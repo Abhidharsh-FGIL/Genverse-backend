@@ -1,0 +1,63 @@
+# Web Framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.19
+
+# Database
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+psycopg2-binary==2.9.10
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
+
+# Pydantic & Settings
+pydantic==2.10.3
+pydantic-settings==2.6.1
+pydantic[email]==2.10.3
+email-validator==2.2.0
+
+# AI Integration
+openai==1.57.4
+google-generativeai==0.8.3
+httpx==0.28.1
+httpx-sse==0.4.0
+
+# File Handling & Storage
+python-magic==0.4.27
+aiofiles==24.1.0
+pillow==11.0.0
+
+# PDF & Document Processing
+pypdf2==3.0.1
+python-docx==1.1.2
+openpyxl==3.1.5
+
+# Background Tasks & Caching
+celery==5.4.0
+redis==5.2.1
+hiredis==3.1.0
+
+# HTTP Utilities
+requests==2.32.3
+aiohttp==3.11.10
+
+# Utilities
+python-dotenv==1.0.1
+pytz==2024.2
+python-slugify==8.0.4
+uuid==1.30
+
+# Email
+fastapi-mail==1.4.1
+
+# Logging
+loguru==0.7.3
+
+# Testing (dev dependencies)
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.28.1
