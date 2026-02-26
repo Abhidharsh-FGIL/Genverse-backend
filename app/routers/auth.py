@@ -120,8 +120,12 @@ async def signup(payload: SignupRequest, db: DBSession):
 
     await _create_free_subscription(db, user_id=user.id, workspace_type="individual")
 
-    # Auto-enroll in any classes the user was pre-invited to before having an account
-    await _process_pending_enrollments(db, user)
+    # Auto-enroll in any classes the user was pre-invited to before having an account.
+    # Wrapped in try/except so a missing table or any unexpected error never breaks signup.
+    try:
+        await _process_pending_enrollments(db, user)
+    except Exception:
+        pass
 
     await db.commit()
     await db.refresh(user)

@@ -178,6 +178,33 @@ class LessonPlanRequest(BaseModel):
     additional_context: Optional[str] = None
 
 
+class LessonPlanCreateRequest(BaseModel):
+    """Manual creation of a lesson plan (no AI generation)."""
+    class_id: str
+    title: str
+    topic: Optional[str] = None
+    objectives: Optional[Any] = None
+    time_estimate: Optional[int] = None
+    steps: Optional[Any] = None
+    practice_tasks: Optional[Any] = None
+    formative_check: Optional[str] = None
+    homework: Optional[str] = None
+    differentiation: Optional[Any] = None
+
+
+class LessonPlanUpdateRequest(BaseModel):
+    """Partial update for an existing lesson plan."""
+    title: Optional[str] = None
+    objectives: Optional[Any] = None
+    time_estimate: Optional[int] = None
+    steps: Optional[Any] = None
+    practice_tasks: Optional[Any] = None
+    formative_check: Optional[str] = None
+    homework: Optional[str] = None
+    differentiation: Optional[Any] = None
+    status: Optional[str] = None
+
+
 class LessonPlanResponse(BaseModel):
     id: uuid.UUID
     class_id: uuid.UUID

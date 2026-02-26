@@ -106,8 +106,10 @@ async def list_submissions(
     )
     if assignment_id:
         q = q.where(Submission.assignment_id == uuid.UUID(assignment_id))
-    if student_id:
-        q = q.where(Submission.student_id == uuid.UUID(student_id))
+    # Default to the current user's submissions; an explicit student_id can override
+    # (e.g. a teacher checking a specific student's history).
+    target_student_id = uuid.UUID(student_id) if student_id else current_user.id
+    q = q.where(Submission.student_id == target_student_id)
     if status:
         q = q.where(Submission.status == status)
     q = q.order_by(Submission.submitted_at.desc())

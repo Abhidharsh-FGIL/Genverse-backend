@@ -14,6 +14,8 @@ from app.schemas.insights import (
     IntelligenceResponse,
     RecommendationResponse,
     LearningCurveResponse,
+    ClassRecommendationRequest,
+    ClassRecommendationItem,
 )
 from app.core.exceptions import NotFoundException
 from app.services.ai_service import AIService
@@ -419,3 +421,53 @@ async def get_learning_curve(current_user: CurrentUser, db: DBSession):
         streak_history=[current_user.streak],
         weekly_activity={"current_streak": current_user.streak, "total_xp": current_user.xp},
     )
+
+
+@router.post("/class-recommendations", response_model=list[ClassRecommendationItem])
+async def generate_class_recommendations(
+    payload: ClassRecommendationRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """
+    Generate AI-powered teaching recommendations for a teacher based on
+    their class grading data (criterion averages, weak areas, student performance).
+    """
+    from app.models.classes import Class
+    import uuid as _uuid
+
+    # Enrich class context from DB if not provided in payload
+    class_name = payload.class_name
+    board = payload.board
+    grade = payload.grade
+    subject = payload.subject
+
+    if not all([class_name, board, grade, subject]):
+        try:
+            result = await db.execute(
+                select(Class).where(Class.id == _uuid.UUID(payload.class_id))
+            )
+            cls = result.scalar_one_or_none()
+            if cls:
+                class_name = class_name or cls.name
+                board = board or cls.board
+                grade = grade or cls.grade
+                subject = subject or cls.subject
+        except Exception:
+            pass
+
+    ai = AIService()
+    recommendations = await ai.generate_class_recommendations({
+        "class_id": payload.class_id,
+        "class_name": class_name,
+        "board": board,
+        "grade": grade,
+        "subject": subject,
+        "total_students": payload.total_students,
+        "submissions_graded": payload.submissions_graded,
+        "class_average": payload.class_average,
+        "students_needing_help": payload.students_needing_help,
+        "criterion_averages": [c.model_dump() for c in payload.criterion_averages],
+        "weak_outcomes": [w.model_dump() for w in payload.weak_outcomes],
+    })
+    return recommendations

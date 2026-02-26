@@ -4,7 +4,7 @@ from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.classes import LessonPlan, Class
-from app.schemas.classes import LessonPlanRequest, LessonPlanResponse
+from app.schemas.classes import LessonPlanRequest, LessonPlanResponse, LessonPlanCreateRequest, LessonPlanUpdateRequest
 from app.core.exceptions import NotFoundException, ForbiddenException
 from app.services.ai_service import AIService
 
@@ -47,6 +47,45 @@ async def generate_lesson_plan(payload: LessonPlanRequest, current_user: Current
     await db.commit()
     await db.refresh(lesson_plan)
     return lesson_plan
+
+
+@router.post("/", response_model=LessonPlanResponse, status_code=status.HTTP_201_CREATED)
+async def create_lesson_plan(payload: LessonPlanCreateRequest, current_user: CurrentUser, db: DBSession):
+    """Manually create a lesson plan without AI generation."""
+    lesson_plan = LessonPlan(
+        class_id=uuid.UUID(payload.class_id),
+        created_by=current_user.id,
+        title=payload.title,
+        topic=payload.topic or payload.title,
+        objectives=payload.objectives,
+        time_estimate=payload.time_estimate,
+        steps=payload.steps,
+        practice_tasks=payload.practice_tasks,
+        formative_check=payload.formative_check,
+        homework=payload.homework,
+        differentiation=payload.differentiation,
+        status="draft",
+    )
+    db.add(lesson_plan)
+    await db.commit()
+    await db.refresh(lesson_plan)
+    return lesson_plan
+
+
+@router.patch("/{plan_id}", response_model=LessonPlanResponse)
+async def update_lesson_plan(plan_id: uuid.UUID, payload: LessonPlanUpdateRequest, current_user: CurrentUser, db: DBSession):
+    """Update an existing lesson plan."""
+    result = await db.execute(select(LessonPlan).where(LessonPlan.id == plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise NotFoundException("Lesson plan not found")
+    if plan.created_by != current_user.id:
+        raise ForbiddenException("Not your lesson plan")
+    for field, value in payload.model_dump(exclude_none=True).items():
+        setattr(plan, field, value)
+    await db.commit()
+    await db.refresh(plan)
+    return plan
 
 
 @router.get("/", response_model=list[LessonPlanResponse])

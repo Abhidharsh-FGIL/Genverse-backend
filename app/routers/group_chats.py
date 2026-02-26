@@ -2,24 +2,65 @@ import uuid
 from datetime import datetime, timezone
 from fastapi import APIRouter, status, UploadFile, File, Form, Query
 from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.communication import GroupChat, GroupChatMessage, ChatReadReceipt
 from app.schemas.communication import (
     GroupChatCreate, GroupChatResponse, MessageCreate, MessageResponse, ReadReceiptUpdate
 )
-from app.core.exceptions import NotFoundException
+from app.core.exceptions import NotFoundException, ForbiddenException
 from app.services.storage_service import StorageService
 
 router = APIRouter()
 
 
+async def _check_class_membership(class_id: uuid.UUID, user_id: uuid.UUID, db: AsyncSession) -> bool:
+    """Return True if user is the class teacher, a co-teacher, or an enrolled student."""
+    from app.models.classes import ClassStudent, ClassTeacher, Class
+    teacher_result = await db.execute(
+        select(Class).where(Class.id == class_id, Class.teacher_id == user_id, Class.is_active == True)
+    )
+    if teacher_result.scalar_one_or_none():
+        return True
+    co_result = await db.execute(
+        select(ClassTeacher).where(ClassTeacher.class_id == class_id, ClassTeacher.teacher_id == user_id)
+    )
+    if co_result.scalar_one_or_none():
+        return True
+    student_result = await db.execute(
+        select(ClassStudent).where(ClassStudent.class_id == class_id, ClassStudent.student_id == user_id)
+    )
+    if student_result.scalar_one_or_none():
+        return True
+    return False
+
+
+async def _check_is_class_teacher(class_id: uuid.UUID, user_id: uuid.UUID, db: AsyncSession) -> bool:
+    """Return True if user is the main teacher or a co-teacher of the class."""
+    from app.models.classes import ClassTeacher, Class
+    teacher_result = await db.execute(
+        select(Class).where(Class.id == class_id, Class.teacher_id == user_id, Class.is_active == True)
+    )
+    if teacher_result.scalar_one_or_none():
+        return True
+    co_result = await db.execute(
+        select(ClassTeacher).where(ClassTeacher.class_id == class_id, ClassTeacher.teacher_id == user_id)
+    )
+    if co_result.scalar_one_or_none():
+        return True
+    return False
+
+
 @router.post("/", response_model=GroupChatResponse, status_code=status.HTTP_201_CREATED)
 async def create_group_chat(payload: GroupChatCreate, current_user: CurrentUser, db: DBSession):
+    class_id = uuid.UUID(payload.class_id) if payload.class_id else None
+    if class_id and not await _check_is_class_teacher(class_id, current_user.id, db):
+        raise ForbiddenException("Only teachers can create a class chat")
     chat = GroupChat(
         name=payload.name,
         description=payload.description,
-        class_id=uuid.UUID(payload.class_id) if payload.class_id else None,
+        class_id=class_id,
         org_id=uuid.UUID(payload.org_id) if payload.org_id else None,
         creator_id=current_user.id,
     )
@@ -155,6 +196,8 @@ async def get_unread_count(current_user: CurrentUser, db: DBSession):
 @router.get("/group/by-class/{class_id}")
 async def get_chat_by_class(class_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
     """Return the first active group chat for a class, or null if none exists."""
+    if not await _check_class_membership(class_id, current_user.id, db):
+        raise ForbiddenException("You are not a member of this class")
     result = await db.execute(
         select(GroupChat).where(
             GroupChat.class_id == class_id,
@@ -175,6 +218,13 @@ async def get_messages(
     before: str | None = Query(None),
     limit: int = Query(50, le=100),
 ):
+    chat_result = await db.execute(select(GroupChat).where(GroupChat.id == chat_id, GroupChat.is_active == True))
+    chat = chat_result.scalar_one_or_none()
+    if not chat:
+        raise NotFoundException("Chat not found")
+    if chat.class_id and not await _check_class_membership(chat.class_id, current_user.id, db):
+        raise ForbiddenException("You are not a member of this class")
+
     from app.models.user import User
     q = (
         select(GroupChatMessage, User)
@@ -206,8 +256,11 @@ async def send_message(
     db: DBSession,
 ):
     chat_result = await db.execute(select(GroupChat).where(GroupChat.id == chat_id, GroupChat.is_active == True))
-    if not chat_result.scalar_one_or_none():
+    chat = chat_result.scalar_one_or_none()
+    if not chat:
         raise NotFoundException("Chat not found")
+    if chat.class_id and not await _check_class_membership(chat.class_id, current_user.id, db):
+        raise ForbiddenException("You are not a member of this class")
 
     msg = GroupChatMessage(
         chat_id=chat_id,
@@ -232,6 +285,13 @@ async def send_message_with_attachment(
     current_user: CurrentUser = None,
     db: DBSession = None,
 ):
+    chat_result = await db.execute(select(GroupChat).where(GroupChat.id == chat_id, GroupChat.is_active == True))
+    chat = chat_result.scalar_one_or_none()
+    if not chat:
+        raise NotFoundException("Chat not found")
+    if chat.class_id and not await _check_is_class_teacher(chat.class_id, current_user.id, db):
+        raise ForbiddenException("Only teachers can upload attachments")
+
     storage = StorageService()
     file_info = await storage.upload_file(
         file=file,

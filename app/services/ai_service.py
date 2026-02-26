@@ -58,40 +58,44 @@ class AIService:
         parts = []
 
         personality_map = {
-            "mentor": "Act as a supportive mentor who guides with encouragement and wisdom.",
+            "mentor": "Act as a supportive mentor who guides with encouragement and wisdom. Inspire curiosity and celebrate progress.",
+            "coach": "Act as a focused, results-driven coach. Be direct, action-oriented, and push the student to think critically and improve.",
             "tutor": "Act as a patient tutor who explains concepts step by step, checking for understanding.",
-            "friend": "Act as a knowledgeable friend — explain things in a casual, relatable way without being overly formal.",
-            "professor": "Act as an authoritative professor delivering comprehensive, academically rigorous responses.",
+            "friend": "Act as a knowledgeable friend — explain things in a casual, relatable, conversational way without being overly formal.",
+            "professor": "Act as an authoritative professor delivering comprehensive, academically rigorous responses with precise terminology.",
+            "technical-expert": "Act as a senior technical expert. Use precise, industry-standard terminology, dive into implementation details, and reference best practices.",
             "helpful": "Be helpful and informative in your responses.",
         }
         personality = chat_settings.get("personality", "helpful")
-        if personality in personality_map:
-            parts.append(personality_map[personality])
+        parts.append(personality_map.get(personality, personality_map["helpful"]))
 
         difficulty_map = {
-            "easy": "Use simple language suitable for beginners. Avoid technical jargon and prefer analogies.",
-            "medium": "Use clear explanations with moderate technical depth, suitable for intermediate learners.",
-            "hard": "Use advanced concepts and technical terminology appropriate for advanced or expert learners.",
+            "easy": "Use very simple language suitable for complete beginners. Avoid technical jargon entirely; prefer everyday analogies and short sentences.",
+            "medium": "Use clear explanations with moderate technical depth, suitable for intermediate learners who know the basics.",
+            "hard": "Use advanced concepts and technical terminology appropriate for advanced learners. Do not over-explain foundational concepts.",
+            "expert": "Assume expert-level knowledge. Skip introductory definitions, focus on nuance, edge cases, trade-offs, and cutting-edge aspects of the topic.",
         }
         difficulty = chat_settings.get("difficulty", "medium")
-        if difficulty in difficulty_map:
-            parts.append(difficulty_map[difficulty])
+        parts.append(difficulty_map.get(difficulty, difficulty_map["medium"]))
 
         length_map = {
+            "small": "Be extremely brief — answer in 1-3 sentences maximum. No preamble, no lists, just the core answer.",
             "brief": "Keep responses concise (1-2 paragraphs max). Get to the point quickly.",
-            "summary": "Keep responses concise (1-2 paragraphs max). Get to the point quickly.",
+            "summary": "Give a focused summary response (2-3 paragraphs). Cover the key points without going into excessive detail.",
             "medium": "Provide moderately detailed responses covering key points without being exhaustive.",
-            "detailed": "Provide comprehensive, in-depth explanations covering all relevant aspects thoroughly.",
+            "detailed": "Provide comprehensive, in-depth explanations covering all relevant aspects thoroughly with examples and structure.",
+            "deep-dive": "Provide an exhaustive, thorough deep-dive. Cover every important aspect, subtlety, edge case, and example. Use headings and structure to organise the response.",
         }
         content_length = chat_settings.get("content_length", "medium")
-        if content_length in length_map:
-            parts.append(length_map[content_length])
+        parts.append(length_map.get(content_length, length_map["medium"]))
 
         if chat_settings.get("explain_3ways"):
             parts.append(
-                "When explaining concepts, provide THREE distinct explanations: "
-                "(1) A simple analogy or metaphor, (2) A technical/formal definition, "
-                "(3) A real-world application or example."
+                "IMPORTANT — Explain in 3 Ways: Structure your response with these three clearly labelled sections "
+                "directly inside your answer (do NOT add a separate card or section after — include all three here):\n"
+                "**🎯 Analogy:** A simple, relatable analogy or metaphor that makes the concept easy to grasp.\n"
+                "**⚙️ Technical:** A precise, formal definition or technical explanation.\n"
+                "**🌍 Real-World Example:** A concrete, real-world application or example of the concept in action."
             )
 
         if chat_settings.get("examples"):
@@ -466,6 +470,114 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             "percentage": round(percentage, 2),
             "feedback": feedback,
         }
+
+    async def evaluate_assignment_attempt(
+        self,
+        responses_json: list,
+        answer_key_json: list,
+        questions_json: list,
+        subject: str = "",
+    ) -> dict:
+        """Per-question AI evaluation for assignment/quiz attempts.
+        Returns feedback_json compatible with GradeSubmissionPage."""
+
+        answer_map = {r["questionId"]: r.get("answer", "") for r in responses_json}
+        key_map = {k["id"]: k for k in answer_key_json}
+        max_score = sum(q.get("points", 1) for q in questions_json)
+
+        # Build per-question payload for the prompt
+        items = []
+        for q in questions_json:
+            qid = q["id"]
+            key = key_map.get(qid, {})
+            items.append({
+                "questionId": qid,
+                "type": q.get("type", "mcq"),
+                "text": q.get("text", ""),
+                "points": q.get("points", 1),
+                "options": q.get("options"),
+                "studentAnswer": answer_map.get(qid, ""),
+                "correctAnswer": key.get("correctAnswer", ""),
+                "explanation": key.get("explanation", ""),
+            })
+
+        prompt = f"""You are an expert teacher grading a student's assignment attempt{f' for "{subject}"' if subject else ''}.
+
+Evaluate each question and assign a score. For each question provide the correct answer and a clear explanation of why it is correct.
+
+Questions:
+{json.dumps(items, indent=2)}
+
+Scoring rules:
+- MCQ: exact match between studentAnswer and correctAnswer (compare as strings) → full points or 0
+- fill-blank / true-false: case-insensitive string match → full points or 0
+- short-answer / essay: judge quality against correctAnswer → partial credit allowed
+- matching: evaluate pair accuracy proportionally
+- "score" must be 0 to the question's "points" value (decimals allowed for partial)
+- "correctAnswer" must state the correct answer clearly (do NOT comment on the student's response)
+- "explanation" must explain why that answer is correct
+
+Return ONLY valid JSON, no markdown:
+{{
+  "feedback": [
+    {{
+      "questionId": "<id>",
+      "score": <number>,
+      "correctAnswer": "<the correct answer stated clearly and concisely>",
+      "explanation": "<explanation of why this is the correct answer>"
+    }}
+  ]
+}}"""
+
+        try:
+            response = await self.chat([{"role": "user", "content": prompt}])
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            data = json.loads(cleaned)
+            feedback_list = data.get("feedback", [])
+
+            total_score = sum(f.get("score", 0) for f in feedback_list)
+            percentage = round((total_score / max_score) * 100, 1) if max_score > 0 else 0
+
+            return {
+                "feedback_json": feedback_list,
+                "score": total_score,
+                "max_score": max_score,
+                "percentage": percentage,
+            }
+        except Exception:
+            # Fallback: simple objective scoring without AI feedback
+            fallback = []
+            total_score = 0.0
+            obj_types = {"mcq", "fill", "fill-blank", "true-false", "truefalse"}
+            for q in questions_json:
+                qid = q["id"]
+                points = q.get("points", 1)
+                qtype = (q.get("type") or "mcq").lower()
+                student_ans = str(answer_map.get(qid, "")).strip()
+                correct_ans = str(key_map.get(qid, {}).get("correctAnswer", "")).strip()
+                if qtype in obj_types:
+                    is_correct = student_ans.lower() == correct_ans.lower()
+                    score = points if is_correct else 0
+                    ca = correct_ans if correct_ans else "See answer key"
+                    expl = "This is correct." if is_correct else f"The correct answer is: {correct_ans}."
+                else:
+                    score = 0
+                    ca = correct_ans if correct_ans else "See answer key"
+                    expl = "Manual review required."
+                total_score += score
+                fallback.append({"questionId": qid, "score": score, "correctAnswer": ca, "explanation": expl})
+
+            percentage = round((total_score / max_score) * 100, 1) if max_score > 0 else 0
+            return {
+                "feedback_json": fallback,
+                "score": total_score,
+                "max_score": max_score,
+                "percentage": percentage,
+            }
 
     async def generate_ebook(
         self,
@@ -1599,15 +1711,20 @@ Return ONLY valid JSON.
     async def generate_follow_up_questions(
         self, user_message: str, ai_response: str, count: int = 4
     ) -> List[str]:
-        """Predict the most likely follow-up questions a student would ask next."""
+        """Generate questions that dive deeper into the same topic — clarifying or expanding the previous answer."""
         prompt = (
-            f"Based on this educational Q&A exchange, predict the {count} most likely "
-            "follow-up questions the student would want to ask next. "
-            "Make questions specific, curious, and naturally flowing from the topic discussed.\n\n"
+            f"You are helping a student go deeper into a topic. Based on this Q&A exchange, generate {count} "
+            "follow-up questions that clarify, expand, or explore nuances of the SAME topic that was just discussed. "
+            "These should be backward/vertical questions — digging deeper into what was just explained, "
+            "NOT pivoting to a different topic or action.\n\n"
+            "Good examples for 'What is the Big Bang theory?':\n"
+            '  - "What evidence supports the Big Bang theory?"\n'
+            '  - "What happened in the first few seconds after the Big Bang?"\n'
+            '  - "Who first proposed the Big Bang theory and how was it discovered?"\n\n'
             f"Student asked: {user_message[:600]}\n\n"
-            f"AI responded (summary): {ai_response[:1200]}\n\n"
-            f"Return ONLY a JSON array of {count} question strings. "
-            'Example: ["What is X?", "How does Y work?"]'
+            f"AI responded: {ai_response[:1200]}\n\n"
+            f"Return ONLY a JSON array of {count} question strings that go deeper into this specific topic. "
+            'Example: ["Why did X happen?", "How exactly does Y work?", "What is the difference between X and Z?"]'
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -1626,16 +1743,22 @@ Return ONLY valid JSON.
     async def generate_next_steps(
         self, user_message: str, ai_response: str, count: int = 4
     ) -> list[str]:
-        """Generate actionable next-study-steps a student should take after this response."""
+        """Generate actionable prompts that move the student forward — broader topics or direct actions."""
         prompt = (
-            f"Based on this educational Q&A, suggest {count} specific, actionable next steps "
-            "a student should take to deepen their understanding of this topic. "
-            "Each step should be a short, natural sentence the student can send as their next question. "
-            "Make them concrete and topic-specific.\n\n"
+            f"You are helping a student decide what to do NEXT after reading an AI response. "
+            f"Generate {count} next-step prompts that are forward/horizontal — they should either:\n"
+            "  (a) Initiate an ACTION on this content: summarize, quiz, compare, create flashcards, practice problems, etc.\n"
+            "  (b) Broaden to a RELATED topic or concept that naturally follows from what was discussed.\n\n"
+            "These should NOT be questions that go deeper into the same topic (those are follow-up questions).\n\n"
+            "Good examples for 'What is the Big Bang theory?':\n"
+            '  - "Summarize the Big Bang theory in 5 bullet points"\n'
+            '  - "Create a 5-question quiz on the Big Bang theory"\n'
+            '  - "Compare the Big Bang theory vs the Steady State theory"\n'
+            '  - "Explain the Big Bounce theory"\n\n'
             f"Student asked: {user_message[:600]}\n\n"
-            f"AI responded (summary): {ai_response[:1200]}\n\n"
-            f"Return ONLY a JSON array of {count} short strings. "
-            'Example: ["Explain photosynthesis with a diagram", "Give me practice problems on this"]'
+            f"AI responded: {ai_response[:1200]}\n\n"
+            f"Return ONLY a JSON array of {count} short action-oriented strings the student can send as their next message. "
+            'Example: ["Summarize this in simple terms", "Give me 5 practice questions on this", "Compare X and Y"]'
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -1714,6 +1837,86 @@ Return ONLY valid JSON.
 
         except Exception as e:
             return ""
+
+    async def generate_class_recommendations(self, class_data: dict) -> List[dict]:
+        """
+        Generate actionable teaching recommendations for a teacher based on
+        class-wide grading data (criterion averages, weak areas, student scores).
+        """
+        class_context = (
+            f"Class: {class_data.get('class_name', 'Unknown')}"
+            f" | Subject: {class_data.get('subject', 'N/A')}"
+            f" | Grade: {class_data.get('grade', 'N/A')}"
+            f" | Board: {class_data.get('board', 'N/A')}"
+        )
+        total_students = class_data.get("total_students", 0)
+        graded_count = class_data.get("submissions_graded", 0)
+        class_avg = class_data.get("class_average", 0)
+        students_needing_help = class_data.get("students_needing_help", 0)
+
+        criterion_lines = "\n".join(
+            f"  - {c['name']}: {c['average']}% average"
+            for c in class_data.get("criterion_averages", [])
+        ) or "  No rubric criterion data available."
+
+        weak_lines = "\n".join(
+            f"  - {w['criterion']}: {w['average']}% (WEAK)"
+            for w in class_data.get("weak_outcomes", [])
+        ) or "  No weak areas identified."
+
+        prompt = f"""You are an expert educational advisor helping a teacher improve their class performance.
+
+Class context:
+{class_context}
+Total students: {total_students}
+Submissions graded: {graded_count}
+Overall class average: {class_avg}%
+Students scoring below 60%: {students_needing_help}
+
+Rubric criterion averages (all criteria):
+{criterion_lines}
+
+Weakest areas (bottom performers):
+{weak_lines}
+
+Based on this real grading data, generate 3 specific, actionable teaching recommendations.
+Each recommendation must:
+- Be directly tied to the data (reference specific criterion names and percentages)
+- Suggest a concrete teaching strategy or activity
+- Specify who it targets (whole class, struggling students, advanced students)
+- Include a suggested action type
+
+Return ONLY a JSON array of exactly 3 objects:
+[
+  {{
+    "title": "Short recommendation title (max 8 words)",
+    "description": "2-3 sentence specific recommendation referencing the actual data",
+    "targets": "whole_class | struggling_students | advanced_students",
+    "action_type": "remediation | enrichment | assessment | lesson_plan | activity",
+    "priority": "high | medium | low"
+  }}
+]
+
+Return ONLY valid JSON. No markdown fences."""
+
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            return json.loads(cleaned)
+        except Exception:
+            return [
+                {
+                    "title": "Review Weak Areas",
+                    "description": response[:300] if response else "Focus extra time on the lowest-scoring criteria.",
+                    "targets": "whole_class",
+                    "action_type": "remediation",
+                    "priority": "high",
+                }
+            ]
 
     async def generate_audiobook(
         self,

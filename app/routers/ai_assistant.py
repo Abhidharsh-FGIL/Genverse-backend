@@ -458,6 +458,30 @@ async def auto_grade(
     return result
 
 
+class AutoEvaluateAttemptRequest(BaseModel):
+    responses_json: list  # [{ "questionId": "...", "answer": "..." }]
+    answer_key_json: list  # [{ "id": "...", "correctAnswer": "...", "points": 1 }]
+    questions_json: list   # [{ "id": "...", "type": "mcq", "text": "...", "points": 1, "options": [...] }]
+    subject: Optional[str] = ""
+
+
+@router.post("/auto-evaluate-attempt")
+async def auto_evaluate_attempt(
+    payload: AutoEvaluateAttemptRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Per-question AI grading for assignment/quiz attempts. Used by the teacher grading page."""
+    ai = AIService()
+    result = await ai.evaluate_assignment_attempt(
+        responses_json=payload.responses_json,
+        answer_key_json=payload.answer_key_json,
+        questions_json=payload.questions_json,
+        subject=payload.subject or "",
+    )
+    return result
+
+
 class SuggestQuestionsRequest(BaseModel):
     topic: str
     subject: str = ""

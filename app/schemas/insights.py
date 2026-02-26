@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List, Any
 
 
@@ -60,6 +60,43 @@ class RecommendationResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class CriterionAverage(BaseModel):
+    name: str
+    average: float
+
+
+class WeakOutcome(BaseModel):
+    criterion: str
+    average: float
+
+
+class ClassRecommendationRequest(BaseModel):
+    class_id: str
+    class_name: Optional[str] = None
+    board: Optional[str] = None
+    grade: Optional[str] = None
+    subject: Optional[str] = None
+    total_students: int = 0
+    submissions_graded: int = 0
+    class_average: float = 0
+    students_needing_help: int = 0
+    criterion_averages: List[CriterionAverage] = []
+    weak_outcomes: List[WeakOutcome] = []
+
+    @field_validator('grade', 'board', 'subject', 'class_name', mode='before')
+    @classmethod
+    def coerce_to_str(cls, v: Any) -> Optional[str]:
+        return str(v) if v is not None else None
+
+
+class ClassRecommendationItem(BaseModel):
+    title: str
+    description: str
+    targets: str
+    action_type: str
+    priority: str
 
 
 class LearningCurveResponse(BaseModel):
