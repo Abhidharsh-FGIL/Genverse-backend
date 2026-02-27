@@ -183,6 +183,7 @@ class GeneratePracticeAssessmentRequest(BaseModel):
     negative_mark_value: Optional[float] = None
     source_text: Optional[str] = None
     source_type: Optional[str] = None
+    source_ref_id: Optional[str] = None  # Vault file ID — content fetched server-side
     type_weightage: Optional[dict] = None
     topic_weightage: Optional[dict] = None
     chapter_weightage: Optional[dict] = None

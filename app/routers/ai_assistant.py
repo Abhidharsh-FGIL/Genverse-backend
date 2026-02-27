@@ -523,6 +523,26 @@ async def generate_practice_assessment_preview(
     else:
         topics = None
 
+    # Resolve source text: fetch vault file chunks when source_ref_id is provided
+    resolved_source_text = payload.source_text
+    if payload.source_ref_id and not resolved_source_text:
+        try:
+            from app.models.content import DocChunk, UserLibraryItem
+            chunks_result = await db.execute(
+                select(DocChunk)
+                .join(UserLibraryItem, DocChunk.library_item_id == UserLibraryItem.id)
+                .where(
+                    UserLibraryItem.id == uuid.UUID(payload.source_ref_id),
+                    UserLibraryItem.user_id == current_user.id,
+                )
+                .order_by(DocChunk.chunk_order)
+            )
+            chunks = chunks_result.scalars().all()
+            if chunks:
+                resolved_source_text = " ".join(c.chunk_text for c in chunks)
+        except Exception:
+            pass  # fall back to topic-based generation if fetch fails
+
     ai = AIService()
     raw = await ai.generate_practice_assessment(
         subject=payload.subject,
@@ -538,7 +558,7 @@ async def generate_practice_assessment_preview(
         type_weightage=payload.type_weightage,
         topic_weightage=payload.topic_weightage,
         negative_marking=payload.negative_marking,
-        source_text=payload.source_text,
+        source_text=resolved_source_text,
     )
 
     import uuid as _uuid
@@ -644,6 +664,7 @@ class SuggestQuestionsRequest(BaseModel):
     difficulty: Optional[str] = "medium"
     lesson_plan_id: Optional[str] = None
     rubric_id: Optional[str] = None
+    source_text: Optional[str] = None  # Full text from a vault file for document-grounded generation
 
 
 @router.post("/suggest-questions")
@@ -707,5 +728,6 @@ async def suggest_questions_for_assignment(
         difficulty=payload.difficulty or "medium",
         lesson_plan_context=lesson_plan_context,
         rubric_criteria=rubric_criteria,
+        source_text=payload.source_text,
     )
     return {"questions": questions}

@@ -1037,6 +1037,7 @@ Return ONLY valid JSON.
         difficulty: str = "medium",
         lesson_plan_context: dict | None = None,
         rubric_criteria: list | None = None,
+        source_text: str | None = None,
     ) -> List[dict]:
         """Generate structured assignment questions for an AssignmentEditor.
 
@@ -1103,11 +1104,27 @@ Rubric Assessment Criteria (questions must be aligned to these criteria so the a
 Distribute questions across these criteria. Each question should clearly target one of the above criteria.
 """
 
+        # Build source document section (vault file content)
+        source_section = ""
+        if source_text:
+            # Truncate to ~6000 words to stay within context limits
+            words = source_text.split()
+            truncated = " ".join(words[:6000])
+            if len(words) > 6000:
+                truncated += " [... content truncated ...]"
+            source_section = f"""
+Source Document (generate questions ONLY from the content below — do not invent information outside this document):
+---
+{truncated}
+---
+
+"""
+
         prompt = f"""Generate assignment questions for a Grade {grade} {subject} class.
 Topic: {topic}
 Difficulty: {difficulty}
 Question breakdown: {types_str}
-{lesson_plan_section}{rubric_section}
+{source_section}{lesson_plan_section}{rubric_section}
 Return a JSON object with a "questions" array. Each question must follow this schema exactly:
 - type: one of "mcq", "fill-blank", "short-answer", "true-false", "match"
 - text: the question text
