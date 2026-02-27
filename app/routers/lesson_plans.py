@@ -27,6 +27,9 @@ async def generate_lesson_plan(payload: LessonPlanRequest, current_user: Current
         grade=class_.grade,
         subject=class_.subject,
         additional_context=payload.additional_context,
+        class_name=class_.name,
+        class_section=class_.section,
+        class_description=class_.description,
     )
 
     lesson_plan = LessonPlan(

@@ -37,7 +37,9 @@ async def playground_explore_stream(
             harder_mode=payload.harder_mode,
             context=payload.context,
         ):
-            yield f"data: {chunk}\n\n"
+            # Encode newlines so they survive SSE line-splitting on the client
+            encoded = chunk.replace('\n', '\\n')
+            yield f"data: {encoded}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

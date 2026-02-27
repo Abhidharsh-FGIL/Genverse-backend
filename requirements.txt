@@ -9,6 +9,10 @@ asyncpg==0.30.0
 alembic==1.14.0
 psycopg2-binary==2.9.10
 
+# Vector search
+faiss-cpu==1.13.2
+numpy>=1.25.0
+
 # Authentication & Security
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4

@@ -721,35 +721,82 @@ Return ONLY valid JSON.
         return {"visuals": response}
 
     async def generate_lesson_plan(
-        self, class_id: str, topic: str, board: str, grade: int, subject: str, additional_context: str | None = None
+        self,
+        class_id: str,
+        topic: str,
+        board: str,
+        grade: int,
+        subject: str,
+        additional_context: str | None = None,
+        class_name: str | None = None,
+        class_section: str | None = None,
+        class_description: str | None = None,
     ) -> dict:
-        """Generate a structured lesson plan."""
-        prompt = f"""Create a detailed lesson plan:
-Topic: {topic}
-Subject: {subject}
-Board: {board}
-Grade: {grade}
-{f'Additional context: {additional_context}' if additional_context else ''}
+        """Generate a structured, grade-aware lesson plan."""
 
-Return JSON:
+        # Build a rich grade context so the AI calibrates language and complexity
+        grade_label = f"Grade {grade}"
+        board_label = board or "General Curriculum"
+
+        class_context_parts = []
+        if class_name:
+            class_context_parts.append(f"Class name: {class_name}")
+        if class_section:
+            class_context_parts.append(f"Section: {class_section}")
+        if class_description:
+            class_context_parts.append(f"Class notes: {class_description}")
+        class_context_str = "\n".join(class_context_parts)
+
+        prompt = f"""You are an expert teacher creating a lesson plan. Use every detail below to calibrate the plan.
+
+CLASS DETAILS
+─────────────
+Subject      : {subject}
+Board        : {board_label}
+Grade        : {grade_label}
+{class_context_str}
+
+TOPIC
+─────
+{topic}
+
+{f'TEACHER NOTES{chr(10)}─────────────{chr(10)}{additional_context}' if additional_context else ''}
+
+GRADE-CALIBRATION RULES (follow strictly)
+──────────────────────────────────────────
+• Language & vocabulary must match the cognitive level of {grade_label} students.
+  – Grades 1-3: very simple sentences, visual/hands-on activities, concrete examples.
+  – Grades 4-6: simple explanations, real-world links, semi-concrete examples.
+  – Grades 7-9: moderate terminology, structured reasoning, some abstraction.
+  – Grades 10-12: subject-specific terminology, abstract reasoning, analytical tasks.
+• Align learning objectives to {board_label} curriculum standards for {grade_label} {subject}.
+• Time estimate should be realistic for a {grade_label} class period (typically 35-60 min).
+• Steps must progress from activate-prior-knowledge → introduce → model → guided practice → independent practice → closure.
+• Practice tasks must be solvable by an average {grade_label} student without extra resources.
+• Formative check must be a single focused question or quick activity appropriate for {grade_label}.
+• Homework must be achievable in 15-30 minutes by a {grade_label} student.
+• Differentiation: easy = scaffolded/simplified for below-grade learners; standard = grade-level; advanced = extension/enrichment for above-grade learners.
+
+OUTPUT
+──────
+Return ONLY valid JSON matching this schema exactly:
 {{
-  "title": "...",
-  "objectives": ["..."],
+  "title": "descriptive lesson title",
+  "objectives": ["By the end of this lesson, students will be able to ...", "..."],
   "timeEstimate": 45,
   "steps": [
-    {{"step": 1, "title": "...", "description": "...", "duration": 10}}
+    {{"step": 1, "title": "step title", "description": "detailed teacher instructions", "duration": 10}},
+    ...
   ],
-  "practiceTasks": ["..."],
-  "formativeCheck": "...",
-  "homework": "...",
+  "practiceTasks": ["specific task 1", "specific task 2"],
+  "formativeCheck": "one focused exit-ticket question or activity",
+  "homework": "clear homework instruction",
   "differentiation": {{
-    "easy": "...",
-    "standard": "...",
-    "advanced": "..."
+    "easy": "what to simplify for struggling learners",
+    "standard": "standard grade-level approach",
+    "advanced": "extension challenge for advanced learners"
   }}
 }}
-
-Return ONLY valid JSON.
 """
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -1847,7 +1894,7 @@ Return ONLY valid JSON.
         return response.strip().strip('"').strip("'")[:100]
 
     def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 100) -> List[str]:
-        """Split text into overlapping chunks for RAG."""
+        """Split text into overlapping character-based chunks (legacy fallback)."""
         chunks = []
         start = 0
         while start < len(text):
@@ -1856,6 +1903,126 @@ Return ONLY valid JSON.
             chunks.append(chunk)
             start = end - overlap
         return chunks
+
+    def semantic_chunk_text(
+        self, text: str, max_words: int = 200, overlap_words: int = 30
+    ) -> List[str]:
+        """Semantic-aware chunking that respects paragraph and sentence boundaries.
+
+        Strategy:
+        1. Split text into paragraphs (double-newline boundaries).
+        2. If a paragraph exceeds max_words, further split it by sentences.
+        3. Accumulate words into a chunk; when the limit is reached save the chunk
+           and carry the last `overlap_words` words into the next chunk for context.
+        """
+        import re
+
+        # Normalise excessive blank lines
+        text = re.sub(r'\n{3,}', '\n\n', text.strip())
+        paragraphs = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
+
+        chunks: List[str] = []
+        current_words: List[str] = []
+        current_count = 0
+
+        def _flush():
+            nonlocal current_words, current_count
+            if current_words:
+                chunks.append(' '.join(current_words))
+            overlap = current_words[-overlap_words:] if len(current_words) > overlap_words else current_words[:]
+            current_words = overlap[:]
+            current_count = len(current_words)
+
+        for para in paragraphs:
+            para_words = para.split()
+
+            if len(para_words) > max_words:
+                # Long paragraph → split by sentence boundaries first
+                sentences = re.split(r'(?<=[.!?])\s+', para)
+                for sentence in sentences:
+                    sent_words = sentence.split()
+                    if current_count + len(sent_words) > max_words:
+                        _flush()
+                    current_words.extend(sent_words)
+                    current_count += len(sent_words)
+            else:
+                if current_count + len(para_words) > max_words:
+                    _flush()
+                current_words.extend(para_words)
+                current_count += len(para_words)
+
+        # Flush the final chunk
+        if current_words:
+            chunks.append(' '.join(current_words))
+
+        return chunks if chunks else [text]
+
+    async def generate_embedding(self, text: str) -> Optional[List[float]]:
+        """Generate a 768-dimensional embedding vector for document storage.
+
+        Uses Google Gemini text-embedding-004 (primary) with OpenAI
+        text-embedding-3-small at 768 dims as fallback.
+        Returns None if both providers fail.
+        """
+        # Trim to avoid hitting API token limits
+        text = text[:8000].strip()
+        if not text:
+            return None
+
+        # --- Primary: Gemini text-embedding-004 (768 dims) ---
+        try:
+            import google.generativeai as genai
+            if settings.GOOGLE_GEMINI_API_KEY:
+                genai.configure(api_key=settings.GOOGLE_GEMINI_API_KEY)
+                result = genai.embed_content(
+                    model="models/text-embedding-004",
+                    content=text,
+                    task_type="retrieval_document",
+                )
+                return result["embedding"]
+        except Exception:
+            pass
+
+        # --- Fallback: OpenAI text-embedding-3-small at 768 dims ---
+        try:
+            openai_client = self._get_openai()
+            if openai_client:
+                resp = await openai_client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=text,
+                    dimensions=768,
+                )
+                return resp.data[0].embedding
+        except Exception:
+            pass
+
+        return None
+
+    async def generate_query_embedding(self, query: str) -> Optional[List[float]]:
+        """Generate a 768-dimensional embedding for a search query.
+
+        Uses the retrieval_query task type so Gemini optimises the vector
+        for similarity search against retrieval_document embeddings.
+        Falls back to generate_embedding if Gemini is unavailable.
+        """
+        query = query[:2000].strip()
+        if not query:
+            return None
+
+        try:
+            import google.generativeai as genai
+            if settings.GOOGLE_GEMINI_API_KEY:
+                genai.configure(api_key=settings.GOOGLE_GEMINI_API_KEY)
+                result = genai.embed_content(
+                    model="models/text-embedding-004",
+                    content=query,
+                    task_type="retrieval_query",
+                )
+                return result["embedding"]
+        except Exception:
+            pass
+
+        return await self.generate_embedding(query)
 
     async def extract_text_from_file(self, file_path: str, language: str = "en") -> str:
         """Extract text from a file (PDF, DOCX, image, etc.)."""

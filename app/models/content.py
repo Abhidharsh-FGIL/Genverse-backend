@@ -35,7 +35,7 @@ class DocChunk(Base):
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
     chunk_order: Mapped[int] = mapped_column(Integer, nullable=False)
     page: Mapped[int | None] = mapped_column(Integer)
-    embedding: Mapped[dict | None] = mapped_column(JSONB)  # Vector embedding stored as JSON array
+    # Embeddings are stored in FAISS index files (see FAISSService) — not in the DB
 
     library_item: Mapped["UserLibraryItem"] = relationship(back_populates="chunks")
 

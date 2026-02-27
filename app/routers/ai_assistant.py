@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.ai import AiChat, AiChatMessage, AiChatSetting
+from app.models.content import UserLibraryItem, DocChunk
 from app.schemas.ai import (
     AiChatCreate, AiChatUpdate, AiChatResponse, AiMessageResponse,
     SendMessageRequest, ChatSettingsUpdate, ChatSettingsResponse,
@@ -16,9 +17,82 @@ from app.schemas.ai import (
 )
 from app.core.exceptions import NotFoundException
 from app.services.ai_service import AIService
+from app.services.faiss_service import FAISSService
 from app.services.points_service import PointsService
+from app.config import settings
 
 router = APIRouter()
+
+
+async def _build_rag_context(
+    user_id: str,
+    question: str,
+    file_ids: list[str],
+    db,
+    ai: AIService,
+    k: int = 15,
+) -> str:
+    """Return the most relevant chunk texts for the given question + file selection.
+
+    1. Tries FAISS cosine-similarity search (fast, semantic).
+    2. Falls back to ordered DB fetch when no FAISS index exists yet.
+    """
+    if not file_ids:
+        return ""
+
+    file_uuids = [uuid.UUID(fid) for fid in file_ids]
+    faiss_svc = FAISSService(settings.STORAGE_ROOT)
+
+    # --- FAISS path ---
+    query_embedding = await ai.generate_query_embedding(question)
+    if query_embedding and faiss_svc.user_has_index(user_id):
+        ranked_ids = faiss_svc.search(user_id=user_id, query_embedding=query_embedding, k=k)
+        if ranked_ids:
+            chunk_uuids = [uuid.UUID(cid) for cid in ranked_ids]
+            result = await db.execute(
+                select(DocChunk)
+                .join(UserLibraryItem, DocChunk.library_item_id == UserLibraryItem.id)
+                .where(
+                    DocChunk.id.in_(chunk_uuids),
+                    UserLibraryItem.user_id == uuid.UUID(user_id),
+                    UserLibraryItem.id.in_(file_uuids),
+                )
+            )
+            by_id = {str(c.id): c for c in result.scalars().all()}
+            chunks = [by_id[cid] for cid in ranked_ids if cid in by_id]
+            if chunks:
+                return "\n\n".join(c.chunk_text for c in chunks)
+
+    # --- Fallback: recency / order-based ---
+    result = await db.execute(
+        select(DocChunk)
+        .join(UserLibraryItem, DocChunk.library_item_id == UserLibraryItem.id)
+        .where(
+            UserLibraryItem.user_id == uuid.UUID(user_id),
+            UserLibraryItem.id.in_(file_uuids),
+        )
+        .order_by(DocChunk.library_item_id, DocChunk.chunk_order)
+        .limit(20)
+    )
+    chunks = result.scalars().all()
+    return "\n\n".join(c.chunk_text for c in chunks)
+
+
+def _inject_rag(messages: list[dict], question: str, rag_text: str) -> list[dict]:
+    """Replace the last user message with a RAG-enriched version."""
+    enriched_question = (
+        "Use the following excerpts from the user's selected documents to answer accurately.\n"
+        "If the answer is not in the excerpts, say so and answer from general knowledge.\n\n"
+        f"--- DOCUMENT EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
+        f"Question: {question}"
+    )
+    updated = list(messages)
+    # Replace the trailing user message that was just appended
+    if updated and updated[-1]["role"] == "user":
+        updated[-1] = {"role": "user", "content": enriched_question}
+    else:
+        updated.append({"role": "user", "content": enriched_question})
+    return updated
 
 
 @router.post("/chats", response_model=AiChatResponse, status_code=status.HTTP_201_CREATED)
@@ -176,6 +250,23 @@ async def send_message_stream(
 
     ai = AIService()
 
+    # RAG: enrich messages with vault content when files are selected
+    selected_files: list[str] = (
+        payload.selected_files
+        or (payload.context or {}).get("selected_files")
+        or []
+    )
+    if selected_files:
+        rag_text = await _build_rag_context(
+            user_id=str(current_user.id),
+            question=payload.message,
+            file_ids=selected_files,
+            db=db,
+            ai=ai,
+        )
+        if rag_text:
+            messages = _inject_rag(messages, payload.message, rag_text)
+
     async def event_stream():
         full_response = ""
         async for chunk in ai.stream_chat(messages=messages, context=payload.context, chat_settings=chat_settings or None):
@@ -239,6 +330,24 @@ async def send_message(
     messages = [{"role": m.role, "content": m.content} for m in history]
 
     ai = AIService()
+
+    # RAG: enrich messages with vault content when files are selected
+    selected_files: list[str] = (
+        payload.selected_files
+        or (payload.context or {}).get("selected_files")
+        or []
+    )
+    if selected_files:
+        rag_text = await _build_rag_context(
+            user_id=str(current_user.id),
+            question=payload.message,
+            file_ids=selected_files,
+            db=db,
+            ai=ai,
+        )
+        if rag_text:
+            messages = _inject_rag(messages, payload.message, rag_text)
+
     response_text = await ai.chat(messages=messages, context=payload.context)
 
     assistant_msg = AiChatMessage(
