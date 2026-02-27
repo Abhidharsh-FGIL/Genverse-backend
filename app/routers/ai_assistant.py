@@ -492,6 +492,8 @@ class SuggestQuestionsRequest(BaseModel):
     trueFalseCount: int = 0
     matchCount: int = 0
     difficulty: Optional[str] = "medium"
+    lesson_plan_id: Optional[str] = None
+    rubric_id: Optional[str] = None
 
 
 @router.post("/suggest-questions")
@@ -500,7 +502,48 @@ async def suggest_questions_for_assignment(
     current_user: CurrentUser,
     db: DBSession,
 ):
-    """Generate typed assignment questions for the AssignmentEditor (MCQ, fill-blank, etc.)."""
+    """Generate typed assignment questions, optionally enriched by lesson plan and/or rubric context."""
+    import uuid as _uuid
+    from sqlalchemy import select as _select
+    from app.models.classes import LessonPlan, Rubric
+
+    # --- Fetch lesson plan context ---
+    lesson_plan_context: dict | None = None
+    if payload.lesson_plan_id:
+        try:
+            lp_result = await db.execute(
+                _select(LessonPlan).where(LessonPlan.id == _uuid.UUID(payload.lesson_plan_id))
+            )
+            lp = lp_result.scalar_one_or_none()
+            if lp:
+                lesson_plan_context = {
+                    "title": lp.title,
+                    "topic": lp.topic,
+                    "objectives": lp.objectives or [],
+                    "steps": lp.steps or [],
+                    "practice_tasks": lp.practice_tasks or [],
+                    "formative_check": lp.formative_check or "",
+                }
+        except Exception:
+            pass  # proceed without lesson plan if fetch fails
+
+    # --- Fetch rubric criteria ---
+    rubric_criteria: list | None = None
+    if payload.rubric_id:
+        try:
+            rb_result = await db.execute(
+                _select(Rubric).where(Rubric.id == _uuid.UUID(payload.rubric_id))
+            )
+            rb = rb_result.scalar_one_or_none()
+            if rb:
+                # Strip __meta sentinel entries before passing to AI
+                rubric_criteria = [
+                    c for c in (rb.criteria or [])
+                    if isinstance(c, dict) and not c.get("__meta")
+                ]
+        except Exception:
+            pass  # proceed without rubric if fetch fails
+
     ai = AIService()
     questions = await ai.generate_assignment_questions(
         topic=payload.topic,
@@ -512,5 +555,7 @@ async def suggest_questions_for_assignment(
         true_false_count=payload.trueFalseCount,
         match_count=payload.matchCount,
         difficulty=payload.difficulty or "medium",
+        lesson_plan_context=lesson_plan_context,
+        rubric_criteria=rubric_criteria,
     )
     return {"questions": questions}

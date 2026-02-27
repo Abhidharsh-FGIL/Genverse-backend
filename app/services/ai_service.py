@@ -988,8 +988,15 @@ Return ONLY valid JSON.
         true_false_count: int = 0,
         match_count: int = 0,
         difficulty: str = "medium",
+        lesson_plan_context: dict | None = None,
+        rubric_criteria: list | None = None,
     ) -> List[dict]:
-        """Generate structured assignment questions for an AssignmentEditor."""
+        """Generate structured assignment questions for an AssignmentEditor.
+
+        When a lesson plan is provided, questions are derived from its objectives and steps.
+        When rubric criteria are provided, questions are aligned to each criterion so the
+        assessment can be evaluated against the rubric.
+        """
         parts = []
         if mcq_count:
             parts.append(f"{mcq_count} MCQ (multiple choice)")
@@ -1003,11 +1010,57 @@ Return ONLY valid JSON.
             parts.append(f"{match_count} Match-the-following")
         types_str = ", ".join(parts) or "5 Short answer"
 
+        # Build optional context sections
+        lesson_plan_section = ""
+        if lesson_plan_context:
+            objectives = lesson_plan_context.get("objectives") or []
+            steps = lesson_plan_context.get("steps") or []
+            practice = lesson_plan_context.get("practice_tasks") or []
+            formative = lesson_plan_context.get("formative_check") or ""
+
+            obj_text = "\n".join(f"  - {o}" for o in objectives) if objectives else "  (none listed)"
+            step_text = "\n".join(
+                f"  {i+1}. {s.get('title', s) if isinstance(s, dict) else s}"
+                for i, s in enumerate(steps)
+            ) if steps else "  (none listed)"
+            practice_text = "\n".join(f"  - {p}" for p in practice) if practice else "  (none listed)"
+
+            lesson_plan_section = f"""
+Teaching Plan (use this to derive relevant questions):
+  Plan Title: {lesson_plan_context.get('title', '')}
+  Topic: {lesson_plan_context.get('topic', topic)}
+  Learning Objectives:
+{obj_text}
+  Lesson Steps:
+{step_text}
+  Practice Tasks:
+{practice_text}
+  Formative Check: {formative}
+
+Questions MUST be rooted in the above lesson plan content, objectives, and activities.
+"""
+
+        rubric_section = ""
+        if rubric_criteria:
+            criteria_lines = []
+            for c in rubric_criteria:
+                title = c.get("title", "")
+                outcome = c.get("linkedOutcome", "")
+                line = f"  - {title}" + (f" (outcome: {outcome})" if outcome else "")
+                criteria_lines.append(line)
+            criteria_text = "\n".join(criteria_lines)
+            rubric_section = f"""
+Rubric Assessment Criteria (questions must be aligned to these criteria so the assessment can be evaluated against the rubric):
+{criteria_text}
+
+Distribute questions across these criteria. Each question should clearly target one of the above criteria.
+"""
+
         prompt = f"""Generate assignment questions for a Grade {grade} {subject} class.
 Topic: {topic}
 Difficulty: {difficulty}
 Question breakdown: {types_str}
-
+{lesson_plan_section}{rubric_section}
 Return a JSON object with a "questions" array. Each question must follow this schema exactly:
 - type: one of "mcq", "fill-blank", "short-answer", "true-false", "match"
 - text: the question text

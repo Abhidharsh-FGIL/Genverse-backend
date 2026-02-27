@@ -299,6 +299,55 @@ async def list_teacher_rubrics(
     ]
 
 
+@router.get("/pending-submissions")
+async def get_teacher_pending_submissions(
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Return submissions awaiting grading (status 'submitted' or 'late') for the teacher's classes."""
+    own_result = await db.execute(
+        select(Class.id).where(Class.teacher_id == current_user.id, Class.is_active == True)
+    )
+    co_result = await db.execute(
+        select(ClassTeacher.class_id).where(ClassTeacher.teacher_id == current_user.id)
+    )
+    teacher_class_ids = list(
+        set([r[0] for r in own_result.all()] + [r[0] for r in co_result.all()])
+    )
+
+    if not teacher_class_ids:
+        return {"total": 0, "items": []}
+
+    q = (
+        select(Submission, Assignment, Class, User)
+        .join(Assignment, Submission.assignment_id == Assignment.id)
+        .join(Class, Assignment.class_id == Class.id)
+        .join(User, Submission.student_id == User.id)
+        .where(
+            Assignment.class_id.in_(teacher_class_ids),
+            Submission.status.in_(["submitted", "late"]),
+        )
+        .order_by(Submission.submitted_at.desc())
+        .limit(50)
+    )
+    result = await db.execute(q)
+    rows = result.all()
+
+    items = [
+        {
+            "submission_id": str(sub.id),
+            "student_name": student.name,
+            "assignment_title": assignment.title,
+            "class_name": class_.name,
+            "class_id": str(class_.id),
+            "submitted_at": sub.submitted_at.isoformat() if sub.submitted_at else None,
+            "is_late": sub.status == "late",
+        }
+        for sub, assignment, class_, student in rows
+    ]
+    return {"total": len(items), "items": items}
+
+
 @router.post("/rubrics", status_code=201)
 async def create_teacher_rubric(
     payload: RubricCreateRequest,
