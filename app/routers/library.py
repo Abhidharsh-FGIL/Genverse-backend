@@ -114,6 +114,41 @@ async def list_library_items(
     return result.scalars().all()
 
 
+@router.post("/extract-text-inline")
+async def extract_text_inline(
+    file: UploadFile = File(...),
+    current_user: CurrentUser = None,
+):
+    """Extract text from an uploaded file without saving it anywhere.
+
+    Used by the AI assistant 'From Device' attachment feature so users can ask
+    questions about a document without it being stored in the Knowledge Vault.
+    """
+    import tempfile
+    import os
+    from pathlib import Path as _Path
+
+    ai = AIService()
+    suffix = _Path(file.filename or "file").suffix.lower() or ".tmp"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        text = await ai.extract_text_from_file(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+
+    word_count = len(text.split()) if text else 0
+    return {
+        "text": text or "",
+        "word_count": word_count,
+        "filename": file.filename,
+    }
+
+
 @router.get("/signed-url")
 async def get_signed_url(
     path: str = Query(...),

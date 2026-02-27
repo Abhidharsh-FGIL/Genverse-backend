@@ -87,11 +87,39 @@ def _inject_rag(messages: list[dict], question: str, rag_text: str) -> list[dict
         f"Question: {question}"
     )
     updated = list(messages)
-    # Replace the trailing user message that was just appended
     if updated and updated[-1]["role"] == "user":
         updated[-1] = {"role": "user", "content": enriched_question}
     else:
         updated.append({"role": "user", "content": enriched_question})
+    return updated
+
+
+def _inject_inline_docs(messages: list[dict], question: str, inline_docs: list[dict]) -> list[dict]:
+    """Inject device-attached file content into the last user message.
+
+    inline_docs is a list of {"filename": str, "text": str} dicts sent by the
+    frontend when the user attaches a file from their device (not the vault).
+    The original question is preserved for display; only the AI sees the file content.
+    """
+    doc_block = "\n\n".join(
+        f"[ATTACHED FILE: {doc['filename']}]\n{doc['text']}\n[END OF FILE]"
+        for doc in inline_docs
+        if doc.get("text")
+    )
+    if not doc_block:
+        return messages
+
+    enriched = (
+        "The user has attached the following file(s). "
+        "Use the content to answer their question accurately.\n\n"
+        f"{doc_block}\n\n"
+        f"Question: {question}"
+    )
+    updated = list(messages)
+    if updated and updated[-1]["role"] == "user":
+        updated[-1] = {"role": "user", "content": enriched}
+    else:
+        updated.append({"role": "user", "content": enriched})
     return updated
 
 
@@ -195,11 +223,14 @@ async def send_message_stream(
     points_service = PointsService()
     await points_service.deduct(user_id=current_user.id, action="basic_chat", db=db)
 
-    # Save user message
+    # Save user message — store any attached filenames in sources_json so the
+    # frontend can render them as file chips above the message bubble.
+    _inline_docs_meta = (payload.context or {}).get("inline_docs") or []
     user_msg = AiChatMessage(
         chat_id=chat_id,
         role="user",
         content=payload.message,
+        sources_json={"attached_files": [d["filename"] for d in _inline_docs_meta if d.get("filename")]} if _inline_docs_meta else None,
     )
     db.add(user_msg)
 
@@ -266,6 +297,11 @@ async def send_message_stream(
         )
         if rag_text:
             messages = _inject_rag(messages, payload.message, rag_text)
+
+    # Inline docs: device-attached files sent from the frontend (not saved to vault)
+    inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
+    if inline_docs:
+        messages = _inject_inline_docs(messages, payload.message, inline_docs)
 
     async def event_stream():
         full_response = ""
@@ -347,6 +383,11 @@ async def send_message(
         )
         if rag_text:
             messages = _inject_rag(messages, payload.message, rag_text)
+
+    # Inline docs: device-attached files sent from the frontend (not saved to vault)
+    inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
+    if inline_docs:
+        messages = _inject_inline_docs(messages, payload.message, inline_docs)
 
     response_text = await ai.chat(messages=messages, context=payload.context)
 
