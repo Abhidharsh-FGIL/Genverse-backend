@@ -96,13 +96,16 @@ async def generate_rubric_ai(payload: GenerateRubricRequest, current_user: Curre
         subject=payload.subject,
         topic=payload.topic,
         criteria_count=payload.criteria_count,
+        difficulty_level=payload.difficulty_level,
     )
+    # Prepend __meta so the chosen difficulty_level is persisted in the JSONB
+    criteria_with_meta = [{"__meta": True, "difficulty_level": payload.difficulty_level}] + criteria
     rubric = Rubric(
         title=f"{payload.subject} Rubric - {payload.topic}",
         board=payload.board,
         grade=payload.grade,
         subject=payload.subject,
-        criteria=criteria,
+        criteria=criteria_with_meta,
         created_by=current_user.id,
         is_ai_generated=True,
     )

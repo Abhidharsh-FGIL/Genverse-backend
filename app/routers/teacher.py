@@ -263,12 +263,26 @@ async def list_teacher_rubrics(
     db: DBSession,
     class_id: Optional[str] = Query(None),
 ):
-    """List rubrics created by the teacher. class_id is accepted but ignored (no DB column)."""
+    """List rubrics created by the teacher, optionally filtered by class_id stored in __meta."""
     from app.models.classes import Rubric
     q = select(Rubric).where(Rubric.created_by == current_user.id)
     q = q.order_by(Rubric.created_at.desc())
     result = await db.execute(q)
     rubrics = result.scalars().all()
+
+    def get_meta(criteria) -> dict:
+        for c in (criteria or []):
+            if isinstance(c, dict) and c.get("__meta"):
+                return c
+        return {}
+
+    # When class_id is provided, only return rubrics whose __meta.class_id matches
+    if class_id:
+        rubrics = [
+            r for r in rubrics
+            if str(get_meta(r.criteria).get("class_id") or "") == class_id
+        ]
+
     return [
         {
             "id": str(r.id),
@@ -277,7 +291,8 @@ async def list_teacher_rubrics(
             "board": r.board,
             "grade": r.grade,
             "criteria": r.criteria,
-            "difficulty_level": None,
+            "is_ai_generated": r.is_ai_generated,
+            "difficulty_level": get_meta(r.criteria).get("difficulty_level"),
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
         for r in rubrics

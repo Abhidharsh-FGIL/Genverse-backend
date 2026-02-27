@@ -299,6 +299,7 @@ class GenerateRubricRequest(BaseModel):
     subject: str
     topic: str
     criteria_count: int = 4
+    difficulty_level: str = 'medium'
 
 
 class SuggestQuestionsRequest(BaseModel):

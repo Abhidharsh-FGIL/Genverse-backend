@@ -763,15 +763,22 @@ Return ONLY valid JSON.
             return {"title": f"Lesson Plan: {topic}", "objectives": [topic], "timeEstimate": 45, "steps": []}
 
     async def generate_rubric(
-        self, board: str, grade: int, subject: str, topic: str, criteria_count: int
+        self, board: str, grade: int, subject: str, topic: str, criteria_count: int,
+        difficulty_level: str = 'medium'
     ) -> List[dict]:
         """Generate grading rubric criteria."""
         import uuid as _uuid
+        difficulty_guidance = {
+            'simple': 'Use straightforward, basic descriptors suitable for foundational understanding.',
+            'medium': 'Use moderately detailed descriptors that require applied understanding.',
+            'complex': 'Use rigorous, nuanced descriptors requiring higher-order thinking and mastery.',
+        }.get(difficulty_level, 'Use moderately detailed descriptors.')
         prompt = f"""Create a detailed grading rubric for:
 Subject: {subject}
 Board: {board}
 Grade: {grade}
 Topic: {topic}
+Difficulty Level: {difficulty_level} — {difficulty_guidance}
 Number of criteria: {criteria_count}
 
 Return JSON array of criteria:
