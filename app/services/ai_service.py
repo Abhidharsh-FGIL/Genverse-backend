@@ -2562,3 +2562,503 @@ Return ONLY valid JSON. No markdown fences."""
             voice_profile=voice_profile,
             narration_style=narration_style,
         )
+
+    # ── Playground Gamification Modes ─────────────────────────────────────────
+
+    async def playground_simulate(self, topic: str, variables: dict, controls: list | None = None) -> dict:
+        """Sandbox mode: analyse scientific effects of dynamic slider values."""
+        if controls:
+            vars_str = "\n".join(
+                f"  - {ctrl['label']} ({ctrl.get('unit', '')}): {variables.get(ctrl['id'], 50)}"
+                for ctrl in controls
+            )
+        else:
+            vars_str = "\n".join(f"  - {k}: {v}" for k, v in variables.items())
+
+        prompt = f"""You are the GenVerse Simulation Engine — a dynamic science visualizer.
+
+Topic: {topic}
+Current parameter settings:
+{vars_str}
+
+Analyse the scientific effects of these settings on the topic.
+Also determine how the visual scene should look right now.
+
+Return ONLY valid JSON — no markdown, no extra text:
+{{
+  "headline": "A dramatic 1-sentence summary of what is happening right now",
+  "analysis": "2-3 sentences of educational science behind these settings",
+  "effects": ["Visible effect 1", "Visible effect 2", "Visible effect 3"],
+  "verdict": "stable",
+  "fun_fact": "A surprising related fact the student might not know",
+  "visual_directives": {{
+    "atmosphere_color": "#hexcolor",
+    "actor_state": "healthy",
+    "actor_emoji": "🌱",
+    "particle_color": "#hexcolor",
+    "particle_count": 20,
+    "particle_type": "dot",
+    "bg_intensity": 0.5,
+    "special_effect": null
+  }}
+}}
+
+Rules:
+- verdict: exactly one of stable | interesting | unstable | dangerous | extreme
+- visual_directives.actor_state: one of thriving | healthy | stressed | dying | extreme
+- visual_directives.actor_emoji: pick the emoji that best represents the topic subject state
+- visual_directives.atmosphere_color: hex color reflecting the overall state
+- visual_directives.particle_color: hex matching the atmosphere
+- visual_directives.particle_count: 5-45 based on activity level
+- visual_directives.particle_type: one of bubble | sparkle | leaf | dot | smoke
+- visual_directives.bg_intensity: 0.0-1.0
+- visual_directives.special_effect: null OR one of: fire | ice | glow | storm | bloom | void
+Return ONLY valid JSON."""
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            return json.loads(cleaned)
+        except Exception:
+            return {
+                "headline": "Simulation running…",
+                "analysis": response[:300],
+                "effects": ["System processing…"],
+                "verdict": "stable",
+                "fun_fact": "",
+                "visual_directives": None,
+            }
+
+    async def playground_setup(self, topic: str) -> dict:
+        """Topic interpreter: returns dynamic controls + scene setup for the Sandbox mode."""
+        prompt = f"""You are the GenVerse Simulation Engine. For the educational topic: '{topic}'
+
+Return ONLY valid JSON with these exact keys:
+{{
+  "controls": [
+    {{
+      "id": "unique_snake_case_id",
+      "label": "Human Label",
+      "unit": "unit_symbol",
+      "icon": "LucideIconName",
+      "default": 50,
+      "description": "Why this parameter matters for this topic"
+    }}
+  ],
+  "scene_type": "scene_name",
+  "actor_emoji": "🌱",
+  "actor_label": "Short Name",
+  "atmosphere": "Brief scene description"
+}}
+
+Rules:
+- controls: exactly 3-4 TOPIC-SPECIFIC scientifically relevant sliders
+- icon must be exactly one of: Sun, Droplets, Wind, Thermometer, Zap, Gauge, Microscope, FlaskConical, Atom, Mountain, Waves, Flame, Leaf, Activity, Cloud
+- default: integer 0-100
+- scene_type: exactly one of: garden, ocean, space, lab, forest, microscopic, geological, atmosphere, desert, arctic, urban, river
+- actor_emoji: the single most representative emoji for this topic's main subject
+- Return ONLY valid JSON, no markdown, no explanation."""
+
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            start = cleaned.find("{")
+            end = cleaned.rfind("}") + 1
+            return json.loads(cleaned[start:end])
+        except Exception:
+            return {
+                "controls": [
+                    {"id": "intensity", "label": "Intensity", "unit": "%", "icon": "Zap", "default": 50, "description": "Overall activity level"},
+                    {"id": "temperature", "label": "Temperature", "unit": "%", "icon": "Thermometer", "default": 40, "description": "Thermal energy"},
+                    {"id": "complexity", "label": "Complexity", "unit": "%", "icon": "Microscope", "default": 30, "description": "System complexity"},
+                ],
+                "scene_type": "lab",
+                "actor_emoji": "⚗️",
+                "actor_label": topic,
+                "atmosphere": f"Simulating {topic}",
+            }
+
+    async def playground_flashcards(self, topic: str) -> list:
+        """Flash-Duel: generate 5 gamified flashcards for a topic."""
+        prompt = f"""You are an energetic quiz master generating flashcards for an educational battle game.
+
+Topic: {topic}
+
+Generate EXACTLY 5 flashcards. Each must test a distinct, interesting aspect of the topic.
+Make questions progressively harder. Mix: 2 easy (10 pts), 2 medium (20 pts), 1 hard (30 pts).
+
+Return ONLY a valid JSON array — no markdown fences, no extra text:
+[
+  {{
+    "id": 1,
+    "question": "An engaging, specific question about the topic",
+    "answer": "Clear, concise answer (1-2 sentences)",
+    "hint": "A subtle clue that does not give the answer away",
+    "difficulty": "easy",
+    "points": 10
+  }}
+]
+
+difficulty must be exactly one of: easy | medium | hard
+Return ONLY the JSON array."""
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            data = json.loads(cleaned)
+            return data if isinstance(data, list) else data.get("cards", [])
+        except Exception:
+            return [
+                {"id": 1, "question": f"What is {topic}?", "answer": response[:200],
+                 "hint": "Think about the basics.", "difficulty": "easy", "points": 10}
+            ]
+
+    async def playground_quest(self, topic: str, history: list, choice: str | None) -> dict:
+        """Quest-Line: advance a branching narrative RPG that teaches the topic."""
+        history_str = ""
+        if history:
+            history_str = "\nStory so far:\n" + "\n".join(
+                f"[Scene {i + 1}] {h}" for i, h in enumerate(history)
+            )
+        chapter = len(history) + 1
+        choice_str = f"\nThe player chose: {choice}" if choice else "\nThis is the very first scene — open with a dramatic hook."
+        is_final = chapter >= 5
+        final_note = (
+            "IMPORTANT: This is the FINAL scene. Conclude the story with a satisfying ending "
+            "that summarises what was learned. Set choices to an empty array []."
+            if is_final
+            else "Provide exactly 3 distinct choices that each reflect a different concept or approach."
+        )
+        prompt = f"""You are a master storyteller running an educational RPG adventure.
+
+Topic: {topic}{history_str}{choice_str}
+
+Write scene {chapter}. Teach real, accurate concepts about {topic} woven into the narrative.
+High-energy, vivid, dramatic. Each scene: 3-4 sentences.
+{final_note}
+
+Return ONLY valid JSON — no markdown fences:
+{{
+  "scene": "Vivid 3-4 sentence scene description teaching a concept about {topic}",
+  "narrator": "One atmospheric narrator line",
+  "choices": ["Choice A: action tied to concept", "Choice B: different approach", "Choice C: creative/risky"],
+  "chapter": {chapter},
+  "is_final": {"true" if is_final else "false"},
+  "xp_gained": {10 + chapter * 5}
+}}
+Return ONLY valid JSON."""
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            return json.loads(cleaned)
+        except Exception:
+            return {
+                "scene": response[:400],
+                "narrator": f"Your {topic} adventure continues…",
+                "choices": ["Investigate further", "Take a different path", "Seek wisdom"],
+                "chapter": chapter,
+                "is_final": is_final,
+                "xp_gained": 10 + chapter * 5,
+            }
+
+    async def playground_mirror_chat(self, topic: str, persona: str, messages: list) -> str:
+        """The Mirror: LLM adopts an educational persona and chats in character."""
+        system_prompt = (
+            f'You are "{persona}", an ancient and wise entity who embodies the very essence of {topic}. '
+            f"Speak in first person as this persona. Be educational, mystical, poetic, and high-energy. "
+            f"Reveal knowledge about {topic} through your persona\u2019s perspective. "
+            f"Keep responses 2-4 sentences. Never break character. "
+            f"The student is visiting you to learn about {topic}."
+        )
+        gemini = self._get_gemini()
+        if gemini:
+            try:
+                history_str = "\n".join(
+                    f"{'STUDENT' if m['role'] == 'user' else 'YOU'}: {m['content']}"
+                    for m in messages
+                )
+                full_prompt = system_prompt + "\n\n" + history_str
+                resp = gemini.generate_content(full_prompt)
+                return resp.text
+            except Exception:
+                pass
+        openai = self._get_openai()
+        if openai:
+            try:
+                oai_messages = [{"role": "system", "content": system_prompt}]
+                for m in messages:
+                    oai_messages.append({"role": m["role"], "content": m["content"]})
+                resp = await openai.chat.completions.create(
+                    model=settings.AI_FALLBACK_MODEL,
+                    messages=oai_messages,
+                )
+                return resp.choices[0].message.content
+            except Exception:
+                pass
+        return f"*{persona} gazes into the distance…* Speak, seeker. What do you wish to know about {topic}?"
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _audience_context(role: str = "student", grade: int | None = None) -> str:
+        """Build an audience description string for AI prompts."""
+        if role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user"):
+            return (
+                "The audience is ADULTS (teachers, professionals, lifelong learners). "
+                "Use sophisticated vocabulary, real-world scenarios, deeper analytical questions, "
+                "industry jargon where appropriate, and a challenging tone. "
+                "Include trick questions and nuanced distinctions. "
+                "Roleplay: adopt a witty, competitive challenger persona — "
+                "tease the player when they get things wrong, celebrate boldly when they're right."
+            )
+        if grade and grade <= 5:
+            return (
+                f"The audience is young children (grade {grade}). "
+                "Use simple words, fun comparisons, colourful imagery, and an encouraging tone. "
+                "Keep questions easy and concrete. "
+                "Roleplay: be a friendly animal buddy (like a wise owl or clever fox) who cheers them on."
+            )
+        if grade and grade <= 8:
+            return (
+                f"The audience is middle-school students (grade {grade}). "
+                "Use age-appropriate vocabulary, relatable examples, and moderate challenge. "
+                "Roleplay: be an adventurous explorer character who discovers facts alongside the student."
+            )
+        return (
+            f"The audience is high-school students (grade {grade or 'unknown'}). "
+            "Use clear academic language, exam-style rigour, and a mix of easy to hard. "
+            "Roleplay: be a cool mentor/coach character who pushes the student to excel."
+        )
+
+    def _parse_json_array(self, text: str) -> list:
+        """Robustly extract a JSON array from LLM output."""
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```")[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+        start = cleaned.find("[")
+        end = cleaned.rfind("]") + 1
+        if start == -1 or end == 0:
+            return []
+        return json.loads(cleaned[start:end])
+
+    def _parse_json_object(self, text: str) -> dict:
+        """Robustly extract a JSON object from LLM output."""
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```")[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        if start == -1 or end == 0:
+            return {}
+        return json.loads(cleaned[start:end])
+
+    async def playground_match_pairs(self, topic: str, role: str = "student", grade: int | None = None) -> list:
+        """Match Mania / Concept Connect: generate 6 term-definition pairs."""
+        audience = self._audience_context(role, grade)
+        prompt = (
+            f"{audience}\n\n"
+            f"Generate exactly 6 term-definition pairs for the topic: '{topic}'.\n"
+            "Each pair must test a distinct, important concept within the topic.\n"
+            "Terms should be concise (1-3 words). Definitions should be clear (5-12 words).\n\n"
+            "Return ONLY a valid JSON array — no markdown, no explanation:\n"
+            '[{"term": "Chloroplast", "definition": "Organelle where photosynthesis occurs in plant cells"}]'
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            data = self._parse_json_array(response)
+            return data[:6] if isinstance(data, list) else []
+        except Exception:
+            return [
+                {"term": f"Term {i+1}", "definition": f"Definition for concept {i+1} in {topic}"}
+                for i in range(6)
+            ]
+
+    async def playground_swipe_facts(self, topic: str, role: str = "student", grade: int | None = None) -> list:
+        """Swipe & Sort: generate 10 true/false statements."""
+        audience = self._audience_context(role, grade)
+        prompt = (
+            f"{audience}\n\n"
+            f"Generate exactly 10 statements about '{topic}'.\n"
+            "Mix TRUE and FALSE (approximately 5-6 true, 4-5 false).\n"
+            "False statements must be plausible but scientifically/factually incorrect.\n\n"
+            "Return ONLY a valid JSON array — no markdown, no explanation:\n"
+            '[{"statement": "Plants absorb CO2 through their roots", "is_true": false, '
+            '"explanation": "Plants absorb CO2 through stomata in their leaves"}]\n\n'
+            "Every item: statement (string), is_true (boolean), explanation (1 sentence).\n"
+            "Return ONLY the JSON array."
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            data = self._parse_json_array(response)
+            return data[:10] if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    async def playground_speed_quiz(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+        """Speed Blitz: generate 10 MCQ questions + a challenger persona."""
+        audience = self._audience_context(role, grade)
+        is_adult = role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user")
+
+        prompt = (
+            f"{audience}\n\n"
+            f"Generate a quiz challenge about '{topic}'.\n"
+            "Return a JSON object with two keys:\n\n"
+            '1. "challenger": an object describing the AI challenger character:\n'
+            '   - "name": a fun character name\n'
+            '   - "avatar": an emoji that represents this character\n'
+            '   - "taunt": a short competitive opening line (10-15 words)\n'
+            '   - "win_line": what they say if the player scores over 70%\n'
+            '   - "lose_line": what they say if the player scores under 50%\n\n'
+            '2. "questions": an array of exactly 10 MCQ questions. Each question:\n'
+            '   - "question": the question text\n'
+            '   - "options": array of exactly 4 options\n'
+            '   - "correct": 0-based index of the correct answer\n'
+            '   - "difficulty": "easy" | "medium" | "hard"\n'
+            '   - "points": 10 (easy) | 20 (medium) | 30 (hard)\n'
+            '   - "explanation": 1-sentence explanation of the correct answer\n'
+            f'   Mix: {"3 easy, 4 medium, 3 hard" if is_adult else "4 easy, 4 medium, 2 hard"}.\n\n'
+            "Return ONLY the JSON object — no markdown, no extra text."
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            data = self._parse_json_object(response)
+            if "questions" in data:
+                data["questions"] = data["questions"][:10]
+            return data
+        except Exception:
+            try:
+                questions = self._parse_json_array(response)
+                return {
+                    "questions": questions[:10] if isinstance(questions, list) else [],
+                    "challenger": {
+                        "name": "Quiz Bot",
+                        "avatar": "\U0001F916",
+                        "taunt": "Think you can beat me? Let's find out!",
+                        "win_line": "Impressive! You actually beat me!",
+                        "lose_line": "Better luck next time, challenger!",
+                    },
+                }
+            except Exception:
+                return {"questions": [], "challenger": {}}
+
+    async def playground_roleplay(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+        """Generate an immersive roleplay scenario with character, scenes, and choices."""
+        audience = self._audience_context(role, grade)
+        is_adult = role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user")
+
+        prompt = (
+            f"{audience}\n\n"
+            f"Create an immersive roleplay scenario about '{topic}'.\n"
+            "The user will play through the scenario by making choices.\n\n"
+            "Return a JSON object with:\n"
+            '1. "title": short scenario title (3-6 words)\n'
+            '2. "setting": 1-sentence setting description\n'
+            '3. "character": the AI character who guides the scenario:\n'
+            '   - "name": a memorable character name\n'
+            '   - "avatar": a single emoji representing this character\n'
+            f'   - "role": their role (e.g. {"\"seasoned professor\", \"industry expert\", \"detective\"" if is_adult else "\"friendly guide\", \"explorer buddy\", \"wise mentor\""})\n'
+            '   - "personality": 1-sentence personality description\n\n'
+            f'4. "scenes": array of exactly {5 if is_adult else 4} scenes. Each scene:\n'
+            '   - "scene_number": 1-based index\n'
+            '   - "narration": 1-2 sentences setting the scene\n'
+            '   - "character_line": what the character says (15-30 words, in-character)\n'
+            '   - "character_mood": one of "happy", "excited", "thinking", "concerned", "proud", "surprised", "encouraging"\n'
+            '   - "choices": array of exactly 3 choices, each:\n'
+            '     - "text": the action/response option (10-20 words)\n'
+            '     - "quality": "best" | "good" | "poor"\n'
+            '     - "feedback": 1-2 sentences explaining why this choice was good/bad\n'
+            '     - "points": 30 (best) | 15 (good) | 5 (poor)\n\n'
+            f'5. "total_scenes": {5 if is_adult else 4}\n\n'
+            "IMPORTANT: Exactly ONE choice per scene must be 'best', ONE 'good', ONE 'poor'.\n"
+            "Shuffle the order of best/good/poor in each scene.\n"
+            "Each scene must teach something important about the topic.\n"
+            "Return ONLY the JSON object — no markdown, no extra text."
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            return self._parse_json_object(response)
+        except Exception:
+            return {
+                "title": f"Exploring {topic}",
+                "setting": f"A journey through {topic}",
+                "character": {"name": "Guide", "avatar": "\U0001F9D9", "role": "mentor", "personality": "Wise and encouraging"},
+                "scenes": [],
+                "total_scenes": 0,
+            }
+
+    async def playground_imagine(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+        """Generate a creative 'What if?' scenario with open-ended prompts."""
+        audience = self._audience_context(role, grade)
+        is_adult = role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user")
+
+        prompt = (
+            f"{audience}\n\n"
+            f"Create a creative 'What if?' scenario about '{topic}' that sparks imagination.\n\n"
+            "Return a JSON object with:\n"
+            '1. "title": catchy scenario title (4-8 words)\n'
+            '2. "hook": an imaginative premise or "What if?" question (2-3 sentences)\n'
+            '3. "background_emoji": a single emoji representing the scenario mood\n'
+            f'4. "prompts": array of exactly {4 if is_adult else 3} open-ended prompts. Each:\n'
+            '   - "prompt_number": 1-based index\n'
+            f'   - "question": a thought-provoking open-ended question ({"challenging, analytical, requires expertise" if is_adult else "creative, imaginative, age-appropriate"})\n'
+            '   - "hint": a short hint or nudge (1 sentence)\n'
+            f'   - "max_points": {25 if is_adult else 20}\n\n'
+            "Questions should build on each other — start simpler, get more creative.\n"
+            "Make the scenario fascinating and engaging.\n"
+            "Return ONLY the JSON object — no markdown, no extra text."
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            return self._parse_json_object(response)
+        except Exception:
+            return {
+                "title": f"Imagining {topic}",
+                "hook": f"What if everything about {topic} was different?",
+                "background_emoji": "\U0001F4A1",
+                "prompts": [],
+            }
+
+    async def playground_imagine_evaluate(
+        self, topic: str, question: str, answer: str,
+        max_points: int = 20, role: str = "student", grade: int | None = None
+    ) -> dict:
+        """Evaluate a creative open-ended answer."""
+        audience = self._audience_context(role, grade)
+        prompt = (
+            f"{audience}\n\n"
+            f"Topic: {topic}\n"
+            f"Question asked: {question}\n"
+            f"Student's answer: {answer}\n\n"
+            f"Evaluate this creative answer on a scale of 0 to {max_points}.\n"
+            "Consider: creativity, depth of understanding, accuracy, and originality.\n"
+            "Be encouraging but honest.\n\n"
+            "Return a JSON object with:\n"
+            f'- "score": integer 0-{max_points}\n'
+            f'- "max_score": {max_points}\n'
+            '- "feedback": 2-3 sentences of constructive feedback\n'
+            '- "highlight": the best part of their answer (quote a phrase or summarize)\n\n'
+            "Return ONLY the JSON object — no markdown."
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            return self._parse_json_object(response)
+        except Exception:
+            return {"score": max_points // 2, "max_score": max_points, "feedback": "Good effort!", "highlight": ""}
