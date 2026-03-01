@@ -47,6 +47,7 @@ class AiMessageResponse(BaseModel):
     content: str
     language: Optional[str] = None
     sources_json: Optional[Any] = None
+    enhancements_json: Optional[Any] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -58,6 +59,7 @@ class ChatSettingsUpdate(BaseModel):
     content_length: Optional[str] = None
     explain_3ways: Optional[bool] = None
     mind_map: Optional[bool] = None
+    infographic: Optional[bool] = None
     examples: Optional[bool] = None
     output_mode: Optional[str] = None
     student_mode: Optional[bool] = None
@@ -75,6 +77,7 @@ class ChatSettingsResponse(BaseModel):
     content_length: str
     explain_3ways: bool
     mind_map: bool
+    infographic: bool
     examples: bool
     output_mode: str
     student_mode: bool
@@ -167,6 +170,25 @@ class NextStepsResponse(BaseModel):
     steps: List[str]
 
 
+class PracticeExercisesRequest(BaseModel):
+    message: str
+    response: str
+    count: int = 3
+    grade: Optional[int] = None
+    difficulty: str = "medium"
+
+
+class PracticeExercise(BaseModel):
+    question: str
+    answer: str
+    type: str  # short | mcq | true_false
+    options: Optional[List[str]] = None
+
+
+class PracticeExercisesResponse(BaseModel):
+    exercises: List[PracticeExercise]
+
+
 class GeneratePracticeAssessmentRequest(BaseModel):
     topic: Optional[str] = None
     multi_topics: Optional[List[str]] = None
@@ -194,3 +216,25 @@ class GeneratePracticeAssessmentRequest(BaseModel):
 class GeneratedQuestionsResponse(BaseModel):
     question_json: List[dict]
     answer_key_json: List[dict]
+
+
+class MindMapRequest(BaseModel):
+    message: str
+    response: str
+    grade: Optional[int] = None
+    language: str = "English"
+
+
+class MindMapResponse(BaseModel):
+    mindmap: Any  # JSON tree structure
+
+
+class InfographicRequest(BaseModel):
+    message: str
+    response: str
+    grade: Optional[int] = None
+    language: str = "English"
+
+
+class InfographicResponse(BaseModel):
+    infographic: Any  # JSON structure with sections

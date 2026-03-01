@@ -32,6 +32,7 @@ class AiChatMessage(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     language: Mapped[str | None] = mapped_column(String(10))
     sources_json: Mapped[dict | None] = mapped_column(JSONB)  # [{title, url, snippet}]
+    enhancements_json: Mapped[dict | None] = mapped_column(JSONB)  # follow_ups, video_refs, mind_map, etc.
     token_count: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -48,6 +49,7 @@ class AiChatSetting(Base):
     content_length: Mapped[str] = mapped_column(String(20), default="medium")
     explain_3ways: Mapped[bool] = mapped_column(Boolean, default=False)
     mind_map: Mapped[bool] = mapped_column(Boolean, default=False)
+    infographic: Mapped[bool] = mapped_column(Boolean, default=False)
     examples: Mapped[bool] = mapped_column(Boolean, default=True)
     output_mode: Mapped[str] = mapped_column(String(50), default="text")
     # Enhancement feature toggles

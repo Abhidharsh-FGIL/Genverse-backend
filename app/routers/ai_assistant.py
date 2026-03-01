@@ -12,7 +12,9 @@ from app.schemas.ai import (
     AiChatCreate, AiChatUpdate, AiChatResponse, AiMessageResponse,
     SendMessageRequest, ChatSettingsUpdate, ChatSettingsResponse,
     FollowUpRequest, FollowUpResponse, VideoRefsRequest, VideoRefsResponse,
-    NextStepsRequest, NextStepsResponse,
+    NextStepsRequest, NextStepsResponse, MindMapRequest, MindMapResponse,
+    InfographicRequest, InfographicResponse,
+    PracticeExercisesRequest, PracticeExercise, PracticeExercisesResponse,
     GeneratePracticeAssessmentRequest, GeneratedQuestionsResponse,
 )
 from app.core.exceptions import NotFoundException
@@ -257,6 +259,7 @@ async def send_message_stream(
             "content_length": db_settings.content_length,
             "explain_3ways": db_settings.explain_3ways,
             "mind_map": db_settings.mind_map,
+            "infographic": db_settings.infographic,
             "examples": db_settings.examples,
             "output_mode": db_settings.output_mode,
             "student_mode": db_settings.student_mode,
@@ -317,6 +320,7 @@ async def send_message_stream(
                 chat_id=chat_id,
                 role="assistant",
                 content=full_response,
+                enhancements_json={"settings_snapshot": chat_settings} if chat_settings else None,
             )
             session.add(assistant_msg)
             chat_obj = await session.get(AiChat, chat_id)
@@ -431,6 +435,49 @@ async def update_chat_settings(
     return settings
 
 
+async def _persist_enhancement(db, chat_id: uuid.UUID, key: str, value):
+    """Atomically merge one enhancement key into the last assistant message's enhancements_json.
+
+    Uses SQLAlchemy ORM update with PostgreSQL JSONB ``||`` merge so concurrent
+    calls from parallel enhancement endpoints don't overwrite each other.
+    Failures are logged but never propagated — the enhancement data has already
+    been generated and will still be returned to the frontend.
+    """
+    import logging
+    from sqlalchemy import update, type_coerce, func
+    from sqlalchemy.dialects.postgresql import JSONB as JSONB_TYPE
+
+    try:
+        # Find the last assistant message id
+        result = await db.execute(
+            select(AiChatMessage.id)
+            .where(AiChatMessage.chat_id == chat_id, AiChatMessage.role == "assistant")
+            .order_by(AiChatMessage.created_at.desc())
+            .limit(1)
+        )
+        msg_id = result.scalar_one_or_none()
+        if not msg_id:
+            return
+
+        patch = {key: value}
+        await db.execute(
+            update(AiChatMessage)
+            .where(AiChatMessage.id == msg_id)
+            .values(
+                enhancements_json=func.coalesce(
+                    AiChatMessage.enhancements_json, type_coerce({}, JSONB_TYPE)
+                ).concat(type_coerce(patch, JSONB_TYPE))
+            )
+        )
+        await db.commit()
+    except Exception:
+        logging.getLogger(__name__).warning("Failed to persist enhancement '%s' for chat %s", key, chat_id, exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+
 @router.post("/chats/{chat_id}/follow-ups", response_model=FollowUpResponse)
 async def generate_follow_ups(
     chat_id: uuid.UUID,
@@ -452,6 +499,7 @@ async def generate_follow_ups(
         ai_response=payload.response,
         count=payload.count,
     )
+    await _persist_enhancement(db, chat_id, "follow_ups", questions)
     return FollowUpResponse(questions=questions)
 
 
@@ -479,6 +527,7 @@ async def get_video_refs(
     from app.services.youtube_service import YouTubeService
     yt = YouTubeService()
     videos = await yt.search_videos(query=search_query, max_results=3)
+    await _persist_enhancement(db, chat_id, "video_refs", [v if isinstance(v, dict) else v.model_dump() for v in videos])
     return VideoRefsResponse(videos=videos)
 
 
@@ -502,7 +551,88 @@ async def get_next_steps(
         ai_response=payload.response,
         count=payload.count,
     )
+    await _persist_enhancement(db, chat_id, "next_steps", steps)
     return NextStepsResponse(steps=steps)
+
+
+@router.post("/chats/{chat_id}/practice-exercises", response_model=PracticeExercisesResponse)
+async def generate_chat_practice_exercises(
+    chat_id: uuid.UUID,
+    payload: PracticeExercisesRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Generate dynamic practice exercises based on the last Q&A exchange."""
+    chat_result = await db.execute(
+        select(AiChat).where(AiChat.id == chat_id, AiChat.user_id == current_user.id)
+    )
+    if not chat_result.scalar_one_or_none():
+        raise NotFoundException("Chat not found")
+
+    ai = AIService()
+    raw_exercises = await ai.generate_practice_exercises(
+        user_message=payload.message,
+        ai_response=payload.response,
+        count=payload.count,
+        grade=payload.grade,
+        difficulty=payload.difficulty,
+    )
+    exercises = [PracticeExercise(**ex) for ex in raw_exercises]
+    await _persist_enhancement(
+        db, chat_id, "practice_exercises",
+        [ex.model_dump() for ex in exercises],
+    )
+    return PracticeExercisesResponse(exercises=exercises)
+
+
+@router.post("/chats/{chat_id}/mindmap", response_model=MindMapResponse)
+async def generate_chat_mindmap(
+    chat_id: uuid.UUID,
+    payload: MindMapRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Generate a visual mind map from the last Q&A exchange."""
+    chat_result = await db.execute(
+        select(AiChat).where(AiChat.id == chat_id, AiChat.user_id == current_user.id)
+    )
+    if not chat_result.scalar_one_or_none():
+        raise NotFoundException("Chat not found")
+
+    ai = AIService()
+    mindmap = await ai.generate_chat_mindmap(
+        user_message=payload.message,
+        ai_response=payload.response,
+        grade=payload.grade,
+        language=payload.language,
+    )
+    await _persist_enhancement(db, chat_id, "mind_map", mindmap)
+    return MindMapResponse(mindmap=mindmap)
+
+
+@router.post("/chats/{chat_id}/infographic", response_model=InfographicResponse)
+async def generate_chat_infographic(
+    chat_id: uuid.UUID,
+    payload: InfographicRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Generate a structured infographic from the last Q&A exchange."""
+    chat_result = await db.execute(
+        select(AiChat).where(AiChat.id == chat_id, AiChat.user_id == current_user.id)
+    )
+    if not chat_result.scalar_one_or_none():
+        raise NotFoundException("Chat not found")
+
+    ai = AIService()
+    infographic = await ai.generate_chat_infographic(
+        user_message=payload.message,
+        ai_response=payload.response,
+        grade=payload.grade,
+        language=payload.language,
+    )
+    await _persist_enhancement(db, chat_id, "infographic", infographic)
+    return InfographicResponse(infographic=infographic)
 
 
 @router.post("/generate-practice-assessment", response_model=GeneratedQuestionsResponse)

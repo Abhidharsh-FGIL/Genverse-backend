@@ -7,6 +7,7 @@ Configure the AI provider via .env:
   AI_PRIMARY_MODEL=gemini-2.5-flash
 """
 import json
+import re
 from typing import AsyncIterator, List, Optional, Any, Dict
 from pathlib import Path
 
@@ -101,11 +102,8 @@ class AIService:
         if chat_settings.get("examples"):
             parts.append("Always include concrete, real-world examples to illustrate concepts.")
 
-        if chat_settings.get("mind_map"):
-            parts.append(
-                "At the end of your response, include a brief mind-map outline using bullet points "
-                "showing how the key concepts relate to each other."
-            )
+        # mind_map is now handled as a separate visual card — no inline bullet outline needed.
+        # The mind map is generated via a dedicated endpoint after the response completes.
 
         output_mode = chat_settings.get("output_mode", "text")
         if output_mode == "structured":
@@ -2277,6 +2275,65 @@ Return ONLY valid JSON.
             pass
         return []
 
+    async def generate_practice_exercises(
+        self,
+        user_message: str,
+        ai_response: str,
+        count: int = 3,
+        grade: int | None = None,
+        difficulty: str = "medium",
+    ) -> list[dict]:
+        """Generate quick practice exercises from a chat Q&A exchange.
+
+        Returns a list of dicts, each with keys: question, answer, type, options (optional).
+        """
+        grade_hint = f" for grade {grade} students" if grade else ""
+        prompt = (
+            f"You are creating {count} quick practice exercises{grade_hint} based on the following Q&A exchange. "
+            f"Difficulty: {difficulty}.\n\n"
+            f"Student asked: {user_message[:600]}\n\n"
+            f"AI responded: {ai_response[:1500]}\n\n"
+            "Generate a MIX of question types. Return ONLY a JSON array with this exact format:\n"
+            "[\n"
+            '  {"question": "What is...?", "answer": "Concise answer here.", "type": "short"},\n'
+            '  {"question": "Which of the following...?", "answer": "B", "type": "mcq", '
+            '"options": ["option A", "correct option B", "option C", "option D"]},\n'
+            '  {"question": "Statement to evaluate.", "answer": "True", "type": "true_false"}\n'
+            "]\n\n"
+            "Rules:\n"
+            "- Use exactly these types: short, mcq, true_false\n"
+            "- MCQ must have exactly 4 options and the answer must be the letter (A/B/C/D)\n"
+            "- true_false answer must be exactly 'True' or 'False'\n"
+            "- short answer should be 1-3 sentences\n"
+            "- Questions must be directly based on the content discussed\n"
+            f"- Generate exactly {count} exercises\n"
+            "- Return ONLY the JSON array, no markdown fences or extra text"
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            exercises = json.loads(cleaned)
+            if isinstance(exercises, list):
+                result = []
+                for ex in exercises[:count]:
+                    if isinstance(ex, dict) and "question" in ex and "answer" in ex:
+                        item = {
+                            "question": str(ex["question"]),
+                            "answer": str(ex["answer"]),
+                            "type": ex.get("type", "short"),
+                        }
+                        if ex.get("options") and isinstance(ex["options"], list):
+                            item["options"] = [str(o) for o in ex["options"][:4]]
+                        result.append(item)
+                return result
+        except Exception:
+            pass
+        return []
+
     async def extract_video_search_query(self, user_message: str, ai_response: str) -> str:
         """Extract the best YouTube search query from a Q&A exchange."""
         prompt = (
@@ -2288,6 +2345,190 @@ Return ONLY valid JSON.
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         return response.strip().strip('"').strip("'")[:100]
+
+    # ── Chat Mind Map & Infographic ──────────────────────────────────────────
+
+    async def generate_chat_mindmap(
+        self,
+        user_message: str,
+        ai_response: str,
+        grade: int | None = None,
+        language: str = "English",
+    ) -> dict:
+        """Generate a structured mind map JSON from a chat Q&A exchange."""
+        grade_str = f"grade {grade}" if grade else "general"
+        prompt = f"""You are a mind-map extractor. Your ONLY job is to read the AI explanation below and
+reorganise the SAME information into a hierarchical mind map. Do NOT add external knowledge.
+Every single node label MUST come directly from a heading, key phrase, term, fact, or example
+that appears in the explanation text.
+
+Topic: {user_message[:500]}
+Grade Level: {grade_str}
+Language: {language}
+
+── AI EXPLANATION (this is your ONLY source — extract nodes from here) ──
+{ai_response[:4000]}
+── END OF EXPLANATION ──
+
+STRICT Rules:
+1. Root node "label" = the main topic (2-6 words).
+2. First-level children = the major headings / sections from the explanation.
+3. Deeper children = the key facts, terms, examples, dates, or details under each section.
+4. Every node label must be a phrase that is clearly present in or directly derived from the explanation above.
+5. Do NOT invent new facts, do NOT add information not in the explanation.
+6. Keep labels concise (2-6 words). 3-4 depth levels minimum.
+7. Aim for 4-8 first-level children, each with 2-5 sub-children.
+8. No repetition. No markdown. No code fences. Raw JSON only.
+
+Return ONLY this JSON structure:
+{{
+  "label": "Main Topic",
+  "children": [
+    {{
+      "label": "Section Heading",
+      "children": [
+        {{
+          "label": "Key Fact A",
+          "children": [
+            {{ "label": "Detail" }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}"""
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            cleaned = response.strip()
+            fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
+            if fence_match:
+                cleaned = fence_match.group(1).strip()
+            start = cleaned.find("{")
+            end = cleaned.rfind("}") + 1
+            if start >= 0 and end > start:
+                json_str = cleaned[start:end]
+                try:
+                    result = json.loads(json_str)
+                except json.JSONDecodeError:
+                    json_str = json_str.replace("'", '"')
+                    result = json.loads(json_str)
+                if isinstance(result, dict) and "label" in result:
+                    if "children" not in result:
+                        result["children"] = []
+                    return result
+        except Exception:
+            pass
+
+        # Fallback: build a simple mind map from the AI response text
+        sentences = re.split(r'(?<=[.!?])\s+', ai_response.strip())
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+        children = []
+        chunk_size = max(1, len(sentences) // 5) if len(sentences) > 5 else 1
+        for i in range(0, len(sentences), chunk_size):
+            chunk = sentences[i:i + chunk_size]
+            if len(chunk) == 1:
+                children.append({"label": chunk[0][:60], "children": []})
+            else:
+                sub_children = [{"label": s[:60]} for s in chunk[1:]]
+                children.append({"label": chunk[0][:60], "children": sub_children})
+        if not children:
+            children = [{"label": ai_response[:60], "children": []}]
+        return {"label": user_message[:50], "children": children[:8]}
+
+    async def generate_chat_infographic(
+        self,
+        user_message: str,
+        ai_response: str,
+        grade: int | None = None,
+        language: str = "English",
+    ) -> dict:
+        """Generate an infographic using Gemini image generation with JSON fallback."""
+        import base64
+        import asyncio
+
+        grade_str = f"grade {grade}" if grade else "general"
+        topic = user_message[:300]
+        explanation = ai_response[:3000]
+
+        prompt = (
+            f"Create a beautiful, colorful educational infographic poster about: {topic}\n\n"
+            f"Grade Level: {grade_str}\n"
+            f"Language: {language}\n\n"
+            f"Key information to include in the infographic:\n{explanation}\n\n"
+            "Design requirements:\n"
+            "- Bold title at the top\n"
+            "- Use vibrant colors, icons, and visual hierarchy\n"
+            "- Organize information into clear visual sections with headings\n"
+            "- Include key facts, statistics, and dates as visual callouts\n"
+            "- Use arrows, connectors, or flow lines between related concepts\n"
+            "- Make text readable and well-spaced\n"
+            "- Professional infographic style suitable for students\n"
+            "- Dark or colored background with contrasting text\n"
+            "- Do NOT leave large empty spaces — fill with relevant visual elements"
+        )
+
+        try:
+            from google import genai
+            from google.genai import types
+
+            client = genai.Client(api_key=settings.GOOGLE_GEMINI_API_KEY)
+
+            def _generate():
+                return client.models.generate_content(
+                    model="gemini-3-pro-image-preview",
+                    contents=[prompt],
+                    config=types.GenerateContentConfig(
+                        response_modalities=["TEXT", "IMAGE"],
+                    ),
+                )
+
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, _generate)
+
+            for part in response.parts:
+                if part.inline_data is not None:
+                    img_bytes = part.inline_data.data
+                    mime = part.inline_data.mime_type or "image/png"
+                    b64 = base64.b64encode(img_bytes).decode("utf-8")
+                    data_uri = f"data:{mime};base64,{b64}"
+                    return {
+                        "image_base64": data_uri,
+                        "title": topic,
+                        "mode": "image",
+                    }
+        except Exception:
+            pass
+
+        # Fallback: generate JSON-based infographic using primary text model
+        fallback_prompt = f"""You are an infographic designer. Convert this into a structured infographic layout.
+
+Topic: {topic}
+Grade Level: {grade_str}
+Language: {language}
+
+── AI EXPLANATION ──
+{explanation}
+── END ──
+
+Return ONLY raw JSON with: title, subtitle, sections (array of heading/icon/color/facts/highlight), keyTakeaway.
+Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shield, Brain, Heart, TrendingUp, BarChart, Layers"""
+
+        response_text = await self.chat([{"role": "user", "content": fallback_prompt}])
+        try:
+            cleaned = response_text.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            start = cleaned.find("{")
+            end = cleaned.rfind("}") + 1
+            if start >= 0 and end > start:
+                result = json.loads(cleaned[start:end])
+                result["mode"] = "json"
+                return result
+        except Exception:
+            pass
+        return {"title": user_message[:50], "subtitle": "", "sections": [], "keyTakeaway": "", "mode": "json"}
 
     def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 100) -> List[str]:
         """Split text into overlapping character-based chunks (legacy fallback)."""
