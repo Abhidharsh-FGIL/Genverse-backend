@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from pydantic import BaseModel
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Literal
 
 
 class LibraryItemResponse(BaseModel):
@@ -39,15 +39,73 @@ class VaultQueryResponse(BaseModel):
     points_used: int = 3
 
 
-class EbookGenerateRequest(BaseModel):
+class EbookOutlineRequest(BaseModel):
     title: str
+    topic: str
     subject: Optional[str] = None
     grade: Optional[int] = None
     language: str = "en"
+    book_size: Optional[Literal["short", "medium", "large"]] = "short"
+    tone: Optional[Literal["academic", "simple", "story_based", "exam_oriented"]] = "academic"
+
+
+class EbookOutlineChapter(BaseModel):
+    title: str
+    description: str
+
+
+class EbookOutlineResponse(BaseModel):
+    chapters: List[EbookOutlineChapter]
+
+
+class EbookChapterInput(BaseModel):
+    title: str
+    description: Optional[str] = None
+
+
+class AssessmentConfig(BaseModel):
+    enabled: bool = False
+    placement: str = "end_of_chapter"   # end_of_chapter | final_section | both
+    difficulty: str = "medium"          # easy | medium | hard | mixed
+    questionTypes: List[str] = ["MCQ"]  # MCQ | Fill in Blank | Short Answer
+    bloomsLevel: str = "understand"     # remember | understand | apply | analyze | evaluate | create
+
+
+class EbookGenerateRequest(BaseModel):
+    title: str
+    topic: Optional[str] = None
+    subject: Optional[str] = None
+    grade: Optional[int] = None
+    language: str = "en"
+    author: Optional[str] = None
     source_type: str = "topic"  # topic | vault | pdf
     source_ref_id: Optional[str] = None
-    outline: Optional[List[str]] = None
-    page_count: int = 5
+    chapters: Optional[List[EbookChapterInput]] = None  # from wizard outline step
+    outline: Optional[List[str]] = None  # legacy flat list
+    book_size: Optional[Literal["short", "medium", "large"]] = None
+    page_count: Optional[int] = None
+    tone: Optional[Literal["academic", "simple", "story_based", "exam_oriented"]] = "academic"
+    image_density: Optional[Literal["minimal", "standard", "visual_heavy"]] = "standard"
+    image_types: Optional[List[str]] = None
+    assessment_config: Optional[AssessmentConfig] = None
+
+
+class EbookGeneratedContent(BaseModel):
+    ebook_json: Any
+    page_count: int
+    points_used: int
+
+
+class EbookCreateRequest(BaseModel):
+    title: str
+    ebook_json: Any
+    language: str = "en"
+    source_type: str = "topic"
+    source_ref_id: Optional[str] = None
+    subject: Optional[str] = None
+    grade: Optional[int] = None
+    page_count: Optional[int] = None
+    points_used: Optional[int] = None
 
 
 class EbookResponse(BaseModel):
@@ -67,9 +125,10 @@ class EbookResponse(BaseModel):
 
 
 class AudiobookGenerateRequest(BaseModel):
-    ebook_id: str
+    ebook_id: Optional[str] = None
     language: str = "en"
     voice_profile: Optional[str] = None
+    narration_style: Optional[Literal["standard", "slow_clear", "energetic", "calm"]] = "standard"
 
 
 class AudiobookResponse(BaseModel):
@@ -78,10 +137,17 @@ class AudiobookResponse(BaseModel):
     audio_path: Optional[str] = None
     language: str
     voice_profile: Optional[str] = None
+    narration_style: Optional[str] = None
     duration_seconds: Optional[int] = None
+    chapter_timestamps: Optional[List[dict]] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class AudiobookVoicesResponse(BaseModel):
+    language: str
+    voices: List[dict]
 
 
 class MindMapGenerateRequest(BaseModel):

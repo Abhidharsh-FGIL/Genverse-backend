@@ -579,6 +579,158 @@ Return ONLY valid JSON, no markdown:
                 "percentage": percentage,
             }
 
+    async def generate_ebook_outline(
+        self,
+        title: str,
+        topic: str,
+        subject: str | None,
+        language: str,
+        chapter_range: tuple,
+        tone: str,
+    ) -> List[dict]:
+        """Generate chapter titles and descriptions only — no full content."""
+        min_ch, max_ch = chapter_range
+
+        tone_context = {
+            "academic": "formal and scholarly",
+            "simple": "beginner-friendly and easy to follow",
+            "story_based": "narrative-driven with engaging storytelling",
+            "exam_oriented": "focused on exam-relevant topics and key facts",
+        }.get(tone, "educational")
+
+        prompt = f"""You are an expert educational author. Create a chapter outline for an eBook.
+
+Title: {title}
+Topic: {topic}
+Subject: {subject or "General"}
+Language: {language}
+Number of chapters: between {min_ch} and {max_ch}
+Writing style: {tone_context}
+
+Generate a logical, well-structured chapter outline where:
+- Chapter titles are concise and clear (4-8 words)
+- Descriptions are 1-2 sentences explaining what the chapter covers
+- Chapters flow naturally from foundational concepts to advanced ones
+- The tone/style "{tone}" is reflected in how chapters are framed
+
+Return ONLY valid JSON in this exact structure:
+{{
+  "chapters": [
+    {{
+      "title": "Chapter title here",
+      "description": "Brief description of what this chapter covers."
+    }}
+  ]
+}}"""
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            data = json.loads(cleaned)
+            return data.get("chapters", [])
+        except Exception:
+            return []
+
+    async def generate_ebook_images(
+        self,
+        title: str,
+        chapters: List[dict],
+        image_density: str,
+        image_types: List[str] | None,
+        subject: str | None = None,
+        grade: int | None = None,
+        tone: str = "academic",
+    ) -> dict:
+        """Retrieve images using Google Custom Search API for ebook cover and chapters."""
+        import asyncio
+        import base64
+        import aiohttp
+
+        _API_KEY = "AIzaSyA_Zfen4abuUycPzB-p12i4zGrbOe7o0ng"
+        _CX = "1536a454c256149b5"
+        _SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+        _HEADERS = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.google.com",
+        }
+
+        grade_str = f"Grade {grade}" if grade else ""
+        subj_str = subject or ""
+
+        images_per_chapter = {"minimal": 0, "standard": 1, "visual_heavy": 2}.get(image_density, 1)
+        result: dict = {"cover_image": None, "chapter_images": {}}
+
+        async def _search_and_fetch(query: str) -> str | None:
+            """Search Google Images for *query* and return the first result as a base64 data URL."""
+            try:
+                params = {
+                    "key": _API_KEY,
+                    "cx": _CX,
+                    "searchType": "image",
+                    "q": query,
+                    "num": 1,
+                    "safe": "active",
+                    "imgType": "photo",
+                }
+                timeout = aiohttp.ClientTimeout(total=20)
+                async with aiohttp.ClientSession(headers=_HEADERS, timeout=timeout) as session:
+                    async with session.get(_SEARCH_URL, params=params) as resp:
+                        if resp.status != 200:
+                            return None
+                        data = await resp.json()
+                        items = data.get("items", [])
+                        if not items:
+                            return None
+                        img_url: str = items[0]["link"]
+
+                    async with session.get(img_url) as img_resp:
+                        if img_resp.status != 200:
+                            return None
+                        img_bytes = await img_resp.read()
+                        content_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+                        if not content_type.startswith("image/"):
+                            content_type = "image/jpeg"
+                        b64 = base64.b64encode(img_bytes).decode()
+                        return f"data:{content_type};base64,{b64}"
+            except Exception:
+                return None
+
+        def _chapter_query(ch: dict, img_idx: int) -> str:
+            ch_title = ch.get("title", "")
+            key_pts = ch.get("key_points", []) or []
+            concepts = " ".join(str(k) for k in key_pts[:2]) if key_pts else ""
+            parts = [p for p in [subj_str, grade_str, ch_title, concepts] if p]
+            query = " ".join(parts).strip()
+            if img_idx > 0:
+                query += " diagram illustration"
+            return query
+
+        tasks: list[tuple[str, int | None, object]] = []
+
+        cover_query_parts = [p for p in [subj_str, grade_str, title, "educational"] if p]
+        cover_query = " ".join(cover_query_parts)
+        tasks.append(("cover", None, _search_and_fetch(cover_query)))
+
+        if images_per_chapter > 0:
+            max_chapters = 10
+            for i, ch in enumerate(chapters[:max_chapters]):
+                for img_idx in range(images_per_chapter):
+                    tasks.append((f"ch_{i}_{img_idx}", i, _search_and_fetch(_chapter_query(ch, img_idx))))
+
+        data_urls = await asyncio.gather(*[t[2] for t in tasks])
+        for (key, ch_idx, _), data_url in zip(tasks, data_urls):
+            if key == "cover":
+                result["cover_image"] = data_url
+            elif data_url and ch_idx is not None:
+                ch_key = str(ch_idx)
+                result["chapter_images"].setdefault(ch_key, [])
+                result["chapter_images"][ch_key].append(data_url)
+
+        return result
+
     async def generate_ebook(
         self,
         title: str,
@@ -588,32 +740,228 @@ Return ONLY valid JSON, no markdown:
         source_type: str,
         outline: List[str] | None,
         page_count: int,
+        chapter_range: tuple = (3, 5),
+        tone: str = "academic",
+        book_size: str = "short",
+        chapters: List[dict] | None = None,
+        image_density: str = "standard",
+        image_types: List[str] | None = None,
+        author: str = "",
+        assessment_config: dict | None = None,
     ) -> dict:
-        """Generate structured eBook content as JSON."""
-        outline_str = "\n".join(f"- {item}" for item in (outline or []))
-        prompt = f"""Create a structured educational eBook:
+        """Generate structured eBook content as JSON, then generate images."""
+        if chapters:
+            outline_str = "\n".join(
+                f"- {ch.get('title', '')}" + (f": {ch.get('description', '')}" if ch.get('description') else "")
+                for ch in chapters
+            )
+        else:
+            outline_str = "\n".join(f"- {item}" for item in (outline or []))
+        min_ch, max_ch = chapter_range
+
+        tone_instructions = {
+            "academic": (
+                "Write in formal, scholarly language with precise terminology. "
+                "Define key terms when introduced. Use evidence-based arguments, "
+                "structured sub-sections with clear headings, and rigorous explanations. "
+                "Each chapter should read like a well-researched textbook section."
+            ),
+            "simple": (
+                "Write in plain, easy-to-understand language suitable for beginners. "
+                "Avoid jargon; explain technical terms immediately in simple words. "
+                "Use short sentences, bullet points, relatable everyday analogies, "
+                "and friendly examples that a student new to the topic can follow."
+            ),
+            "story_based": (
+                "Open every chapter with a short engaging story, scenario, or character dialogue "
+                "that naturally introduces the topic. Narrate concepts through the story, "
+                "weaving educational content into the narrative. Use vivid descriptions, "
+                "relatable characters, and real-world situations to make learning immersive."
+            ),
+            "exam_oriented": (
+                "Focus strictly on exam-relevant facts, formulas, definitions, and concepts. "
+                "Use callout markers like 'Remember:', 'Key Formula:', and 'Exam Tip:' "
+                "to highlight critical information. End every chapter with 3-5 practice "
+                "questions (with answers) covering the chapter's most testable content."
+            ),
+        }
+
+        size_content_guides = {
+            "short": {
+                "total_pages": 15,
+                "content_pages": "pages 5–15 (11 content pages)",
+                "paragraphs": "4-5 substantial paragraphs",
+                "depth": (
+                    "Cover the concept with a clear introduction, 2-3 detailed body sections with examples, "
+                    "and a concise conclusion. Each chapter must feel complete and informative on its own."
+                ),
+                "key_points": "4-5 key points per chapter",
+                "words_hint": "~1000-1200 words per chapter",
+            },
+            "medium": {
+                "total_pages": 30,
+                "content_pages": "pages 5–30 (26 content pages)",
+                "paragraphs": "6-8 detailed paragraphs",
+                "depth": (
+                    "Cover the topic with solid depth. Include an introduction, 3-5 well-developed sections "
+                    "with examples and explanations, connections to related ideas, and a conclusion paragraph."
+                ),
+                "key_points": "5-7 key points per chapter",
+                "words_hint": "~1200-1500 words per chapter",
+            },
+            "large": {
+                "total_pages": 60,
+                "content_pages": "pages 5–60 (56 content pages)",
+                "paragraphs": "9-12 comprehensive paragraphs with internal sub-headings",
+                "depth": (
+                    "Cover the topic exhaustively. Use sub-headings to structure major ideas. Include an introduction, "
+                    "multiple in-depth sections with worked examples or case studies, real-world applications, "
+                    "and a thorough conclusion."
+                ),
+                "key_points": "6-8 key points per chapter",
+                "words_hint": "~1400-1800 words per chapter",
+            },
+        }
+
+        tone_guide = tone_instructions.get(tone, tone_instructions["academic"])
+        size_guide = size_content_guides.get(book_size, size_content_guides["short"])
+
+        language_names = {
+            "en": "English", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
+            "fr": "French", "de": "German", "es": "Spanish", "zh": "Chinese",
+            "ar": "Arabic", "pt": "Portuguese",
+        }
+        language_name = language_names.get(language, language.upper())
+
+        chapters_provided = bool(chapters and len(chapters) > 0)
+        chapter_count_instruction = (
+            f"Use EXACTLY the {len(chapters)} chapters listed in the outline below — do not add, remove, or reorder them."
+            if chapters_provided
+            else f"Generate between {min_ch} and {max_ch} chapters — choose the exact count that best covers the topic."
+        )
+
+        assessment_section = ""
+        final_assessment_json = '"final_assessment": null'
+        assessment_enabled = bool(assessment_config and assessment_config.get("enabled"))
+        if assessment_enabled:
+            difficulty = assessment_config.get("difficulty", "medium")
+            q_types = assessment_config.get("questionTypes", ["MCQ"])
+            blooms = assessment_config.get("bloomsLevel", "understand")
+            q_types_str = ", ".join(q_types)
+
+            type_instructions = []
+            json_fields = []
+            if "MCQ" in q_types:
+                type_instructions.append('- For MCQ: include in "mcq_questions" with "chapter_number", "question", "options" (4 choices), "answer" (correct option text).')
+                json_fields.append('    "mcq_questions": [\n      { "chapter_number": 1, "question": "...", "options": ["...", "...", "...", "..."], "answer": "..." }\n    ]')
+            if "Fill in Blank" in q_types:
+                type_instructions.append('- For Fill in Blank: include in "fill_in_blank_questions" with "chapter_number", "question" (sentence with ___ for the blank), "answer" (word/phrase that fills the blank).')
+                json_fields.append('    "fill_in_blank_questions": [\n      { "chapter_number": 1, "question": "The ___ process converts sunlight into energy.", "answer": "photosynthesis" }\n    ]')
+            if "Short Answer" in q_types:
+                type_instructions.append('- For Short Answer: include in "short_answer_questions" with "chapter_number", "question", "answer" (2-3 sentence model answer).')
+                json_fields.append('    "short_answer_questions": [\n      { "chapter_number": 1, "question": "...", "answer": "..." }\n    ]')
+            if "Long Answer" in q_types:
+                type_instructions.append('- For Long Answer: include in "long_answer_questions" with "chapter_number", "question", "answer" (detailed model answer).')
+                json_fields.append('    "long_answer_questions": [\n      { "chapter_number": 1, "question": "...", "answer": "..." }\n    ]')
+
+            instructions_str = "\n".join(type_instructions)
+            assessment_section = f"""
+ASSESSMENT REQUIREMENTS:
+- Place ALL assessment questions in the root-level "final_assessment" section — NOT inside individual chapters.
+- Generate 3-5 questions per chapter, distributed across all chapters of the book.
+- Question types to include: {q_types_str}
+- Difficulty: {difficulty}
+- Bloom's Taxonomy level: {blooms}
+{instructions_str}
+- Only include JSON keys for the selected question types above — omit others entirely.
+- Group questions by type in order — this is the final section of the book.
+"""
+            fields_str = ",\n".join(json_fields)
+            final_assessment_json = f'"final_assessment": {{\n{fields_str}\n  }}'
+
+        assessment_layout_line = (
+            '  • End Pages — Assessment Section: all MCQs grouped together, then Short Answers, then Long Answers'
+            if assessment_enabled else ""
+        )
+        no_assessment_note = (
+            "" if assessment_enabled
+            else '- Do NOT include any assessment questions. Set "final_assessment" to null.'
+        )
+
+        prompt = f"""Create a complete structured educational eBook with the following specifications.
+
+LANGUAGE REQUIREMENT: Write ALL content — titles, descriptions, chapter bodies, key points, summaries, questions — in {language_name}. Do NOT use any other language.
+
 Title: {title}
+Author: {author or "Anonymous"}
 Subject: {subject or "General"}
 Grade: {grade or "General"}
-Language: {language}
-Pages: ~{page_count}
-{f'Outline:{chr(10)}{outline_str}' if outline_str else ''}
+Book Size: {book_size.capitalize()} — TARGET: {size_guide["total_pages"]} pages total
+Writing Tone: {tone.replace("_", " ").title()}
 
-Return JSON with structure:
+BOOK PAGE LAYOUT (strictly follow this structure):
+  • Page 1   — Cover Page: full-page book cover (image generated separately)
+  • Page 2   — Title Page: book title centered large, "by {{author}}" centered below it
+  • Page 3   — Book Summary: 4-10 sentences giving a comprehensive overview of the entire book
+  • Page 4   — Table of Contents: numbered chapter list
+  • {size_guide["content_pages"]} — Chapters numbered "1. Title", "2. Title", etc. (one chapter per page range)
+{assessment_layout_line}
+  • Final Page — Thank you / hope message for the reader
+
+TONE INSTRUCTIONS (apply to every chapter):
+{tone_guide}
+
+CONTENT DEPTH PER CHAPTER (calibrated to fill {size_guide["total_pages"]} pages total):
+- Length: {size_guide["paragraphs"]} — {size_guide["words_hint"]}
+- Structure: {size_guide["depth"]}
+- Key points: {size_guide["key_points"]}
+{assessment_section}
+{f'Chapter Outline:{chr(10)}{outline_str}' if outline_str else ''}
+
+REQUIREMENTS:
+1. {chapter_count_instruction}
+2. Every chapter MUST meet the word count target ({size_guide["words_hint"]}). Short chapters that do not fill their page budget are NOT acceptable.
+3. Apply both the tone style and depth level consistently across ALL chapters.
+4. The "content" field must be the FULL chapter body — not a placeholder, stub, or summary.
+5. The "key_points" array must list the most important facts/concepts from the chapter.
+6. The "summary" must be 1-2 sentences recapping the chapter.
+7. Do NOT reuse identical phrasing across chapters — each chapter must feel distinct.
+8. If a chapter description is given in the outline, use it to guide the content scope.
+9. The "title_page.description" must be a compelling 2-3 sentence overview of the entire book.
+10. All text must be written in {language_name}.
+11. The "book_summary" field must be 4-10 sentences giving a comprehensive overview of the ENTIRE book — its scope, key themes, and what the reader will learn.
+12. The "thank_you_message" must be 2-3 warm, encouraging sentences wishing the reader well after completing the book.
+{no_assessment_note}
+
+Return ONLY valid JSON in this exact structure (no markdown fences, no extra keys):
 {{
-  "title": "...",
+  "title": "{title}",
+  "author": "{author or 'Anonymous'}",
+  "language": "{language}",
+  "book_size": "{book_size}",
+  "tone": "{tone}",
+  "title_page": {{
+    "title": "...",
+    "author": "...",
+    "subtitle": "...",
+    "description": "..."
+  }},
+  "book_summary": "...",
+  "table_of_contents": [
+    {{ "chapter_number": 1, "title": "..." }}
+  ],
   "chapters": [
     {{
+      "chapter_number": 1,
       "title": "...",
       "content": "...",
-      "key_points": ["..."],
+      "key_points": ["...", "..."],
       "summary": "..."
     }}
-  ]
-}}
-
-Return ONLY valid JSON.
-"""
+  ],
+  {final_assessment_json},
+  "thank_you_message": "..."
+}}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -621,9 +969,40 @@ Return ONLY valid JSON.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            ebook_data = json.loads(cleaned)
         except Exception:
-            return {"title": title, "chapters": [{"title": "Chapter 1", "content": response}]}
+            ebook_data = {
+                "title": title,
+                "author": author or "Anonymous",
+                "language": language,
+                "book_size": book_size,
+                "tone": tone,
+                "title_page": {"title": title, "author": author or "Anonymous", "subtitle": "", "description": ""},
+                "book_summary": "",
+                "table_of_contents": [{"chapter_number": 1, "title": "Chapter 1"}],
+                "chapters": [{"chapter_number": 1, "title": "Chapter 1", "content": response, "key_points": [], "summary": ""}],
+                "final_assessment": None,
+                "thank_you_message": f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you.",
+            }
+
+        # Generate images via Google Custom Search if requested
+        if image_density != "minimal":
+            try:
+                generated_chapters = ebook_data.get("chapters", [])
+                images = await self.generate_ebook_images(
+                    title=title,
+                    chapters=generated_chapters,
+                    image_density=image_density,
+                    image_types=image_types,
+                    subject=subject,
+                    grade=grade,
+                    tone=tone,
+                )
+                ebook_data["images"] = images
+            except Exception:
+                pass  # Image generation is non-blocking — proceed without images
+
+        return ebook_data
 
     async def generate_mindmap(
         self,
@@ -2167,12 +2546,19 @@ Return ONLY valid JSON. No markdown fences."""
         ebook_json: dict | None,
         language: str,
         voice_profile: str | None,
+        narration_style: str = "standard",
     ) -> dict:
-        """Generate audiobook metadata (actual TTS integration placeholder)."""
-        # In a real implementation, this would call a TTS API (ElevenLabs, Google TTS, etc.)
-        # For now, return a placeholder
-        return {
-            "audio_path": None,
-            "duration_seconds": None,
-            "message": "Audiobook generation requires TTS service configuration",
-        }
+        """Generate industry-grade audiobook from ebook content.
+
+        Uses edge-tts (Microsoft Neural TTS) with chapter-aware narration,
+        structured segments, silence gaps, and chapter timestamps.
+        Falls back to gTTS when edge-tts is unavailable.
+        """
+        from app.services.audiobook_service import generate_audiobook as _generate
+
+        return await _generate(
+            ebook_json=ebook_json,
+            language=language,
+            voice_profile=voice_profile,
+            narration_style=narration_style,
+        )

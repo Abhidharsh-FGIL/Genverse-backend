@@ -70,7 +70,9 @@ class Audiobook(Base):
     audio_path: Mapped[str | None] = mapped_column(String(1000))
     language: Mapped[str] = mapped_column(String(10), default="en")
     voice_profile: Mapped[str | None] = mapped_column(String(100))
+    narration_style: Mapped[str | None] = mapped_column(String(50), default="standard")
     duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    chapter_timestamps: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     ebook: Mapped["Ebook"] = relationship(back_populates="audiobook")
