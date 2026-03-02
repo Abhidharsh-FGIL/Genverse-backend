@@ -2471,7 +2471,7 @@ Return ONLY this JSON structure:
             from google import genai
             from google.genai import types
 
-            client = genai.Client(api_key=settings.GOOGLE_GEMINI_API_KEY)
+            client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
             def _generate():
                 return client.models.generate_content(
@@ -2491,13 +2491,15 @@ Return ONLY this JSON structure:
                     mime = part.inline_data.mime_type or "image/png"
                     b64 = base64.b64encode(img_bytes).decode("utf-8")
                     data_uri = f"data:{mime};base64,{b64}"
+                    print(f"[Infographic] Generated image ({len(img_bytes)} bytes)")
                     return {
                         "image_base64": data_uri,
                         "title": topic,
                         "mode": "image",
                     }
-        except Exception:
-            pass
+            print("[Infographic] No image part in response, falling back to JSON mode")
+        except Exception as e:
+            print(f"[Infographic] Image generation failed: {e}, falling back to JSON mode")
 
         # Fallback: generate JSON-based infographic using primary text model
         fallback_prompt = f"""You are an infographic designer. Convert this into a structured infographic layout.
