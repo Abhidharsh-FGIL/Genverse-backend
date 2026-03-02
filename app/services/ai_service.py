@@ -642,91 +642,132 @@ Return ONLY valid JSON in this exact structure:
         grade: int | None = None,
         tone: str = "academic",
     ) -> dict:
-        """Retrieve images using Google Custom Search API for ebook cover and chapters."""
+        """Generate infographic images using Gemini image generation for ebook cover and chapters."""
         import asyncio
         import base64
-        import aiohttp
+        from google import genai
+        from google.genai import types
 
-        _API_KEY = "AIzaSyA_Zfen4abuUycPzB-p12i4zGrbOe7o0ng"
-        _CX = "1536a454c256149b5"
-        _SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
-        _HEADERS = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.google.com",
-        }
+        api_key = settings.GEMINI_API_KEY or settings.GOOGLE_GEMINI_API_KEY
+        print(f"[EbookImage] Starting image generation. API key set: {bool(api_key)}, density: {image_density}, chapters: {len(chapters)}")
+        client = genai.Client(api_key=api_key)
 
-        grade_str = f"Grade {grade}" if grade else ""
-        subj_str = subject or ""
+        grade_str = f"Grade {grade}" if grade else "General"
+        subj_str = subject or "General"
 
         images_per_chapter = {"minimal": 0, "standard": 1, "visual_heavy": 2}.get(image_density, 1)
         result: dict = {"cover_image": None, "chapter_images": {}}
 
-        async def _search_and_fetch(query: str) -> str | None:
-            """Search Google Images for *query* and return the first result as a base64 data URL."""
+        def _generate_image(prompt: str) -> str | None:
+            """Generate an infographic image using Gemini and return as base64 data URL."""
             try:
-                params = {
-                    "key": _API_KEY,
-                    "cx": _CX,
-                    "searchType": "image",
-                    "q": query,
-                    "num": 1,
-                    "safe": "active",
-                    "imgType": "photo",
-                }
-                timeout = aiohttp.ClientTimeout(total=20)
-                async with aiohttp.ClientSession(headers=_HEADERS, timeout=timeout) as session:
-                    async with session.get(_SEARCH_URL, params=params) as resp:
-                        if resp.status != 200:
-                            return None
-                        data = await resp.json()
-                        items = data.get("items", [])
-                        if not items:
-                            return None
-                        img_url: str = items[0]["link"]
+                response = client.models.generate_content(
+                    model="gemini-3-pro-image-preview",
+                    contents=[prompt],
+                    config=types.GenerateContentConfig(
+                        response_modalities=["TEXT", "IMAGE"],
+                    ),
+                )
 
-                    async with session.get(img_url) as img_resp:
-                        if img_resp.status != 200:
-                            return None
-                        img_bytes = await img_resp.read()
-                        content_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
-                        if not content_type.startswith("image/"):
-                            content_type = "image/jpeg"
-                        b64 = base64.b64encode(img_bytes).decode()
-                        return f"data:{content_type};base64,{b64}"
-            except Exception:
+                # Safely access candidates
+                if not response.candidates:
+                    print(f"[EbookImage] No candidates in response. Prompt feedback: {getattr(response, 'prompt_feedback', 'N/A')}")
+                    return None
+
+                candidate = response.candidates[0]
+                if not candidate.content or not candidate.content.parts:
+                    print(f"[EbookImage] No content parts. Finish reason: {getattr(candidate, 'finish_reason', 'N/A')}")
+                    return None
+
+                for part in candidate.content.parts:
+                    if part.inline_data is not None:
+                        img_bytes = part.inline_data.data
+                        mime = part.inline_data.mime_type or "image/png"
+                        b64 = base64.b64encode(img_bytes).decode("utf-8")
+                        print(f"[EbookImage] Image generated ({len(img_bytes)} bytes)")
+                        return f"data:{mime};base64,{b64}"
+
+                print("[EbookImage] Response had parts but no image data found")
+                return None
+            except Exception as e:
+                print(f"[EbookImage] Generation failed: {type(e).__name__}: {e}")
                 return None
 
-        def _chapter_query(ch: dict, img_idx: int) -> str:
+        def _build_cover_prompt() -> str:
+            return (
+                f"Create a professional, visually stunning book cover image for an educational eBook.\n\n"
+                f"Book Title: {title}\n"
+                f"Subject: {subj_str}\n"
+                f"Grade Level: {grade_str}\n\n"
+                "Design requirements:\n"
+                "- Clean, modern book cover design\n"
+                "- Bold, prominent title text at the center\n"
+                "- Use vibrant, appealing colors related to the subject\n"
+                "- Include relevant icons or illustrations related to the topic\n"
+                "- Professional educational style suitable for students\n"
+                "- No blank or empty spaces — fill with relevant visual elements\n"
+                "- The image should look like a real book cover"
+            )
+
+        def _build_chapter_prompt(ch: dict, img_idx: int) -> str:
             ch_title = ch.get("title", "")
             key_pts = ch.get("key_points", []) or []
-            concepts = " ".join(str(k) for k in key_pts[:2]) if key_pts else ""
-            parts = [p for p in [subj_str, grade_str, ch_title, concepts] if p]
-            query = " ".join(parts).strip()
+            key_pts_str = "\n".join(f"- {kp}" for kp in key_pts[:5]) if key_pts else ""
+            summary = ch.get("summary", "")
+
+            variant = ""
             if img_idx > 0:
-                query += " diagram illustration"
-            return query
+                variant = "\nMake this a DIFFERENT style from the previous image — use a different layout, color scheme, and visual approach."
 
-        tasks: list[tuple[str, int | None, object]] = []
+            return (
+                f"Create a beautiful, colorful educational infographic image about: {ch_title}\n\n"
+                f"Subject: {subj_str}\n"
+                f"Grade Level: {grade_str}\n"
+                f"Chapter Summary: {summary}\n\n"
+                f"Key information to visualize:\n{key_pts_str}\n\n"
+                "Design requirements:\n"
+                "- Bold heading at the top with the chapter title\n"
+                "- Use vibrant colors, icons, and visual hierarchy\n"
+                "- Organize information into clear visual sections\n"
+                "- Include key facts and concepts as visual callouts\n"
+                "- Use arrows, connectors, or flow lines between related concepts\n"
+                "- Make text readable and well-spaced\n"
+                "- Professional infographic style suitable for students\n"
+                "- Colored background with contrasting text\n"
+                "- Do NOT leave large empty spaces — fill with relevant visual elements"
+                f"{variant}"
+            )
 
-        cover_query_parts = [p for p in [subj_str, grade_str, title, "educational"] if p]
-        cover_query = " ".join(cover_query_parts)
-        tasks.append(("cover", None, _search_and_fetch(cover_query)))
+        loop = asyncio.get_event_loop()
+
+        # Build all tasks: list of (key, chapter_index, prompt)
+        tasks: list[tuple[str, int | None, str]] = []
+        tasks.append(("cover", None, _build_cover_prompt()))
 
         if images_per_chapter > 0:
             max_chapters = 10
             for i, ch in enumerate(chapters[:max_chapters]):
                 for img_idx in range(images_per_chapter):
-                    tasks.append((f"ch_{i}_{img_idx}", i, _search_and_fetch(_chapter_query(ch, img_idx))))
+                    tasks.append((f"ch_{i}_{img_idx}", i, _build_chapter_prompt(ch, img_idx)))
 
-        data_urls = await asyncio.gather(*[t[2] for t in tasks])
+        # Run ALL image generations in parallel
+        print(f"[EbookImage] Generating {len(tasks)} images in parallel...")
+        data_urls = await asyncio.gather(
+            *[loop.run_in_executor(None, _generate_image, t[2]) for t in tasks]
+        )
+
         for (key, ch_idx, _), data_url in zip(tasks, data_urls):
             if key == "cover":
                 result["cover_image"] = data_url
+                if data_url:
+                    print("[EbookImage] Cover image generated successfully")
             elif data_url and ch_idx is not None:
                 ch_key = str(ch_idx)
                 result["chapter_images"].setdefault(ch_key, [])
                 result["chapter_images"][ch_key].append(data_url)
+                print(f"[EbookImage] Chapter {ch_idx+1} image generated successfully")
 
+        print(f"[EbookImage] Done. Cover: {bool(result['cover_image'])}, Chapters with images: {len(result['chapter_images'])}")
         return result
 
     async def generate_ebook(
@@ -2170,34 +2211,167 @@ Return ONLY valid JSON.
         }
 
     async def generate_evaluation_paper(
-        self, paper_id: str, subjects: List[dict], question_types: List[str] | None
-    ) -> List[dict]:
-        """Generate institutional evaluation questions."""
-        types_str = ", ".join(question_types or ["MCQ", "Short Answer"])
-        subjects_str = json.dumps(subjects, indent=2)
-        prompt = f"""Generate exam questions for an institutional assessment:
-Subjects config:
-{subjects_str[:2000]}
-Question types: {types_str}
+        self,
+        subjects: List[dict],
+        question_types: List[str] | None,
+        difficulty: str = "medium",
+        blooms_level: str = "mixed",
+        question_count: int = 20,
+        grade: int | None = None,
+        board: str | None = None,
+        mcq_subtypes: List[str] | None = None,
+        type_weightage: dict | None = None,
+        negative_marking: bool = False,
+    ) -> tuple[List[dict], List[dict]]:
+        """Generate institutional evaluation questions with full config support.
 
-For each chapter in each subject, generate questions based on weightage.
-Return JSON array:
-[
-  {{
-    "type": "MCQ|fill|true_false|short|long",
-    "text": "...",
-    "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
-    "correct_answer": "A",
-    "marks": 1,
-    "subject": "...",
-    "chapter": "...",
-    "difficulty": "easy|medium|hard",
-    "explanation": "..."
-  }}
-]
+        Returns (question_json, answer_key_json) tuple.
+        """
+        types = question_types or ["mcq"]
 
-Return ONLY valid JSON.
-"""
+        # ── Compute exact counts per question type ──────────────────────────
+        if type_weightage and len(types) > 1:
+            filtered_weights = {t: type_weightage.get(t, 0) for t in types}
+            type_counts = self._distribute_questions(question_count, filtered_weights)
+        else:
+            type_counts = {types[0]: question_count} if len(types) == 1 else {
+                t: max(1, question_count // len(types)) for t in types
+            }
+            diff = question_count - sum(type_counts.values())
+            if diff:
+                type_counts[types[-1]] = type_counts.get(types[-1], 1) + diff
+
+        # ── MCQ subtype distribution ────────────────────────────────────────
+        subtypes = mcq_subtypes or ["standard"]
+        mcq_count = type_counts.get("mcq", 0)
+        mcq_subtype_counts: dict = {}
+        if mcq_count > 0 and len(subtypes) > 1:
+            mcq_subtype_counts = self._distribute_questions(mcq_count, {s: 1 for s in subtypes})
+        elif mcq_count > 0:
+            mcq_subtype_counts = {subtypes[0]: mcq_count}
+
+        # ── Distribution lines for prompt ───────────────────────────────────
+        type_labels = {
+            "mcq": "MCQ", "fill": "Fill in the Blank", "short": "Short Answer",
+            "long": "Long Answer", "true_false": "True / False", "match": "Match the Following",
+        }
+        subtype_labels = {
+            "standard": "Standard MCQ", "case": "Case-based MCQ",
+            "assertion_reason": "Assertion-Reason MCQ", "higher_order": "Higher Order Thinking MCQ",
+        }
+        dist_lines = []
+        for t, cnt in type_counts.items():
+            label = type_labels.get(t, t)
+            dist_lines.append(f"  - {label}: {cnt} question(s)")
+            if t == "mcq" and mcq_subtype_counts:
+                for s, sc in mcq_subtype_counts.items():
+                    dist_lines.append(f"      • {subtype_labels.get(s, s)}: {sc}")
+
+        # ── Build per-subject source sections ───────────────────────────────
+        subject_sections = []
+        all_subjects_str = ", ".join(s.get("subject", "") for s in subjects if s.get("subject"))
+        for s in subjects:
+            subj_name = s.get("subject", "General")
+            chapters = s.get("chapters", [])
+            chapters_str = ", ".join(c.get("name", "") for c in chapters) if chapters else "all topics"
+            source_type = s.get("source_type", "online")
+            source_text = s.get("source_text", "")
+
+            section = f"\n### {subj_name} (Chapters: {chapters_str})"
+            if source_type in ("text", "file") and source_text and source_text.strip():
+                section += (
+                    f"\nSOURCE TEXT (generate questions for {subj_name} ONLY from this content):\n"
+                    f"---\n{source_text[:5000]}\n---"
+                )
+            else:
+                section += f"\nUse your educational knowledge of {subj_name} ({chapters_str})."
+            subject_sections.append(section)
+
+        # ── Bloom's taxonomy instruction ────────────────────────────────────
+        blooms_map = {
+            "remember": "Recall / recognition of facts",
+            "understand": "Interpretation and explanation of concepts",
+            "apply": "Use of knowledge in new practical situations",
+            "analyze": "Break down information, find patterns and relationships",
+            "evaluate": "Justify decisions, critique, judge quality",
+            "create": "Design, produce, or construct new ideas",
+        }
+        if blooms_level and blooms_level != "mixed":
+            blooms_section = f"BLOOM'S LEVEL: All questions must target '{blooms_level.capitalize()}' — {blooms_map.get(blooms_level, '')}."
+        else:
+            blooms_section = "BLOOM'S LEVEL: Use a balanced mix across Remember, Understand, Apply, and higher levels."
+
+        neg_section = (
+            "NEGATIVE MARKING: This is a negative-marking assessment. Every question MUST have "
+            "one clearly unambiguous correct answer with no trick or confusable options."
+            if negative_marking else ""
+        )
+
+        allowed_types_str = " | ".join(f'"{t}"' for t in types)
+
+        prompt = f"""You are an expert question paper setter. Generate exactly {question_count} questions for an institutional evaluation paper.
+
+SUBJECTS: {all_subjects_str}
+GRADE: {f'Grade {grade}' if grade else 'General'}{f' ({board})' if board else ''}
+DIFFICULTY: {difficulty}
+{blooms_section}
+{neg_section}
+
+ALLOWED QUESTION TYPES — STRICTLY: {allowed_types_str}
+You MUST NOT generate any question with a "type" outside this list.
+
+EXACT QUESTION DISTRIBUTION (generate exactly this many of each type — no more, no less):
+{chr(10).join(dist_lines)}
+
+SUBJECT-WISE SOURCE MATERIAL:
+{chr(10).join(subject_sections)}
+
+QUESTION FORMAT RULES — follow exactly:
+1. MCQ (standard): 4 distinct options as a list. Exactly one correct.
+   "options": ["option1", "option2", "option3", "option4"]
+   "correct_answer": the exact correct option string.
+
+2. MCQ (case): Include a brief scenario/passage (2-4 sentences) in "text".
+   Then ask a question. 4 options as above.
+
+3. MCQ (assertion_reason): Two statements.
+   "text": "Assertion (A): [statement]\\nReason (R): [statement]\\nChoose the correct option:"
+   "options": ["Both A and R are true, and R is the correct explanation of A", "Both A and R are true, but R is not the correct explanation of A", "A is true but R is false", "A is false but R is true"]
+
+4. MCQ (higher_order): Requires analysis/application — NOT simple recall. 4 options.
+
+5. Fill in the Blank: "text" has ___ for the missing word/phrase.
+   "correct_answer": the exact word/phrase. "options": null.
+
+6. Short Answer: Question needing 2-4 sentence answer.
+   "correct_answer": concise model answer. "options": null.
+
+7. Long Answer: Descriptive/essay question.
+   "correct_answer": key points and model answer outline. "options": null.
+
+8. True / False: A clear factual statement.
+   "options": ["True", "False"]. "correct_answer": "True" or "False".
+
+9. Match the Following: Two columns to match.
+   "options": right-column items as array. "pairs": [{{"left": "...", "right": "..."}}]
+   "correct_answer": matching in "A-1, B-2" notation.
+
+Return a JSON array of EXACTLY {question_count} objects. Each object MUST have ALL these fields:
+- "id": "q1", "q2", "q3" ... (sequential)
+- "type": one of the ALLOWED TYPES ONLY: {allowed_types_str}
+- "subtype": for MCQ — "standard"|"case"|"assertion_reason"|"higher_order"; for others — null
+- "text": the full question text
+- "options": array of strings for mcq/true_false/match; null for fill/short/long
+- "pairs": array of {{"left":..., "right":...}} for match; null for others
+- "correct_answer": string (required)
+- "explanation": 1-2 sentence explanation
+- "marks": 1 for mcq/fill/true_false; 2 for short/match; 4 for long
+- "subject": the subject name
+- "chapter": the chapter name
+- "blooms_level": one of "remember"|"understand"|"apply"|"analyze"|"evaluate"|"create"
+
+Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""
+
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -2205,9 +2379,24 @@ Return ONLY valid JSON.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            questions = json.loads(cleaned)
+            if not isinstance(questions, list):
+                return [], []
+
+            # Build separate answer key
+            answer_key = []
+            for q in questions:
+                answer_key.append({
+                    "id": q.get("id"),
+                    "correctAnswer": q.get("correct_answer", ""),
+                    "explanation": q.get("explanation", ""),
+                })
+                # Map points field for frontend compatibility
+                q["points"] = q.get("marks", 1)
+
+            return questions, answer_key
         except Exception:
-            return []
+            return [], []
 
     async def generate_follow_up_questions(
         self, user_message: str, ai_response: str, count: int = 4

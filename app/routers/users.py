@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.dependencies import DBSession, CurrentUser
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.models.ai import AiContextSession
 from app.schemas.user import UserResponse, UserUpdate, AiContextRequest, AiContextResponse
 
@@ -20,6 +20,19 @@ async def get_profile(current_user: CurrentUser):
 @router.patch("/me", response_model=UserResponse)
 async def update_profile(payload: UserUpdate, current_user: CurrentUser, db: DBSession):
     update_data = payload.model_dump(exclude_unset=True)
+
+    # Handle role update separately (lives in user_roles table, not profiles)
+    new_role = update_data.pop("role", None)
+    if new_role:
+        existing_role = await db.execute(
+            select(UserRole).where(UserRole.user_id == current_user.id)
+        )
+        role_record = existing_role.scalar_one_or_none()
+        if role_record:
+            role_record.role = new_role
+        else:
+            db.add(UserRole(user_id=current_user.id, role=new_role))
+
     for key, value in update_data.items():
         setattr(current_user, key, value)
     await db.commit()
@@ -81,6 +94,20 @@ async def search_users(
     )
     user = result.scalar_one_or_none()
     return [user] if user else []
+
+
+@router.get("/{user_id}/org-role")
+async def get_user_org_roles(user_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    """Return the user's active organization membership roles."""
+    from app.models.organization import OrgMember
+    result = await db.execute(
+        select(OrgMember).where(
+            OrgMember.user_id == user_id,
+            OrgMember.status == "active",
+        )
+    )
+    members = result.scalars().all()
+    return [{"role": m.role, "org_id": str(m.org_id)} for m in members]
 
 
 @router.get("/{user_id}", response_model=UserResponse)

@@ -37,18 +37,40 @@ async def _check_class_membership(class_id: uuid.UUID, user_id: uuid.UUID, db: A
 
 
 async def _check_is_class_teacher(class_id: uuid.UUID, user_id: uuid.UUID, db: AsyncSession) -> bool:
-    """Return True if user is the main teacher or a co-teacher of the class."""
+    """Return True if user is the main teacher, a co-teacher, or an org admin of the class's org."""
     from app.models.classes import ClassTeacher, Class
-    teacher_result = await db.execute(
-        select(Class).where(Class.id == class_id, Class.teacher_id == user_id, Class.is_active == True)
+    from app.models.organization import OrgMember
+
+    # Check main teacher
+    cls_result = await db.execute(
+        select(Class).where(Class.id == class_id, Class.is_active == True)
     )
-    if teacher_result.scalar_one_or_none():
+    cls = cls_result.scalar_one_or_none()
+    if not cls:
+        return False
+    if cls.teacher_id == user_id:
         return True
+
+    # Check co-teacher
     co_result = await db.execute(
         select(ClassTeacher).where(ClassTeacher.class_id == class_id, ClassTeacher.teacher_id == user_id)
     )
     if co_result.scalar_one_or_none():
         return True
+
+    # Check org admin
+    if cls.org_id:
+        admin_result = await db.execute(
+            select(OrgMember).where(
+                OrgMember.org_id == cls.org_id,
+                OrgMember.user_id == user_id,
+                OrgMember.role == "org_admin",
+                OrgMember.status == "active",
+            )
+        )
+        if admin_result.scalar_one_or_none():
+            return True
+
     return False
 
 

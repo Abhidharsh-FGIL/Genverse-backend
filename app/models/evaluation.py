@@ -22,6 +22,9 @@ class EvaluationQuestionPaper(Base):
     time_limit: Mapped[int | None] = mapped_column(Integer)  # minutes
     mode: Mapped[str] = mapped_column(String(20), default="exam")  # exam | practice
     status: Mapped[str] = mapped_column(String(20), default="draft")
+    difficulty: Mapped[str | None] = mapped_column(String(20))
+    question_count: Mapped[int | None] = mapped_column(Integer)
+    max_score: Mapped[float | None] = mapped_column(Float)
     config: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -72,6 +75,8 @@ class EvaluationQuestion(Base):
     difficulty: Mapped[str | None] = mapped_column(String(20))
     explanation: Mapped[str | None] = mapped_column(Text)
     tags: Mapped[dict | None] = mapped_column(JSONB)
+    source_type: Mapped[str | None] = mapped_column(String(20))  # online | text | file
+    blooms_level: Mapped[str | None] = mapped_column(String(30))
     is_ai_generated: Mapped[bool] = mapped_column(Boolean, default=False)
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

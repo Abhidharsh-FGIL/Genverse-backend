@@ -1,7 +1,9 @@
 import uuid
+import tempfile
 from datetime import datetime, timezone
-from fastapi import APIRouter, status, Query
-from sqlalchemy import select
+from fastapi import APIRouter, status, Query, UploadFile, File, HTTPException
+from sqlalchemy import select, distinct, union_all
+from sqlalchemy.orm import selectinload
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.evaluation import (
@@ -22,6 +24,9 @@ from app.schemas.evaluation import (
     EvalQuestionUpdate,
     EvalQuestionResponse,
     GeneratePaperRequest,
+    GenerateEvalPaperRequest,
+    GenerateEvalPaperResponse,
+    SaveEvalPaperRequest,
     EvalAssessmentCreate,
     EvalAssessmentResponse,
     DistributeAssessmentRequest,
@@ -35,6 +40,179 @@ router = APIRouter()
 
 
 # ---- Question Papers ----
+
+@router.post("/papers/generate", response_model=GenerateEvalPaperResponse)
+async def generate_paper(
+    payload: GenerateEvalPaperRequest,
+    org_id: str = Query(...),
+    current_user: CurrentUser = None,
+    db: DBSession = None,
+):
+    """AI-generate questions for a new paper. Does NOT persist — frontend reviews first."""
+    ai = AIService()
+
+    # Build subjects list for AI service
+    subjects_for_ai = []
+    for s in payload.subjects:
+        subj = {
+            "subject": s.subject,
+            "source_type": s.source_type,
+            "source_text": s.source_text,
+            "chapters": s.chapters or [],
+        }
+        subjects_for_ai.append(subj)
+
+    questions, answer_key = await ai.generate_evaluation_paper(
+        subjects=subjects_for_ai,
+        question_types=payload.question_types,
+        difficulty=payload.difficulty,
+        blooms_level=payload.blooms_level,
+        question_count=payload.question_count,
+        grade=payload.grade,
+        board=payload.board,
+        mcq_subtypes=payload.mcq_subtypes,
+        type_weightage=payload.type_weightage,
+        negative_marking=payload.negative_marking,
+    )
+
+    return GenerateEvalPaperResponse(question_json=questions, answer_key_json=answer_key)
+
+
+@router.post("/papers/upload-source")
+async def upload_source_file(
+    file: UploadFile = File(...),
+    org_id: str = Query(...),
+    current_user: CurrentUser = None,
+    db: DBSession = None,
+):
+    """Upload a file and extract text for use as question source material."""
+    allowed_types = {
+        "image/jpeg", "image/png", "image/gif", "image/webp",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "text/plain", "text/markdown",
+    }
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Unsupported file type. Allowed: PDF, DOCX, TXT, MD, images.",
+        )
+
+    # Save to temp file for AI extraction
+    content = await file.read()
+    suffix = "." + (file.filename or "file").rsplit(".", 1)[-1] if file.filename else ".tmp"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    ai = AIService()
+
+    # For plain text files, just read the content directly
+    if file.content_type in {"text/plain", "text/markdown"}:
+        extracted_text = content.decode("utf-8", errors="replace")
+    else:
+        extracted_text = await ai.extract_text_from_file(file_path=tmp_path)
+
+    # Clean up temp file
+    import os
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+
+    return {
+        "extracted_text": extracted_text or "",
+        "filename": file.filename or "uploaded_file",
+        "word_count": len(extracted_text.split()) if extracted_text else 0,
+    }
+
+
+@router.post("/papers/save", response_model=EvalPaperResponse, status_code=status.HTTP_201_CREATED)
+async def save_paper(
+    payload: SaveEvalPaperRequest,
+    current_user: CurrentUser = None,
+    db: DBSession = None,
+):
+    """Save a reviewed paper with its questions and answer key."""
+    config = payload.config
+    questions_data = payload.questions
+
+    # Calculate total marks
+    total_marks = sum(q.get("points", q.get("marks", 1)) for q in questions_data)
+
+    paper = EvaluationQuestionPaper(
+        org_id=uuid.UUID(payload.org_id),
+        created_by=current_user.id,
+        title=config.get("title", "Untitled Paper"),
+        board=config.get("board"),
+        grade=config.get("grade"),
+        total_marks=int(total_marks),
+        negative_marking=config.get("negativeMarking", False),
+        negative_mark_value=config.get("negativeMarkValue", 0.25),
+        time_limit=config.get("timeLimitSeconds"),
+        mode=config.get("mode", "exam"),
+        difficulty=config.get("difficulty"),
+        question_count=len(questions_data),
+        max_score=total_marks,
+        status="draft",
+        config={"answer_key": payload.answer_key, "original_config": config},
+    )
+    db.add(paper)
+    await db.flush()
+
+    # Create subjects
+    subjects_config = config.get("subjects", [])
+    for i, sc in enumerate(subjects_config):
+        paper_subject = EvaluationPaperSubject(
+            paper_id=paper.id,
+            subject=sc.get("subject", ""),
+            marks_allocated=None,
+            order_index=i,
+        )
+        db.add(paper_subject)
+        await db.flush()
+
+        # Create chapters
+        for ch in sc.get("chapters", []):
+            db.add(EvaluationPaperChapter(
+                paper_subject_id=paper_subject.id,
+                chapter_name=ch.get("name", ""),
+                weightage=ch.get("weightage", 1.0),
+            ))
+
+    # Create questions
+    for i, q in enumerate(questions_data):
+        # Determine source_type from the subject config
+        q_subject = q.get("subject", "")
+        source_type = "online"
+        for sc in subjects_config:
+            if sc.get("subject", "").lower() == q_subject.lower():
+                source_type = sc.get("sourceType", "online")
+                break
+
+        question = EvaluationQuestion(
+            paper_id=paper.id,
+            question_type=q.get("type", "mcq"),
+            question_text=q.get("text", ""),
+            options=q.get("options"),
+            correct_answer=str(q.get("correctAnswer", "")) if q.get("correctAnswer") is not None else None,
+            marks=q.get("points", q.get("marks", 1.0)),
+            negative_marks=0.0,
+            subject=q_subject,
+            chapter=q.get("chapter"),
+            difficulty=config.get("difficulty"),
+            explanation=q.get("explanation"),
+            source_type=source_type,
+            blooms_level=q.get("blooms_level"),
+            is_ai_generated=True,
+            order_index=i,
+        )
+        db.add(question)
+
+    await db.commit()
+    await db.refresh(paper)
+    return paper
+
 
 @router.post("/papers", response_model=EvalPaperResponse, status_code=status.HTTP_201_CREATED)
 async def create_paper(
@@ -54,6 +232,9 @@ async def create_paper(
         negative_mark_value=payload.negative_mark_value,
         time_limit=payload.time_limit,
         mode=payload.mode,
+        difficulty=payload.difficulty,
+        question_count=payload.question_count,
+        max_score=payload.max_score,
         status="draft",
     )
     db.add(paper)
@@ -76,6 +257,35 @@ async def list_papers(
     return result.scalars().all()
 
 
+@router.delete("/papers/{paper_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_paper(paper_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    result = await db.execute(
+        select(EvaluationQuestionPaper).where(EvaluationQuestionPaper.id == paper_id)
+    )
+    paper = result.scalar_one_or_none()
+    if not paper:
+        raise NotFoundException("Question paper not found")
+    await db.delete(paper)
+    await db.commit()
+
+
+@router.patch("/papers/{paper_id}", response_model=EvalPaperResponse)
+async def update_paper(paper_id: uuid.UUID, payload: dict, current_user: CurrentUser, db: DBSession):
+    result = await db.execute(
+        select(EvaluationQuestionPaper).where(EvaluationQuestionPaper.id == paper_id)
+    )
+    paper = result.scalar_one_or_none()
+    if not paper:
+        raise NotFoundException("Question paper not found")
+    allowed_fields = {"title", "status", "board", "grade", "total_marks", "time_limit", "difficulty"}
+    for key, value in payload.items():
+        if key in allowed_fields:
+            setattr(paper, key, value)
+    await db.commit()
+    await db.refresh(paper)
+    return paper
+
+
 @router.get("/papers/{paper_id}", response_model=EvalPaperResponse)
 async def get_paper(paper_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
     result = await db.execute(
@@ -88,6 +298,102 @@ async def get_paper(paper_id: uuid.UUID, current_user: CurrentUser, db: DBSessio
 
 
 # ---- Questions ----
+
+@router.get("/questions", response_model=list[EvalQuestionResponse])
+async def list_all_questions(
+    org_id: str = Query(...),
+    current_user: CurrentUser = None,
+    db: DBSession = None,
+    subject: str | None = Query(None),
+    question_type: str | None = Query(None, alias="type"),
+    difficulty: str | None = Query(None),
+    paper_id: str | None = Query(None),
+    limit: int = Query(200, le=500),
+):
+    """Get questions across all papers in the org, with optional filters."""
+    q = (
+        select(EvaluationQuestion)
+        .join(EvaluationQuestionPaper, EvaluationQuestion.paper_id == EvaluationQuestionPaper.id)
+        .where(EvaluationQuestionPaper.org_id == uuid.UUID(org_id))
+    )
+    if paper_id:
+        q = q.where(EvaluationQuestion.paper_id == uuid.UUID(paper_id))
+    if subject:
+        q = q.where(EvaluationQuestion.subject == subject)
+    if question_type:
+        q = q.where(EvaluationQuestion.question_type == question_type)
+    if difficulty:
+        q = q.where(EvaluationQuestion.difficulty == difficulty)
+    q = q.order_by(EvaluationQuestion.created_at.desc()).limit(limit)
+    result = await db.execute(q)
+    return result.scalars().all()
+
+
+@router.get("/subjects")
+async def list_subjects(
+    org_id: str = Query(...),
+    current_user: CurrentUser = None,
+    db: DBSession = None,
+):
+    """Get distinct subjects used across all papers in the org."""
+    # From questions
+    q1 = (
+        select(distinct(EvaluationQuestion.subject))
+        .join(EvaluationQuestionPaper, EvaluationQuestion.paper_id == EvaluationQuestionPaper.id)
+        .where(
+            EvaluationQuestionPaper.org_id == uuid.UUID(org_id),
+            EvaluationQuestion.subject.isnot(None),
+        )
+    )
+    # From paper subjects
+    q2 = (
+        select(distinct(EvaluationPaperSubject.subject))
+        .join(EvaluationQuestionPaper, EvaluationPaperSubject.paper_id == EvaluationQuestionPaper.id)
+        .where(EvaluationQuestionPaper.org_id == uuid.UUID(org_id))
+    )
+    result1 = await db.execute(q1)
+    result2 = await db.execute(q2)
+    subjects = set(result1.scalars().all()) | set(result2.scalars().all())
+    subjects.discard(None)
+    subjects.discard("")
+    return sorted(subjects)
+
+
+@router.get("/chapters")
+async def list_chapters(
+    org_id: str = Query(...),
+    subject: str = Query(...),
+    current_user: CurrentUser = None,
+    db: DBSession = None,
+):
+    """Get distinct chapters for a subject across all papers in the org."""
+    # From questions
+    q1 = (
+        select(distinct(EvaluationQuestion.chapter))
+        .join(EvaluationQuestionPaper, EvaluationQuestion.paper_id == EvaluationQuestionPaper.id)
+        .where(
+            EvaluationQuestionPaper.org_id == uuid.UUID(org_id),
+            EvaluationQuestion.subject == subject,
+            EvaluationQuestion.chapter.isnot(None),
+        )
+    )
+    # From paper chapters
+    q2 = (
+        select(distinct(EvaluationPaperChapter.chapter_name))
+        .join(EvaluationPaperSubject, EvaluationPaperChapter.paper_subject_id == EvaluationPaperSubject.id)
+        .join(EvaluationQuestionPaper, EvaluationPaperSubject.paper_id == EvaluationQuestionPaper.id)
+        .where(
+            EvaluationQuestionPaper.org_id == uuid.UUID(org_id),
+            EvaluationPaperSubject.subject == subject,
+        )
+    )
+    result1 = await db.execute(q1)
+    result2 = await db.execute(q2)
+    chapters = set(result1.scalars().all()) | set(result2.scalars().all())
+    chapters.discard(None)
+    chapters.discard("")
+    return sorted(chapters)
+
 
 @router.post("/papers/{paper_id}/questions", response_model=EvalQuestionResponse, status_code=status.HTTP_201_CREATED)
 async def add_question(
@@ -106,6 +412,8 @@ async def add_question(
         difficulty=payload.difficulty,
         explanation=payload.explanation,
         tags=payload.tags,
+        source_type=payload.source_type,
+        blooms_level=payload.blooms_level,
         is_ai_generated=False,
     )
     db.add(question)
@@ -168,8 +476,7 @@ async def ai_generate_questions(
 ):
     """Use AI to generate questions for the question bank."""
     ai = AIService()
-    questions = await ai.generate_evaluation_paper(
-        paper_id=str(paper_id),
+    questions, _ = await ai.generate_evaluation_paper(
         subjects=payload.subjects,
         question_types=payload.question_types,
     )
@@ -186,6 +493,8 @@ async def ai_generate_questions(
             chapter=q_data.get("chapter"),
             difficulty=q_data.get("difficulty"),
             explanation=q_data.get("explanation"),
+            source_type=q_data.get("source_type", "online"),
+            blooms_level=q_data.get("blooms_level"),
             is_ai_generated=True,
         )
         db.add(question)
