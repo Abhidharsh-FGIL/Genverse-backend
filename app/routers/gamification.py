@@ -30,8 +30,29 @@ async def award_xp(payload: dict, current_user: CurrentUser, db: DBSession):
 
 @router.post("/activity")
 async def record_activity(current_user: CurrentUser, db: DBSession):
-    """Record activity ping and return current streak."""
-    return {"streak": current_user.streak or 0}
+    """Record activity ping and update streak based on consecutive days."""
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    today = now.date()
+
+    if current_user.last_login_date:
+        last_date = current_user.last_login_date.date()
+        if last_date == today:
+            # Already recorded today — streak unchanged
+            return {"streak": current_user.streak or 0}
+        elif last_date == today - timedelta(days=1):
+            # Consecutive day — increment streak
+            current_user.streak = (current_user.streak or 0) + 1
+        else:
+            # Gap in days — reset to 1
+            current_user.streak = 1
+    else:
+        current_user.streak = 1  # First activity ever
+
+    current_user.last_login_date = now
+    await db.commit()
+    return {"streak": current_user.streak}
 
 
 @router.get("/badges", response_model=list[BadgeResponse])

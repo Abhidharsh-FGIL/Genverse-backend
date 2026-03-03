@@ -39,6 +39,16 @@ async def generate_insights(payload: GenerateInsightsRequest, current_user: Curr
         existing = result.scalars().all()
         if existing:
             return existing
+    else:
+        # Delete existing unread insights so regeneration replaces rather than accumulates
+        from sqlalchemy import delete as sql_delete
+        await db.execute(
+            sql_delete(UserInsight).where(
+                UserInsight.user_id == current_user.id,
+                UserInsight.is_read == False,
+            )
+        )
+        await db.commit()
 
     points_service = PointsService()
     await points_service.deduct(user_id=current_user.id, action="generate_insights", db=db)

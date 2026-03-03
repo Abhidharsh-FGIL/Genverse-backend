@@ -148,6 +148,7 @@ async def get_org_analytics(org_id: uuid.UUID, current_user: CurrentUser, db: DB
 async def get_user_progress(current_user: CurrentUser, db: DBSession):
     """Individual user's personal progress summary."""
     from app.models.content import Ebook, MindMap, UserLibraryItem
+    from app.models.ai import AiChat
 
     assessments_result = await db.execute(
         select(func.count(AssessmentAttempt.id)).where(
@@ -180,6 +181,11 @@ async def get_user_progress(current_user: CurrentUser, db: DBSession):
     )
     library_count = library_count_result.scalar_one()
 
+    chat_count_result = await db.execute(
+        select(func.count(AiChat.id)).where(AiChat.user_id == current_user.id)
+    )
+    chat_count = chat_count_result.scalar_one()
+
     return {
         "user_id": str(current_user.id),
         "xp": current_user.xp,
@@ -189,6 +195,7 @@ async def get_user_progress(current_user: CurrentUser, db: DBSession):
         "ebooks_created": ebook_count,
         "mindmaps_created": mindmap_count,
         "library_documents": library_count,
+        "total_chats": chat_count,
     }
 
 
@@ -311,9 +318,9 @@ async def get_activity_heatmap(
     db: DBSession,
     days: int = Query(30, le=90),
 ):
-    """Daily activity count (AI interactions + assessment attempts) for the last N days."""
+    """Daily activity count (AI chats + interactions + assessment attempts) for the last N days."""
     from datetime import datetime, timezone, timedelta, date
-    from app.models.ai import AiInteractionHistory
+    from app.models.ai import AiInteractionHistory, AiChat
 
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
@@ -341,10 +348,24 @@ async def get_activity_heatmap(
         .group_by(func.date(AssessmentAttempt.submitted_at))
     )).all()
 
+    chat_rows = (await db.execute(
+        select(
+            func.date(AiChat.created_at).label("day"),
+            func.count(AiChat.id).label("cnt"),
+        )
+        .where(
+            AiChat.user_id == current_user.id,
+            AiChat.created_at >= since,
+        )
+        .group_by(func.date(AiChat.created_at))
+    )).all()
+
     daily: dict[str, int] = {}
     for row in ai_rows:
         daily[str(row.day)] = daily.get(str(row.day), 0) + row.cnt
     for row in attempt_rows:
+        daily[str(row.day)] = daily.get(str(row.day), 0) + row.cnt
+    for row in chat_rows:
         daily[str(row.day)] = daily.get(str(row.day), 0) + row.cnt
 
     today = date.today()
@@ -354,3 +375,77 @@ async def get_activity_heatmap(
         result.append({"date": d, "count": daily.get(d, 0)})
 
     return {"dailyActivity": result}
+
+
+@router.get("/user/recent-activity")
+async def get_recent_activity(current_user: CurrentUser, db: DBSession):
+    """Last 5 user actions merged across assessments, library, chats, and ebooks."""
+    from datetime import datetime, timezone
+    from app.models.assessment import AssessmentAttempt, PracticeAssessment
+    from app.models.content import UserLibraryItem, Ebook
+    from app.models.ai import AiChat
+
+    events = []
+
+    rows = (await db.execute(
+        select(AssessmentAttempt, PracticeAssessment.title.label("ptitle"))
+        .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        .where(
+            AssessmentAttempt.user_id == current_user.id,
+            AssessmentAttempt.submitted_at.isnot(None),
+        )
+        .order_by(AssessmentAttempt.submitted_at.desc())
+        .limit(5)
+    )).all()
+    for attempt, title in rows:
+        events.append({"type": "assessment", "label": f"Completed: {title or 'Assessment'}",
+                       "icon": "📝", "ts": attempt.submitted_at})
+
+    lib_rows = (await db.execute(
+        select(UserLibraryItem).where(UserLibraryItem.user_id == current_user.id)
+        .order_by(UserLibraryItem.created_at.desc()).limit(5)
+    )).scalars().all()
+    for item in lib_rows:
+        events.append({"type": "document", "label": f"Uploaded: {item.title or 'Document'}",
+                       "icon": "📄", "ts": item.created_at})
+
+    chat_rows = (await db.execute(
+        select(AiChat).where(AiChat.user_id == current_user.id)
+        .order_by(AiChat.created_at.desc()).limit(5)
+    )).scalars().all()
+    for chat in chat_rows:
+        events.append({"type": "chat", "label": f"AI Chat: {chat.title or 'New Chat'}",
+                       "icon": "💬", "ts": chat.created_at})
+
+    ebook_rows = (await db.execute(
+        select(Ebook).where(Ebook.user_id == current_user.id)
+        .order_by(Ebook.created_at.desc()).limit(5)
+    )).scalars().all()
+    for ebook in ebook_rows:
+        events.append({"type": "ebook", "label": f"Created eBook: {ebook.title or 'eBook'}",
+                       "icon": "📚", "ts": ebook.created_at})
+
+    now = datetime.now(timezone.utc)
+
+    def normalize_ts(ts):
+        if ts is None:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+    events.sort(key=lambda e: normalize_ts(e["ts"]), reverse=True)
+
+    def human_time(ts):
+        if not ts:
+            return ""
+        t = normalize_ts(ts)
+        s = int((now - t).total_seconds())
+        if s < 3600:
+            return f"{max(1, s // 60)} min ago"
+        if s < 86400:
+            return f"{s // 3600} hr{'s' if s // 3600 > 1 else ''} ago"
+        return f"{s // 86400} day{'s' if s // 86400 > 1 else ''} ago"
+
+    return [
+        {"type": e["type"], "label": e["label"], "icon": e["icon"], "time": human_time(e["ts"])}
+        for e in events[:5]
+    ]
