@@ -190,11 +190,16 @@ async def save_paper(
                 source_type = sc.get("sourceType", "online")
                 break
 
+        # For match questions, store pairs alongside options in the JSONB field
+        q_options = q.get("options")
+        if q.get("type") == "match" and q.get("pairs"):
+            q_options = {"options": q_options, "pairs": q.get("pairs")}
+
         question = EvaluationQuestion(
             paper_id=paper.id,
             question_type=q.get("type", "mcq"),
             question_text=q.get("text", ""),
-            options=q.get("options"),
+            options=q_options,
             correct_answer=str(q.get("correctAnswer", "")) if q.get("correctAnswer") is not None else None,
             marks=q.get("points", q.get("marks", 1.0)),
             negative_marks=0.0,
@@ -497,11 +502,15 @@ async def ai_generate_questions(
     )
     new_questions = []
     for q_data in questions:
+        q_options = q_data.get("options")
+        if q_data.get("type") == "match" and q_data.get("pairs"):
+            q_options = {"options": q_options, "pairs": q_data.get("pairs")}
+
         question = EvaluationQuestion(
             paper_id=paper_id,
             question_type=q_data.get("type"),
             question_text=q_data.get("text"),
-            options=q_data.get("options"),
+            options=q_options,
             correct_answer=q_data.get("correct_answer"),
             marks=q_data.get("marks", 1.0),
             subject=q_data.get("subject"),
@@ -711,9 +720,19 @@ async def submit_eval_attempt(
     )
     assessment = assessment_result.scalar_one_or_none()
 
-    questions_result = await db.execute(
-        select(EvaluationQuestion).where(EvaluationQuestion.paper_id == assessment.paper_id)
-    )
+    # Fetch questions: prefer question_ids (explicit list), fall back to paper_id
+    if assessment.question_ids:
+        questions_result = await db.execute(
+            select(EvaluationQuestion).where(EvaluationQuestion.id.in_(
+                [uuid.UUID(qid) if isinstance(qid, str) else qid for qid in assessment.question_ids]
+            ))
+        )
+    elif assessment.paper_id:
+        questions_result = await db.execute(
+            select(EvaluationQuestion).where(EvaluationQuestion.paper_id == assessment.paper_id)
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Assessment has no questions configured")
     questions = questions_result.scalars().all()
 
     score = 0

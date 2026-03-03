@@ -35,16 +35,10 @@ async def extract_text(
     )
 
     ai = AIService()
-    print(f"[OCR] File saved to: {file_info['path']}")
-    print(f"[OCR] Content type: {file.content_type}, Original name: {file.filename}")
-    from pathlib import Path as _P
-    _saved = _P(file_info["path"])
-    print(f"[OCR] File exists: {_saved.exists()}, Extension: {_saved.suffix}, Size: {_saved.stat().st_size if _saved.exists() else 'N/A'}")
     extracted_text = await ai.extract_text_from_file(
         file_path=file_info["path"],
         language=language,
     )
-    print(f"[OCR] Extracted text length: {len(extracted_text) if extracted_text else 0}")
 
     # Save library item so it appears in GET /library?folder=ocr
     item = UserLibraryItem(
