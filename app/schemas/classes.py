@@ -36,6 +36,7 @@ class ClassResponse(BaseModel):
     section: Optional[str] = None
     join_code: str
     teacher_id: uuid.UUID
+    teacher_name: Optional[str] = None
     color: Optional[str] = None
     description: Optional[str] = None
     is_active: bool

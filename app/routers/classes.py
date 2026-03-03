@@ -33,6 +33,23 @@ def _generate_join_code(length: int = 8) -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 
+async def _build_class_response(class_: Class, db, student_count: int | None = None) -> ClassResponse:
+    """Build a ClassResponse with teacher_name and student_count populated."""
+    if student_count is None:
+        count_result = await db.execute(
+            select(func.count(ClassStudent.id)).where(ClassStudent.class_id == class_.id)
+        )
+        student_count = count_result.scalar_one()
+
+    teacher_result = await db.execute(select(User.name).where(User.id == class_.teacher_id))
+    teacher_name = teacher_result.scalar_one_or_none()
+
+    r = ClassResponse.model_validate(class_)
+    r.student_count = student_count
+    r.teacher_name = teacher_name
+    return r
+
+
 @router.post("/", response_model=ClassResponse, status_code=status.HTTP_201_CREATED)
 async def create_class(payload: ClassCreate, current_user: CurrentUser, db: DBSession):
     join_code = _generate_join_code()
@@ -47,9 +64,20 @@ async def create_class(payload: ClassCreate, current_user: CurrentUser, db: DBSe
     assigned_teacher_id = current_user.id
     if payload.teacher_id:
         try:
-            assigned_teacher_id = uuid.UUID(payload.teacher_id)
+            tid = uuid.UUID(payload.teacher_id)
         except ValueError:
-            pass
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid teacher_id format",
+            )
+        # Verify the teacher exists
+        teacher_check = await db.execute(select(User.id).where(User.id == tid))
+        if not teacher_check.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Selected teacher not found",
+            )
+        assigned_teacher_id = tid
 
     class_ = Class(
         name=payload.name,
@@ -67,15 +95,7 @@ async def create_class(payload: ClassCreate, current_user: CurrentUser, db: DBSe
     await db.commit()
     await db.refresh(class_)
 
-    # Count students
-    count_result = await db.execute(
-        select(func.count(ClassStudent.id)).where(ClassStudent.class_id == class_.id)
-    )
-    student_count = count_result.scalar_one()
-
-    response = ClassResponse.model_validate(class_)
-    response.student_count = student_count
-    return response
+    return await _build_class_response(class_, db)
 
 
 @router.get("/", response_model=list[ClassResponse])
@@ -106,12 +126,7 @@ async def list_classes(
             all_classes = {c.id: c for c in result.scalars().all()}
             responses = []
             for c in all_classes.values():
-                count_result = await db.execute(
-                    select(func.count(ClassStudent.id)).where(ClassStudent.class_id == c.id)
-                )
-                r = ClassResponse.model_validate(c)
-                r.student_count = count_result.scalar_one()
-                responses.append(r)
+                responses.append(await _build_class_response(c, db))
             return responses
 
     # Teacher / co-teacher: return only classes they are part of
@@ -132,13 +147,7 @@ async def list_classes(
 
     responses = []
     for c in all_classes.values():
-        count_result = await db.execute(
-            select(func.count(ClassStudent.id)).where(ClassStudent.class_id == c.id)
-        )
-        student_count = count_result.scalar_one()
-        r = ClassResponse.model_validate(c)
-        r.student_count = student_count
-        responses.append(r)
+        responses.append(await _build_class_response(c, db))
     return responses
 
 
@@ -167,12 +176,7 @@ async def get_enrolled_classes(
     rows = result.all()
     responses = []
     for enrollment, c in rows:
-        count_result = await db.execute(
-            select(func.count(ClassStudent.id)).where(ClassStudent.class_id == c.id)
-        )
-        student_count = count_result.scalar_one()
-        r = ClassResponse.model_validate(c)
-        r.student_count = student_count
+        r = await _build_class_response(c, db)
         d = r.model_dump()
         d["roll_no"] = enrollment.roll_no
         d["joined_at_enrollment"] = enrollment.joined_at.isoformat() if enrollment.joined_at else None
@@ -192,13 +196,7 @@ async def get_enrolled_classes_legacy(current_user: CurrentUser, db: DBSession):
     classes = result.scalars().all()
     responses = []
     for c in classes:
-        count_result = await db.execute(
-            select(func.count(ClassStudent.id)).where(ClassStudent.class_id == c.id)
-        )
-        student_count = count_result.scalar_one()
-        r = ClassResponse.model_validate(c)
-        r.student_count = student_count
-        responses.append(r)
+        responses.append(await _build_class_response(c, db))
     return responses
 
 
@@ -209,13 +207,7 @@ async def get_class(class_id: uuid.UUID, current_user: CurrentUser, db: DBSessio
     if not class_:
         raise NotFoundException("Class not found")
 
-    count_result = await db.execute(
-        select(func.count(ClassStudent.id)).where(ClassStudent.class_id == class_id)
-    )
-    student_count = count_result.scalar_one()
-    r = ClassResponse.model_validate(class_)
-    r.student_count = student_count
-    return r
+    return await _build_class_response(class_, db)
 
 
 @router.patch("/{class_id}", response_model=ClassResponse)
@@ -234,13 +226,7 @@ async def update_class(
     await db.commit()
     await db.refresh(class_)
 
-    count_result = await db.execute(
-        select(func.count(ClassStudent.id)).where(ClassStudent.class_id == class_id)
-    )
-    student_count = count_result.scalar_one()
-    r = ClassResponse.model_validate(class_)
-    r.student_count = student_count
-    return r
+    return await _build_class_response(class_, db)
 
 
 @router.delete("/{class_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -297,13 +283,7 @@ async def join_class(payload: JoinClassRequest, current_user: CurrentUser, db: D
 
     await db.commit()
 
-    count_result = await db.execute(
-        select(func.count(ClassStudent.id)).where(ClassStudent.class_id == class_.id)
-    )
-    student_count = count_result.scalar_one()
-    r = ClassResponse.model_validate(class_)
-    r.student_count = student_count
-    return r
+    return await _build_class_response(class_, db)
 
 
 @router.get("/{class_id}/students", response_model=list[ClassStudentResponse])

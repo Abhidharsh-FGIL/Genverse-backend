@@ -13,6 +13,9 @@ class EvalPaperCreate(BaseModel):
     negative_mark_value: float = 0.25
     time_limit: Optional[int] = None
     mode: str = "exam"
+    difficulty: Optional[str] = None
+    question_count: Optional[int] = None
+    max_score: Optional[float] = None
 
 
 class EvalPaperResponse(BaseModel):
@@ -27,6 +30,9 @@ class EvalPaperResponse(BaseModel):
     time_limit: Optional[int] = None
     mode: str
     status: str
+    difficulty: Optional[str] = None
+    question_count: Optional[int] = None
+    max_score: Optional[float] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -58,6 +64,8 @@ class EvalQuestionCreate(BaseModel):
     difficulty: Optional[str] = None
     explanation: Optional[str] = None
     tags: Optional[List[str]] = None
+    source_type: Optional[str] = None
+    blooms_level: Optional[str] = None
 
 
 class EvalQuestionUpdate(BaseModel):
@@ -82,6 +90,8 @@ class EvalQuestionResponse(BaseModel):
     chapter: Optional[str] = None
     difficulty: Optional[str] = None
     explanation: Optional[str] = None
+    source_type: Optional[str] = None
+    blooms_level: Optional[str] = None
     is_ai_generated: bool
     order_index: int
 
@@ -94,24 +104,77 @@ class GeneratePaperRequest(BaseModel):
     question_types: Optional[List[str]] = None
 
 
-class EvalAssessmentCreate(BaseModel):
-    paper_id: str
+# ---- New schemas for full paper generation flow ----
+
+class EvalSubjectConfigSchema(BaseModel):
+    subject: str
+    weightage: float = 100
+    source_type: str = "online"  # online | text | file
+    source_text: Optional[str] = None
+    chapters: Optional[List[dict]] = None  # [{name, weightage}]
+
+
+class GenerateEvalPaperRequest(BaseModel):
     title: str
+    grade: Optional[int] = None
+    board: Optional[str] = None
+    difficulty: str = "medium"
+    blooms_level: str = "mixed"
+    question_count: int = 20
+    question_types: List[str] = ["mcq"]
+    mcq_subtypes: Optional[List[str]] = None
+    type_weightage: Optional[dict] = None
+    negative_marking: bool = False
+    negative_mark_value: float = 0.25
+    subjects: List[EvalSubjectConfigSchema]
+
+
+class GenerateEvalPaperResponse(BaseModel):
+    question_json: List[dict]
+    answer_key_json: List[dict]
+
+
+class SaveEvalPaperRequest(BaseModel):
+    org_id: str
+    config: dict  # Full EvalPaperConfig from frontend
+    questions: List[dict]
+    answer_key: Optional[List[dict]] = None
+
+
+class EvalAssessmentCreate(BaseModel):
+    paper_id: Optional[str] = None
+    title: str
+    grade: Optional[int] = None
+    board: Optional[str] = None
+    difficulty: Optional[str] = None
+    question_ids: Optional[List[str]] = None
+    question_count: Optional[int] = None
+    max_score: Optional[float] = None
+    due_date: Optional[datetime] = None
     mode: str = "exam"
     time_limit: Optional[int] = None
+    time_limit_seconds: Optional[int] = None
     negative_marking: bool = False
+    negative_mark_value: Optional[float] = None
     scheduled_at: Optional[datetime] = None
     ends_at: Optional[datetime] = None
 
 
 class EvalAssessmentResponse(BaseModel):
     id: uuid.UUID
-    paper_id: uuid.UUID
+    paper_id: Optional[uuid.UUID] = None
     org_id: uuid.UUID
     title: str
     mode: str
     time_limit: Optional[int] = None
     negative_marking: bool
+    negative_mark_value: Optional[float] = None
+    question_count: Optional[int] = None
+    max_score: Optional[float] = None
+    difficulty: Optional[str] = None
+    grade: Optional[int] = None
+    board: Optional[str] = None
+    due_date: Optional[datetime] = None
     scheduled_at: Optional[datetime] = None
     ends_at: Optional[datetime] = None
     status: str

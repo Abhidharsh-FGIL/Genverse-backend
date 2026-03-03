@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional, List
 
 
@@ -25,6 +25,17 @@ class UserUpdate(BaseModel):
     persona_band: Optional[str] = None
     language: Optional[str] = None
     subjects: Optional[List[str]] = None
+    role: Optional[str] = None
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        allowed = {"normal_user", "teacher", "student", "guardian"}
+        if v not in allowed:
+            raise ValueError(f"Role must be one of: {', '.join(allowed)}")
+        return v
 
 
 class UserResponse(UserBase):
