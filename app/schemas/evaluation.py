@@ -142,23 +142,39 @@ class SaveEvalPaperRequest(BaseModel):
 
 
 class EvalAssessmentCreate(BaseModel):
-    paper_id: str
+    paper_id: Optional[str] = None
     title: str
+    grade: Optional[int] = None
+    board: Optional[str] = None
+    difficulty: Optional[str] = None
+    question_ids: Optional[List[str]] = None
+    question_count: Optional[int] = None
+    max_score: Optional[float] = None
+    due_date: Optional[datetime] = None
     mode: str = "exam"
     time_limit: Optional[int] = None
+    time_limit_seconds: Optional[int] = None
     negative_marking: bool = False
+    negative_mark_value: Optional[float] = None
     scheduled_at: Optional[datetime] = None
     ends_at: Optional[datetime] = None
 
 
 class EvalAssessmentResponse(BaseModel):
     id: uuid.UUID
-    paper_id: uuid.UUID
+    paper_id: Optional[uuid.UUID] = None
     org_id: uuid.UUID
     title: str
     mode: str
     time_limit: Optional[int] = None
     negative_marking: bool
+    negative_mark_value: Optional[float] = None
+    question_count: Optional[int] = None
+    max_score: Optional[float] = None
+    difficulty: Optional[str] = None
+    grade: Optional[int] = None
+    board: Optional[str] = None
+    due_date: Optional[datetime] = None
     scheduled_at: Optional[datetime] = None
     ends_at: Optional[datetime] = None
     status: str

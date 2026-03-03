@@ -2874,7 +2874,7 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
                 doc = Document(file_path)
                 return "\n".join(para.text for para in doc.paragraphs)
 
-            elif ext in (".txt",):
+            elif ext in (".txt", ".md"):
                 return path.read_text(encoding="utf-8", errors="ignore")
 
             elif ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):

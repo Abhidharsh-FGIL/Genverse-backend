@@ -307,6 +307,7 @@ async def list_all_questions(
     subject: str | None = Query(None),
     question_type: str | None = Query(None, alias="type"),
     difficulty: str | None = Query(None),
+    source_type: str | None = Query(None, alias="source"),
     paper_id: str | None = Query(None),
     limit: int = Query(200, le=500),
 ):
@@ -324,6 +325,8 @@ async def list_all_questions(
         q = q.where(EvaluationQuestion.question_type == question_type)
     if difficulty:
         q = q.where(EvaluationQuestion.difficulty == difficulty)
+    if source_type:
+        q = q.where(EvaluationQuestion.source_type == source_type)
     q = q.order_by(EvaluationQuestion.created_at.desc()).limit(limit)
     result = await db.execute(q)
     return result.scalars().all()
@@ -332,10 +335,12 @@ async def list_all_questions(
 @router.get("/subjects")
 async def list_subjects(
     org_id: str = Query(...),
+    grade: int | None = Query(None),
+    board: str | None = Query(None),
     current_user: CurrentUser = None,
     db: DBSession = None,
 ):
-    """Get distinct subjects used across all papers in the org."""
+    """Get distinct subjects used across all papers in the org, optionally filtered by grade/board."""
     # From questions
     q1 = (
         select(distinct(EvaluationQuestion.subject))
@@ -345,12 +350,22 @@ async def list_subjects(
             EvaluationQuestion.subject.isnot(None),
         )
     )
+    if grade:
+        q1 = q1.where(EvaluationQuestionPaper.grade == grade)
+    if board:
+        q1 = q1.where(EvaluationQuestionPaper.board == board)
+
     # From paper subjects
     q2 = (
         select(distinct(EvaluationPaperSubject.subject))
         .join(EvaluationQuestionPaper, EvaluationPaperSubject.paper_id == EvaluationQuestionPaper.id)
         .where(EvaluationQuestionPaper.org_id == uuid.UUID(org_id))
     )
+    if grade:
+        q2 = q2.where(EvaluationQuestionPaper.grade == grade)
+    if board:
+        q2 = q2.where(EvaluationQuestionPaper.board == board)
+
     result1 = await db.execute(q1)
     result2 = await db.execute(q2)
     subjects = set(result1.scalars().all()) | set(result2.scalars().all())
@@ -512,14 +527,27 @@ async def create_assessment(
     current_user: CurrentUser = None,
     db: DBSession = None,
 ):
+    # Resolve time_limit: prefer time_limit_seconds (from frontend), fall back to time_limit (minutes)
+    time_limit = payload.time_limit
+    if payload.time_limit_seconds is not None:
+        time_limit = payload.time_limit_seconds
+
     assessment = EvaluationAssessment(
-        paper_id=uuid.UUID(payload.paper_id),
+        paper_id=uuid.UUID(payload.paper_id) if payload.paper_id else None,
         org_id=uuid.UUID(org_id),
         created_by=current_user.id,
         title=payload.title,
         mode=payload.mode,
-        time_limit=payload.time_limit,
+        time_limit=time_limit,
         negative_marking=payload.negative_marking,
+        negative_mark_value=payload.negative_mark_value,
+        question_count=payload.question_count,
+        max_score=payload.max_score,
+        difficulty=payload.difficulty,
+        grade=payload.grade,
+        board=payload.board,
+        due_date=payload.due_date,
+        question_ids=[str(qid) for qid in payload.question_ids] if payload.question_ids else None,
         scheduled_at=payload.scheduled_at,
         ends_at=payload.ends_at,
         status="draft",
@@ -542,6 +570,39 @@ async def list_assessments(
         .order_by(EvaluationAssessment.created_at.desc())
     )
     return result.scalars().all()
+
+
+@router.patch("/assessments/{assessment_id}/status", response_model=EvalAssessmentResponse)
+async def update_assessment_status(
+    assessment_id: uuid.UUID,
+    payload: dict,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == assessment_id)
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise NotFoundException("Assessment not found")
+    new_status = payload.get("status")
+    if new_status and new_status in ("draft", "active", "completed"):
+        assessment.status = new_status
+    await db.commit()
+    await db.refresh(assessment)
+    return assessment
+
+
+@router.delete("/assessments/{assessment_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_assessment(assessment_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == assessment_id)
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise NotFoundException("Assessment not found")
+    await db.delete(assessment)
+    await db.commit()
 
 
 @router.post("/assessments/{assessment_id}/distribute")
