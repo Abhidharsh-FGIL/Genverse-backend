@@ -184,7 +184,10 @@ class EvalAssessmentResponse(BaseModel):
 
 
 class DistributeAssessmentRequest(BaseModel):
-    assessment_id: str
+    emails: Optional[List[str]] = None
+    class_id: Optional[str] = None
+    org_id: Optional[str] = None
+    # Legacy fields
     class_ids: Optional[List[str]] = None
     student_ids: Optional[List[str]] = None
 

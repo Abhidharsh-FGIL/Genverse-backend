@@ -200,6 +200,32 @@ async def get_enrolled_classes_legacy(current_user: CurrentUser, db: DBSession):
     return responses
 
 
+@router.get("/students")
+async def list_students_for_classes(
+    classIds: str = Query(..., description="Comma-separated class UUIDs"),
+    current_user: CurrentUser = None,
+    db: DBSession = None,
+):
+    """Get students across multiple classes (for assessment distribution)."""
+    class_id_list = [uuid.UUID(cid.strip()) for cid in classIds.split(",") if cid.strip()]
+    if not class_id_list:
+        return []
+    result = await db.execute(
+        select(ClassStudent, User)
+        .join(User, ClassStudent.student_id == User.id)
+        .where(ClassStudent.class_id.in_(class_id_list))
+    )
+    rows = result.all()
+    return [
+        ClassStudentResponse(
+            id=cs.id, class_id=cs.class_id, student_id=cs.student_id,
+            roll_no=cs.roll_no, joined_at=cs.joined_at,
+            student_name=user.name, student_email=user.email,
+        )
+        for cs, user in rows
+    ]
+
+
 @router.get("/{class_id}", response_model=ClassResponse)
 async def get_class(class_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
     result = await db.execute(select(Class).where(Class.id == class_id))

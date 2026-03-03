@@ -2878,21 +2878,49 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
                 return path.read_text(encoding="utf-8", errors="ignore")
 
             elif ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
-                # For images, use Gemini's vision capability or pytesseract
-                gemini = self._get_gemini()
-                if gemini:
-                    import google.generativeai as genai
-                    vision_model = genai.GenerativeModel("gemini-2.5-flash")
-                    with open(file_path, "rb") as f:
-                        image_data = f.read()
-                    response = vision_model.generate_content([
-                        "Extract all text from this image. Return only the extracted text.",
-                        {"mime_type": "image/jpeg", "data": image_data},
-                    ])
-                    return response.text
-                return ""
+                # Map extension to correct MIME type for Gemini vision
+                mime_map = {
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".png": "image/png",
+                    ".webp": "image/webp",
+                    ".gif": "image/gif",
+                }
+                mime_type = mime_map.get(ext, "image/jpeg")
+
+                with open(file_path, "rb") as f:
+                    image_data = f.read()
+
+                print(f"[OCR] Image read: {len(image_data)} bytes, mime={mime_type}")
+
+                # Use the newer google-genai SDK for reliable multimodal support
+                try:
+                    from google import genai
+                    from google.genai import types
+
+                    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+                    response = client.models.generate_content(
+                        model=settings.AI_PRIMARY_MODEL,
+                        contents=[
+                            f"Extract all text from this image. The text may be in {language} language. "
+                            "Return only the extracted text, preserving the original formatting. "
+                            "If there is no text in the image, return an empty string.",
+                            types.Part.from_bytes(data=image_data, mime_type=mime_type),
+                        ],
+                    )
+                    text = response.text or ""
+                    print(f"[OCR] Extracted {len(text)} chars from image")
+                    return text
+                except Exception as img_err:
+                    print(f"[OCR] Image extraction failed: {img_err}")
+                    import traceback
+                    traceback.print_exc()
+                    return ""
 
         except Exception as e:
+            print(f"[OCR] Error extracting text from {file_path}: {e}")
+            import traceback
+            traceback.print_exc()
             return ""
 
     async def generate_class_recommendations(self, class_data: dict) -> List[dict]:

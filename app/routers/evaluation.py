@@ -39,6 +39,29 @@ from app.services.ai_service import AIService
 router = APIRouter()
 
 
+# ---- Email Test (temporary — remove after debugging) ----
+
+@router.get("/test-email")
+async def test_email(to: str = Query(...)):
+    """Temporary test endpoint: GET /api/v1/evaluation/test-email?to=someone@example.com"""
+    import sys
+    from app.services.email_service import send_assessment_invitation
+    print(f"[TestEmail] Sending test email to {to}", flush=True)
+    sys.stdout.flush()
+    try:
+        await send_assessment_invitation(
+            to_emails=[to],
+            assessment_title="Test Assessment",
+            assessment_id="test-123",
+            teacher_name="Test Teacher",
+        )
+        return {"status": "sent", "to": to}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"status": "failed", "error": str(e)}
+
+
 # ---- Question Papers ----
 
 @router.post("/papers/generate", response_model=GenerateEvalPaperResponse)
@@ -190,11 +213,16 @@ async def save_paper(
                 source_type = sc.get("sourceType", "online")
                 break
 
+        # For match questions, store pairs alongside options in the JSONB field
+        q_options = q.get("options")
+        if q.get("type") == "match" and q.get("pairs"):
+            q_options = {"options": q_options, "pairs": q.get("pairs")}
+
         question = EvaluationQuestion(
             paper_id=paper.id,
             question_type=q.get("type", "mcq"),
             question_text=q.get("text", ""),
-            options=q.get("options"),
+            options=q_options,
             correct_answer=str(q.get("correctAnswer", "")) if q.get("correctAnswer") is not None else None,
             marks=q.get("points", q.get("marks", 1.0)),
             negative_marks=0.0,
@@ -337,10 +365,11 @@ async def list_subjects(
     org_id: str = Query(...),
     grade: int | None = Query(None),
     board: str | None = Query(None),
+    source_type: str | None = Query(None, alias="source"),
     current_user: CurrentUser = None,
     db: DBSession = None,
 ):
-    """Get distinct subjects used across all papers in the org, optionally filtered by grade/board."""
+    """Get distinct subjects used across all papers in the org, optionally filtered by grade/board/source_type."""
     # From questions
     q1 = (
         select(distinct(EvaluationQuestion.subject))
@@ -354,21 +383,27 @@ async def list_subjects(
         q1 = q1.where(EvaluationQuestionPaper.grade == grade)
     if board:
         q1 = q1.where(EvaluationQuestionPaper.board == board)
+    if source_type:
+        q1 = q1.where(EvaluationQuestion.source_type == source_type)
 
-    # From paper subjects
-    q2 = (
-        select(distinct(EvaluationPaperSubject.subject))
-        .join(EvaluationQuestionPaper, EvaluationPaperSubject.paper_id == EvaluationQuestionPaper.id)
-        .where(EvaluationQuestionPaper.org_id == uuid.UUID(org_id))
-    )
-    if grade:
-        q2 = q2.where(EvaluationQuestionPaper.grade == grade)
-    if board:
-        q2 = q2.where(EvaluationQuestionPaper.board == board)
-
+    # From paper subjects — only include if no source_type filter (paper subjects don't have source_type)
+    subjects: set[str] = set()
     result1 = await db.execute(q1)
-    result2 = await db.execute(q2)
-    subjects = set(result1.scalars().all()) | set(result2.scalars().all())
+    subjects |= set(result1.scalars().all())
+
+    if not source_type:
+        q2 = (
+            select(distinct(EvaluationPaperSubject.subject))
+            .join(EvaluationQuestionPaper, EvaluationPaperSubject.paper_id == EvaluationQuestionPaper.id)
+            .where(EvaluationQuestionPaper.org_id == uuid.UUID(org_id))
+        )
+        if grade:
+            q2 = q2.where(EvaluationQuestionPaper.grade == grade)
+        if board:
+            q2 = q2.where(EvaluationQuestionPaper.board == board)
+        result2 = await db.execute(q2)
+        subjects |= set(result2.scalars().all())
+
     subjects.discard(None)
     subjects.discard("")
     return sorted(subjects)
@@ -497,11 +532,15 @@ async def ai_generate_questions(
     )
     new_questions = []
     for q_data in questions:
+        q_options = q_data.get("options")
+        if q_data.get("type") == "match" and q_data.get("pairs"):
+            q_options = {"options": q_options, "pairs": q_data.get("pairs")}
+
         question = EvaluationQuestion(
             paper_id=paper_id,
             question_type=q_data.get("type"),
             question_text=q_data.get("text"),
-            options=q_data.get("options"),
+            options=q_options,
             correct_answer=q_data.get("correct_answer"),
             marks=q_data.get("marks", 1.0),
             subject=q_data.get("subject"),
@@ -572,6 +611,17 @@ async def list_assessments(
     return result.scalars().all()
 
 
+@router.get("/assessments/{assessment_id}", response_model=EvalAssessmentResponse)
+async def get_assessment(assessment_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == assessment_id)
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise NotFoundException("Assessment not found")
+    return assessment
+
+
 @router.patch("/assessments/{assessment_id}/status", response_model=EvalAssessmentResponse)
 async def update_assessment_status(
     assessment_id: uuid.UUID,
@@ -609,43 +659,147 @@ async def delete_assessment(assessment_id: uuid.UUID, current_user: CurrentUser,
 async def distribute_assessment(
     assessment_id: uuid.UUID, payload: DistributeAssessmentRequest, current_user: CurrentUser, db: DBSession
 ):
-    """Distribute an assessment to specific classes or individual students."""
+    """Distribute an assessment to students by email and send invitation emails."""
+    import traceback
     from app.models.classes import ClassStudent
-    invitations = []
-    if payload.class_ids:
-        for class_id in payload.class_ids:
-            students_result = await db.execute(
-                select(ClassStudent).where(ClassStudent.class_id == uuid.UUID(class_id))
-            )
-            students = students_result.scalars().all()
-            for student in students:
-                inv = EvaluationInvitation(
-                    assessment_id=assessment_id,
-                    student_id=student.student_id,
-                    class_id=uuid.UUID(class_id),
-                )
-                db.add(inv)
-                invitations.append(student.student_id)
+    from app.models.user import User
+    from app.services.email_service import send_assessment_invitation
 
-    if payload.student_ids:
-        for student_id in payload.student_ids:
-            inv = EvaluationInvitation(
-                assessment_id=assessment_id,
-                student_id=uuid.UUID(student_id),
-            )
-            db.add(inv)
-            invitations.append(student_id)
+    print(f"\n{'='*60}", flush=True)
+    print(f"[Distribute] START", flush=True)
+    print(f"[Distribute] assessment_id={assessment_id}")
+    print(f"[Distribute] payload.emails={payload.emails}")
+    print(f"[Distribute] payload.class_id={payload.class_id}")
+    print(f"[Distribute] payload.class_ids={payload.class_ids}")
+    print(f"[Distribute] payload.student_ids={payload.student_ids}")
 
-    # Update assessment status
+    # Fetch the assessment
     assessment_result = await db.execute(
         select(EvaluationAssessment).where(EvaluationAssessment.id == assessment_id)
     )
     assessment = assessment_result.scalar_one_or_none()
-    if assessment:
+    if not assessment:
+        print(f"[Distribute] ERROR: Assessment not found!")
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    print(f"[Distribute] Assessment found: title={assessment.title}")
+
+    invited_student_ids: set[uuid.UUID] = set()
+    all_recipient_emails: set[str] = set()  # All emails to send invitations to
+    class_id_for_inv = uuid.UUID(payload.class_id) if payload.class_id else None
+
+    # Collect all valid emails from payload (for sending emails later)
+    if payload.emails:
+        valid_emails = [e.strip().lower() for e in payload.emails if e and e.strip()]
+        print(f"[Distribute] valid_emails={valid_emails} (from {len(payload.emails)} raw)")
+        all_recipient_emails.update(valid_emails)
+
+        # Resolve registered users to create invitation records
+        if valid_emails:
+            users_result = await db.execute(
+                select(User).where(User.email.in_(valid_emails))
+            )
+            users = users_result.scalars().all()
+            print(f"[Distribute] Resolved {len(users)} registered users: {[(u.id, u.email) for u in users]}")
+            registered_emails = set()
+            for user in users:
+                invited_student_ids.add(user.id)
+                registered_emails.add(user.email.lower())
+            unregistered = set(valid_emails) - registered_emails
+            if unregistered:
+                print(f"[Distribute] Unregistered emails (will still receive email): {unregistered}")
+    else:
+        print(f"[Distribute] payload.emails is empty/None")
+
+    # Legacy: class_ids support
+    if payload.class_ids:
+        for cid in payload.class_ids:
+            students_result = await db.execute(
+                select(ClassStudent).where(ClassStudent.class_id == uuid.UUID(cid))
+            )
+            for student in students_result.scalars().all():
+                invited_student_ids.add(student.student_id)
+
+    # Legacy: student_ids support
+    if payload.student_ids:
+        for sid in payload.student_ids:
+            invited_student_ids.add(uuid.UUID(sid))
+
+    print(f"[Distribute] Total invited_student_ids={len(invited_student_ids)}: {invited_student_ids}")
+
+    # Check existing invitations to avoid duplicates
+    existing_result = await db.execute(
+        select(EvaluationInvitation.student_id).where(
+            EvaluationInvitation.assessment_id == assessment_id
+        )
+    )
+    existing_ids = set(existing_result.scalars().all())
+    new_ids = invited_student_ids - existing_ids
+    print(f"[Distribute] existing_invitations={len(existing_ids)}, new_to_invite={len(new_ids)}")
+
+    # Create invitation records for registered users
+    for student_id in new_ids:
+        db.add(EvaluationInvitation(
+            assessment_id=assessment_id,
+            student_id=student_id,
+            class_id=class_id_for_inv,
+        ))
+
+    # Also fetch emails of newly invited registered users
+    if new_ids:
+        email_result = await db.execute(
+            select(User.email).where(User.id.in_(new_ids))
+        )
+        for e in email_result.scalars().all():
+            if e:
+                all_recipient_emails.add(e.lower())
+
+    # Update assessment status
+    if assessment.status != "distributed":
         assessment.status = "distributed"
 
     await db.commit()
-    return {"distributed_to": len(invitations), "message": "Assessment distributed"}
+    print(f"[Distribute] DB committed. Now sending emails...")
+
+    # Send invitation emails to ALL collected emails (registered + unregistered)
+    emails_sent = 0
+    recipient_list = sorted(all_recipient_emails)
+    print(f"[Distribute] All recipient emails: {recipient_list}")
+
+    if recipient_list:
+        teacher_name = current_user.name or "Your Teacher"
+        due_str = assessment.due_date.strftime("%d %b %Y, %I:%M %p") if assessment.due_date else None
+        time_limit = assessment.time_limit if assessment.time_limit else None
+        print(f"[Distribute] Calling send_assessment_invitation...")
+        print(f"[Distribute]   to={recipient_list}")
+        print(f"[Distribute]   title={assessment.title}")
+        print(f"[Distribute]   teacher={teacher_name}")
+
+        try:
+            await send_assessment_invitation(
+                to_emails=recipient_list,
+                assessment_title=assessment.title,
+                assessment_id=str(assessment_id),
+                teacher_name=teacher_name,
+                due_date=due_str,
+                time_limit=time_limit,
+            )
+            emails_sent = len(recipient_list)
+            print(f"[Distribute] SUCCESS: Emails sent to {emails_sent} recipients!")
+        except Exception as e:
+            print(f"[Distribute] FAILED to send email: {type(e).__name__}: {e}")
+            traceback.print_exc()
+    else:
+        print(f"[Distribute] No recipient emails to send")
+
+    print(f"[Distribute] DONE: distributed_to={len(new_ids)}, emails_sent={emails_sent}")
+    print(f"{'='*60}\n")
+
+    return {
+        "distributed_to": len(new_ids),
+        "already_invited": len(existing_ids & invited_student_ids),
+        "emails_sent": emails_sent,
+        "message": "Assessment distributed",
+    }
 
 
 @router.get("/my-assessments", response_model=list[EvalAssessmentResponse])
@@ -711,9 +865,19 @@ async def submit_eval_attempt(
     )
     assessment = assessment_result.scalar_one_or_none()
 
-    questions_result = await db.execute(
-        select(EvaluationQuestion).where(EvaluationQuestion.paper_id == assessment.paper_id)
-    )
+    # Fetch questions: prefer question_ids (explicit list), fall back to paper_id
+    if assessment.question_ids:
+        questions_result = await db.execute(
+            select(EvaluationQuestion).where(EvaluationQuestion.id.in_(
+                [uuid.UUID(qid) if isinstance(qid, str) else qid for qid in assessment.question_ids]
+            ))
+        )
+    elif assessment.paper_id:
+        questions_result = await db.execute(
+            select(EvaluationQuestion).where(EvaluationQuestion.paper_id == assessment.paper_id)
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Assessment has no questions configured")
     questions = questions_result.scalars().all()
 
     score = 0
