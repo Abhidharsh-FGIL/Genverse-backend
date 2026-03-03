@@ -190,3 +190,167 @@ async def get_user_progress(current_user: CurrentUser, db: DBSession):
         "mindmaps_created": mindmap_count,
         "library_documents": library_count,
     }
+
+
+@router.get("/user/monthly-comparison")
+async def get_monthly_comparison(current_user: CurrentUser, db: DBSession):
+    """This-month vs last-month counts for assessments, documents, chats, and avg score."""
+    from datetime import datetime, timezone, timedelta
+    from app.models.content import UserLibraryItem
+    from app.models.ai import AiChat
+
+    now = datetime.now(timezone.utc)
+    first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    first_last = (first_this - timedelta(days=1)).replace(day=1)
+
+    async def count_rows(model, date_col, start, end):
+        r = await db.execute(
+            select(func.count(model.id))
+            .where(model.user_id == current_user.id, date_col >= start, date_col < end)
+        )
+        return r.scalar_one()
+
+    async def avg_pct(start, end):
+        r = await db.execute(
+            select(func.avg(AssessmentAttempt.percentage))
+            .where(
+                AssessmentAttempt.user_id == current_user.id,
+                AssessmentAttempt.status == "evaluated",
+                AssessmentAttempt.submitted_at >= start,
+                AssessmentAttempt.submitted_at < end,
+            )
+        )
+        return round(r.scalar_one() or 0, 1)
+
+    return {
+        "thisMonth": {
+            "assessments": await count_rows(AssessmentAttempt, AssessmentAttempt.submitted_at, first_this, now),
+            "documents":   await count_rows(UserLibraryItem, UserLibraryItem.created_at, first_this, now),
+            "chats":       await count_rows(AiChat, AiChat.created_at, first_this, now),
+            "avgScore":    await avg_pct(first_this, now),
+        },
+        "lastMonth": {
+            "assessments": await count_rows(AssessmentAttempt, AssessmentAttempt.submitted_at, first_last, first_this),
+            "documents":   await count_rows(UserLibraryItem, UserLibraryItem.created_at, first_last, first_this),
+            "chats":       await count_rows(AiChat, AiChat.created_at, first_last, first_this),
+            "avgScore":    await avg_pct(first_last, first_this),
+        },
+    }
+
+
+@router.get("/user/score-trend")
+async def get_score_trend(
+    current_user: CurrentUser,
+    db: DBSession,
+    limit: int = Query(12, le=30),
+):
+    """Last N assessed scores with real submission dates, sorted ascending."""
+    from app.models.assessment import PracticeAssessment
+
+    rows = (await db.execute(
+        select(AssessmentAttempt, PracticeAssessment.subject)
+        .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        .where(
+            AssessmentAttempt.user_id == current_user.id,
+            AssessmentAttempt.status == "evaluated",
+            AssessmentAttempt.submitted_at.isnot(None),
+        )
+        .order_by(AssessmentAttempt.submitted_at.desc())
+        .limit(limit)
+    )).all()
+
+    return [
+        {
+            "date":    attempt.submitted_at.strftime("%b %d"),
+            "score":   round(attempt.percentage or 0, 1),
+            "subject": subject or "General",
+        }
+        for attempt, subject in reversed(rows)
+    ]
+
+
+@router.get("/user/study-time")
+async def get_study_time(current_user: CurrentUser, db: DBSession):
+    """AI interactions + assessments grouped by subject — proxy for study activity distribution."""
+    from app.models.ai import AiInteractionHistory
+    from app.models.assessment import PracticeAssessment
+
+    ai_rows = (await db.execute(
+        select(AiInteractionHistory)
+        .where(AiInteractionHistory.user_id == current_user.id)
+        .order_by(AiInteractionHistory.created_at.desc())
+        .limit(200)
+    )).scalars().all()
+
+    subject_counts: dict[str, int] = {}
+    for row in ai_rows:
+        ctx = row.context_snapshot or {}
+        subject = ctx.get("subject") or "General"
+        subject_counts[subject] = subject_counts.get(subject, 0) + 1
+
+    attempt_rows = (await db.execute(
+        select(PracticeAssessment.subject, func.count(AssessmentAttempt.id))
+        .join(AssessmentAttempt, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        .where(AssessmentAttempt.user_id == current_user.id)
+        .group_by(PracticeAssessment.subject)
+    )).all()
+    for subject, cnt in attempt_rows:
+        s = subject or "General"
+        subject_counts[s] = subject_counts.get(s, 0) + cnt
+
+    return [
+        {"subject": s, "interactions": c}
+        for s, c in sorted(subject_counts.items(), key=lambda x: -x[1])
+        if s and c > 0
+    ][:10]
+
+
+@router.get("/user/activity-heatmap")
+async def get_activity_heatmap(
+    current_user: CurrentUser,
+    db: DBSession,
+    days: int = Query(30, le=90),
+):
+    """Daily activity count (AI interactions + assessment attempts) for the last N days."""
+    from datetime import datetime, timezone, timedelta, date
+    from app.models.ai import AiInteractionHistory
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    ai_rows = (await db.execute(
+        select(
+            func.date(AiInteractionHistory.created_at).label("day"),
+            func.count(AiInteractionHistory.id).label("cnt"),
+        )
+        .where(
+            AiInteractionHistory.user_id == current_user.id,
+            AiInteractionHistory.created_at >= since,
+        )
+        .group_by(func.date(AiInteractionHistory.created_at))
+    )).all()
+
+    attempt_rows = (await db.execute(
+        select(
+            func.date(AssessmentAttempt.submitted_at).label("day"),
+            func.count(AssessmentAttempt.id).label("cnt"),
+        )
+        .where(
+            AssessmentAttempt.user_id == current_user.id,
+            AssessmentAttempt.submitted_at >= since,
+        )
+        .group_by(func.date(AssessmentAttempt.submitted_at))
+    )).all()
+
+    daily: dict[str, int] = {}
+    for row in ai_rows:
+        daily[str(row.day)] = daily.get(str(row.day), 0) + row.cnt
+    for row in attempt_rows:
+        daily[str(row.day)] = daily.get(str(row.day), 0) + row.cnt
+
+    today = date.today()
+    result = []
+    for i in range(days - 1, -1, -1):
+        d = str(today - timedelta(days=i))
+        result.append({"date": d, "count": daily.get(d, 0)})
+
+    return {"dailyActivity": result}

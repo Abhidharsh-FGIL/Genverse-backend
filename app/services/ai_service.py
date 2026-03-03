@@ -3207,6 +3207,7 @@ Return ONLY valid JSON."""
         audience = self._audience_context(role, grade)
         is_adult = role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user")
 
+        role_examples = '"seasoned professor", "industry expert", "detective"' if is_adult else '"friendly guide", "explorer buddy", "wise mentor"'
         prompt = (
             f"{audience}\n\n"
             f"Create an immersive roleplay scenario about '{topic}'.\n"
@@ -3217,7 +3218,7 @@ Return ONLY valid JSON."""
             '3. "character": the AI character who guides the scenario:\n'
             '   - "name": a memorable character name\n'
             '   - "avatar": a single emoji representing this character\n'
-            f'   - "role": their role (e.g. {"\"seasoned professor\", \"industry expert\", \"detective\"" if is_adult else "\"friendly guide\", \"explorer buddy\", \"wise mentor\""})\n'
+            f'   - "role": their role (e.g. {role_examples})\n'
             '   - "personality": 1-sentence personality description\n\n'
             f'4. "scenes": array of exactly {5 if is_adult else 4} scenes. Each scene:\n'
             '   - "scene_number": 1-based index\n'

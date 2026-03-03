@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
-from app.models.ai import AiChat, AiChatMessage, AiChatSetting
+from app.models.ai import AiChat, AiChatMessage, AiChatSetting, AiInteractionHistory
 from app.models.content import UserLibraryItem, DocChunk
 from app.schemas.ai import (
     AiChatCreate, AiChatUpdate, AiChatResponse, AiMessageResponse,
@@ -327,6 +327,20 @@ async def send_message_stream(
             if chat_obj:
                 from datetime import datetime, timezone
                 chat_obj.updated_at = datetime.now(timezone.utc)
+            # Track interaction for analytics (study-time, activity-heatmap)
+            ctx = payload.context or {}
+            session.add(AiInteractionHistory(
+                user_id=current_user.id,
+                service="ai-assistant",
+                query=payload.message[:500] if payload.message else None,
+                response_summary=full_response[:200] if full_response else None,
+                context_snapshot={
+                    "subject":  ctx.get("subject"),
+                    "grade":    ctx.get("grade"),
+                    "board":    ctx.get("board"),
+                    "language": ctx.get("language"),
+                },
+            ))
             await session.commit()
 
         yield "data: [DONE]\n\n"
@@ -401,6 +415,19 @@ async def send_message(
         content=response_text,
     )
     db.add(assistant_msg)
+    ctx = payload.context or {}
+    db.add(AiInteractionHistory(
+        user_id=current_user.id,
+        service="ai-assistant",
+        query=payload.message[:500] if payload.message else None,
+        response_summary=response_text[:200] if response_text else None,
+        context_snapshot={
+            "subject":  ctx.get("subject"),
+            "grade":    ctx.get("grade"),
+            "board":    ctx.get("board"),
+            "language": ctx.get("language"),
+        },
+    ))
     await db.commit()
     await db.refresh(assistant_msg)
     return assistant_msg

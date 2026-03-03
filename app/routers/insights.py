@@ -20,6 +20,7 @@ from app.schemas.insights import (
 from app.core.exceptions import NotFoundException
 from app.services.ai_service import AIService
 from app.services.points_service import PointsService
+from app.services.news_service import NewsService
 
 router = APIRouter()
 
@@ -172,6 +173,89 @@ async def get_insight_feed(
             articles.append(article)
         await db.commit()
     return articles
+
+
+@router.get("/news/common")
+async def get_common_news(
+    current_user: CurrentUser,
+    category: str = Query("all"),
+    language: str = Query("en"),
+    max_results: int = Query(10, le=30),
+):
+    """Fetch real-time Google News articles by category via RapidAPI."""
+    svc = NewsService()
+    return await svc.get_common_news(category=category, language=language, max_results=max_results)
+
+
+@router.get("/news/personal")
+async def get_personal_news(
+    current_user: CurrentUser,
+    db: DBSession,
+    language: str = Query("en"),
+    max_results: int = Query(10, le=30),
+):
+    """Fetch real-time news personalised to the user's learning context via RapidAPI."""
+    from app.models.ai import AiContextSession, AiInteractionHistory
+    from app.models.assessment import TopicMastery
+
+    context: dict = {
+        "subjects": [], "topics": [], "weak_topics": [],
+        "grade": None, "board": None, "recent_queries": [],
+    }
+
+    # AI context session — subject, grade, board from most recent session
+    ctx = (await db.execute(
+        select(AiContextSession)
+        .where(AiContextSession.user_id == current_user.id)
+        .order_by(AiContextSession.updated_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if ctx:
+        if ctx.subject: context["subjects"].append(ctx.subject)
+        if ctx.grade:   context["grade"] = ctx.grade
+        if ctx.board:   context["board"] = ctx.board
+
+    # User profile fallbacks for grade and subjects
+    if not context["grade"] and getattr(current_user, "grade", None):
+        context["grade"] = current_user.grade
+    if getattr(current_user, "subjects", None):
+        context["subjects"].extend(current_user.subjects[:2])
+
+    # Topics the user is actively mastering (most recent)
+    for m in (await db.execute(
+        select(TopicMastery)
+        .where(TopicMastery.user_id == current_user.id)
+        .order_by(TopicMastery.updated_at.desc())
+        .limit(3)
+    )).scalars().all():
+        if m.topic:
+            context["topics"].append(m.topic)
+
+    # Weak topics — mastery_level < 50 (areas that need improvement)
+    for m in (await db.execute(
+        select(TopicMastery)
+        .where(
+            TopicMastery.user_id == current_user.id,
+            TopicMastery.mastery_level < 50,
+        )
+        .order_by(TopicMastery.mastery_level.asc())
+        .limit(3)
+    )).scalars().all():
+        if m.topic:
+            context["weak_topics"].append(m.topic)
+
+    # Recent queries across ALL AI services (assistant, ebook, ask-doc, etc.)
+    for h in (await db.execute(
+        select(AiInteractionHistory)
+        .where(AiInteractionHistory.user_id == current_user.id)
+        .order_by(AiInteractionHistory.created_at.desc())
+        .limit(5)
+    )).scalars().all():
+        if getattr(h, "query", None):
+            context["recent_queries"].append(h.query[:50])
+
+    svc = NewsService()
+    return await svc.get_personal_news(user_context=context, language=language, max_results=max_results)
 
 
 @router.post("/intelligence", response_model=IntelligenceResponse)

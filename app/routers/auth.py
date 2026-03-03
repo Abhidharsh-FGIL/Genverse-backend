@@ -186,7 +186,20 @@ async def login(payload: LoginRequest, db: DBSession):
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is inactive")
 
-    user.last_login_date = datetime.now(timezone.utc)
+    # Update streak: consecutive daily logins
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    if user.last_login_date:
+        prev_date = user.last_login_date.date()
+        delta = (today - prev_date).days
+        if delta == 1:
+            user.streak = (user.streak or 0) + 1
+        elif delta > 1:
+            user.streak = 1  # gap in logins — start fresh
+        # delta == 0: same-day login, keep streak unchanged
+    else:
+        user.streak = 1  # first ever login
+    user.last_login_date = now
     await db.commit()
 
     access_token = create_access_token(str(user.id))

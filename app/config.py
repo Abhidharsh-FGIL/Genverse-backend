@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     # YouTube Data API
     YOUTUBE_API_KEY: str = ""
 
+    # RapidAPI — Google News (google-news13.p.rapidapi.com)
+    RAPIDAPI_KEY: str = ""
+    RAPIDAPI_NEWS_HOST: str = "google-news13.p.rapidapi.com"
+
     # Storage
     STORAGE_ROOT: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 50
