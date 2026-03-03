@@ -970,6 +970,7 @@ REQUIREMENTS:
 10. All text must be written in {language_name}.
 11. The "book_summary" field must be 4-10 sentences giving a comprehensive overview of the ENTIRE book — its scope, key themes, and what the reader will learn.
 12. The "thank_you_message" must be 2-3 warm, encouraging sentences wishing the reader well after completing the book.
+13. FORMATTING: Do NOT use markdown headings (# ## ###) inside the "content" field. Use plain text paragraphs only. If you need sub-sections, use **bold text** for sub-headings on their own line — never use # or ## or ### symbols.
 {no_assessment_note}
 
 Return ONLY valid JSON in this exact structure (no markdown fences, no extra keys):
@@ -1024,7 +1025,7 @@ Return ONLY valid JSON in this exact structure (no markdown fences, no extra key
                 "thank_you_message": f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you.",
             }
 
-        # Generate images via Google Custom Search if requested
+        # Generate infographic images using Gemini
         if image_density != "minimal":
             try:
                 generated_chapters = ebook_data.get("chapters", [])
@@ -1038,7 +1039,8 @@ Return ONLY valid JSON in this exact structure (no markdown fences, no extra key
                     tone=tone,
                 )
                 ebook_data["images"] = images
-            except Exception:
+            except Exception as e:
+                print(f"[EbookImage] Image generation error: {e}")
                 pass  # Image generation is non-blocking — proceed without images
 
         return ebook_data
