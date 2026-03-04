@@ -14,11 +14,28 @@ from app.services.points_service import PointsService
 router = APIRouter()
 
 
+def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
+
+
+def _apply_org_filter(q, column, org_id_param: str | None):
+    parsed = _parse_org_id(org_id_param)
+    if parsed is None:
+        return q.where(column.is_(None))
+    return q.where(column == parsed)
+
+
 @router.get("/profile")
 async def get_career_profile(
     current_user: CurrentUser,
     db: DBSession,
     force_refresh: bool = Query(False),
+    org_id: str | None = Query(None),
 ):
     """
     Returns an AI-generated career profile built from the user's assessment data,
@@ -26,7 +43,8 @@ async def get_career_profile(
     No user input required — the profile grows automatically as the user uses the platform.
     Cached for 60 minutes per user.
     """
-    cache_key = f"career-profile:{current_user.id}"
+    workspace_tag = org_id or "personal"
+    cache_key = f"career-profile:{current_user.id}:{workspace_tag}"
 
     if not force_refresh:
         try:
@@ -74,8 +92,15 @@ async def get_career_profile(
 
 
 @router.post("/analyze", response_model=CareerGuidanceResponse, status_code=status.HTTP_201_CREATED)
-async def analyze_career(payload: CareerGuidanceRequest, current_user: CurrentUser, db: DBSession):
+async def analyze_career(
+    payload: CareerGuidanceRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
     """Run career compatibility analysis using AI. Cost: 8 pts."""
+    parsed_oid = _parse_org_id(org_id)
+
     points_service = PointsService()
     await points_service.deduct(user_id=current_user.id, action="career_guidance", db=db)
 
@@ -90,6 +115,7 @@ async def analyze_career(payload: CareerGuidanceRequest, current_user: CurrentUs
 
     session = CareerGuidanceSession(
         user_id=current_user.id,
+        org_id=parsed_oid,
         interests=payload.interests,
         strengths=payload.strengths,
         target_careers=payload.target_careers,
@@ -102,11 +128,12 @@ async def analyze_career(payload: CareerGuidanceRequest, current_user: CurrentUs
     await db.refresh(session)
 
     # Invalidate cached profile so next load reflects new session data
+    workspace_tag = org_id or "personal"
     try:
         old = await db.execute(
             select(IntelligenceCache).where(
                 IntelligenceCache.user_id == current_user.id,
-                IntelligenceCache.cache_key == f"career-profile:{current_user.id}",
+                IntelligenceCache.cache_key == f"career-profile:{current_user.id}:{workspace_tag}",
             )
         )
         old_row = old.scalar_one_or_none()
@@ -124,13 +151,16 @@ async def list_career_sessions(
     current_user: CurrentUser,
     db: DBSession,
     limit: int = Query(10, le=50),
+    org_id: str | None = Query(None),
 ):
-    result = await db.execute(
+    q = (
         select(CareerGuidanceSession)
         .where(CareerGuidanceSession.user_id == current_user.id)
-        .order_by(CareerGuidanceSession.created_at.desc())
-        .limit(limit)
     )
+    if org_id is not None:
+        q = _apply_org_filter(q, CareerGuidanceSession.org_id, org_id)
+    q = q.order_by(CareerGuidanceSession.created_at.desc()).limit(limit)
+    result = await db.execute(q)
     return result.scalars().all()
 
 

@@ -26,6 +26,22 @@ from app.config import settings
 router = APIRouter()
 
 
+def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
+
+
+def _apply_org_filter(q, column, org_id_param: str | None):
+    parsed = _parse_org_id(org_id_param)
+    if parsed is None:
+        return q.where(column.is_(None))
+    return q.where(column == parsed)
+
+
 async def _build_rag_context(
     user_id: str,
     question: str,
@@ -129,6 +145,7 @@ def _inject_inline_docs(messages: list[dict], question: str, inline_docs: list[d
 async def create_chat(payload: AiChatCreate, current_user: CurrentUser, db: DBSession):
     chat = AiChat(
         user_id=current_user.id,
+        org_id=_parse_org_id(payload.org_id),
         scope=payload.scope,
         title=payload.title,
         class_id=uuid.UUID(payload.class_id) if payload.class_id else None,
@@ -146,8 +163,10 @@ async def create_chat(payload: AiChatCreate, current_user: CurrentUser, db: DBSe
 
 
 @router.get("/chats", response_model=list[AiChatResponse])
-async def list_chats(current_user: CurrentUser, db: DBSession, scope: str | None = Query(None)):
+async def list_chats(current_user: CurrentUser, db: DBSession, scope: str | None = Query(None), org_id: str | None = Query(None)):
     q = select(AiChat).where(AiChat.user_id == current_user.id)
+    if org_id is not None:
+        q = _apply_org_filter(q, AiChat.org_id, org_id)
     if scope:
         q = q.where(AiChat.scope == scope)
     q = q.order_by(AiChat.updated_at.desc())

@@ -6,13 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
-from app.database import close_db
+from app.database import close_db, run_migrations
 from app.routers import register_routers
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(settings.STORAGE_ROOT, exist_ok=True)
+    await run_migrations()
     yield
     await close_db()
 

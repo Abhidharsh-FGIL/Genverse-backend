@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, status
+from fastapi import APIRouter, status, Query
 from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
@@ -10,6 +10,22 @@ from app.services.ai_service import AIService
 from app.services.points_service import PointsService
 
 router = APIRouter()
+
+
+def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
+
+
+def _apply_org_filter(q, column, org_id_param: str | None):
+    parsed = _parse_org_id(org_id_param)
+    if parsed is None:
+        return q.where(column.is_(None))
+    return q.where(column == parsed)
 
 
 @router.post("/script", response_model=VideoProjectResponse, status_code=status.HTTP_201_CREATED)
@@ -29,6 +45,7 @@ async def generate_video_script(payload: VideoScriptRequest, current_user: Curre
 
     project = VideoProject(
         user_id=current_user.id,
+        org_id=_parse_org_id(payload.org_id),
         title=f"Video: {payload.topic}",
         topic=payload.topic,
         subject=payload.subject,
@@ -66,12 +83,12 @@ async def generate_video_visuals(project_id: uuid.UUID, current_user: CurrentUse
 
 
 @router.get("/", response_model=list[VideoProjectResponse])
-async def list_video_projects(current_user: CurrentUser, db: DBSession):
-    result = await db.execute(
-        select(VideoProject)
-        .where(VideoProject.user_id == current_user.id)
-        .order_by(VideoProject.created_at.desc())
-    )
+async def list_video_projects(current_user: CurrentUser, db: DBSession, org_id: str | None = Query(None)):
+    q = select(VideoProject).where(VideoProject.user_id == current_user.id)
+    if org_id is not None:
+        q = _apply_org_filter(q, VideoProject.org_id, org_id)
+    q = q.order_by(VideoProject.created_at.desc())
+    result = await db.execute(q)
     return result.scalars().all()
 
 

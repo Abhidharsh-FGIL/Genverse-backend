@@ -1,9 +1,10 @@
 import uuid
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, status, Query
 from sqlalchemy import select, func
 
 from app.dependencies import DBSession, CurrentUser
-from app.models.gamification import Badge, StudentBadge, Title, StudentTitle
+from app.models.gamification import Badge, StudentBadge, Title, StudentTitle, WorkspaceGamification
 from app.models.user import User
 from app.schemas.gamification import (
     BadgeResponse,
@@ -18,41 +19,109 @@ from app.core.exceptions import NotFoundException, ConflictException
 router = APIRouter()
 
 
+def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
+
+
+async def _get_or_create_ws_gamification(
+    user_id: uuid.UUID, org_id_param: str | None, db
+) -> WorkspaceGamification:
+    """Get or create workspace gamification row for user + workspace."""
+    parsed_oid = _parse_org_id(org_id_param)
+    if parsed_oid is None:
+        q = select(WorkspaceGamification).where(
+            WorkspaceGamification.user_id == user_id,
+            WorkspaceGamification.org_id.is_(None),
+        )
+    else:
+        q = select(WorkspaceGamification).where(
+            WorkspaceGamification.user_id == user_id,
+            WorkspaceGamification.org_id == parsed_oid,
+        )
+    result = await db.execute(q)
+    row = result.scalar_one_or_none()
+    if not row:
+        row = WorkspaceGamification(user_id=user_id, org_id=parsed_oid, xp=0, streak=0)
+        db.add(row)
+        await db.flush()
+    return row
+
+
 @router.post("/xp")
-async def award_xp(payload: dict, current_user: CurrentUser, db: DBSession):
+async def award_xp(
+    payload: dict,
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
     """Award XP for non-assessment actions (uploads, mindmaps, etc.)."""
     amount = int(payload.get("amount") or 0)
     if amount > 0:
+        # Update global XP (backward compatible)
         current_user.xp = (current_user.xp or 0) + amount
+
+        # Update workspace-specific XP
+        ws_gam = await _get_or_create_ws_gamification(current_user.id, org_id, db)
+        ws_gam.xp = (ws_gam.xp or 0) + amount
+
         await db.commit()
-    return {"xp": current_user.xp or 0}
+
+    # Return workspace-specific XP
+    ws_gam = await _get_or_create_ws_gamification(current_user.id, org_id, db)
+    return {"xp": ws_gam.xp or 0}
 
 
 @router.post("/activity")
-async def record_activity(current_user: CurrentUser, db: DBSession):
-    """Record activity ping and update streak based on consecutive days."""
-    from datetime import datetime, timezone, timedelta
-
+async def record_activity(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
+    """Record activity ping, update streak, and award daily login XP (idempotent per day per workspace)."""
+    DAILY_LOGIN_XP = 3
     now = datetime.now(timezone.utc)
     today = now.date()
 
-    if current_user.last_login_date:
-        last_date = current_user.last_login_date.date()
-        if last_date == today:
-            # Already recorded today — streak unchanged
-            return {"streak": current_user.streak or 0}
-        elif last_date == today - timedelta(days=1):
-            # Consecutive day — increment streak
-            current_user.streak = (current_user.streak or 0) + 1
-        else:
-            # Gap in days — reset to 1
-            current_user.streak = 1
-    else:
-        current_user.streak = 1  # First activity ever
+    # Update workspace-specific streak + daily XP
+    ws_gam = await _get_or_create_ws_gamification(current_user.id, org_id, db)
+    already_today = False
 
-    current_user.last_login_date = now
+    if ws_gam.last_activity_date:
+        ws_last = ws_gam.last_activity_date.date()
+        if ws_last == today:
+            # Already recorded today — no XP, no streak change
+            already_today = True
+        elif ws_last == today - timedelta(days=1):
+            ws_gam.streak = (ws_gam.streak or 0) + 1
+        else:
+            ws_gam.streak = 1
+    else:
+        ws_gam.streak = 1
+
+    if not already_today:
+        ws_gam.last_activity_date = now
+        # Award daily login XP (only once per day per workspace)
+        ws_gam.xp = (ws_gam.xp or 0) + DAILY_LOGIN_XP
+        # Also update global XP and streak (backward compatible)
+        current_user.xp = (current_user.xp or 0) + DAILY_LOGIN_XP
+        if current_user.last_login_date:
+            gl = current_user.last_login_date.date()
+            if gl != today:
+                if gl == today - timedelta(days=1):
+                    current_user.streak = (current_user.streak or 0) + 1
+                else:
+                    current_user.streak = 1
+        else:
+            current_user.streak = 1
+        current_user.last_login_date = now
+
     await db.commit()
-    return {"streak": current_user.streak}
+    return {"streak": ws_gam.streak or 0, "xp": ws_gam.xp or 0}
 
 
 @router.get("/badges", response_model=list[BadgeResponse])
@@ -143,7 +212,11 @@ async def activate_title(title_id: uuid.UUID, current_user: CurrentUser, db: DBS
 
 
 @router.get("/my/summary", response_model=GamificationSummary)
-async def get_gamification_summary(current_user: CurrentUser, db: DBSession):
+async def get_gamification_summary(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
     badge_count_result = await db.execute(
         select(func.count(StudentBadge.id)).where(StudentBadge.student_id == current_user.id)
     )
@@ -154,13 +227,17 @@ async def get_gamification_summary(current_user: CurrentUser, db: DBSession):
     )
     title_count = title_count_result.scalar_one()
 
-    xp = current_user.xp or 0
+    # Use workspace-specific XP/streak
+    ws_gam = await _get_or_create_ws_gamification(current_user.id, org_id, db)
+    await db.commit()  # persist if newly created
+
+    xp = ws_gam.xp or 0
     level = xp // 100 + 1
     next_level_xp = level * 100
 
     return GamificationSummary(
         xp=xp,
-        streak=current_user.streak or 0,
+        streak=ws_gam.streak or 0,
         level=level,
         next_level_xp=next_level_xp,
         badges_earned=badge_count,

@@ -1,3 +1,4 @@
+import uuid
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status
 from app.dependencies import DBSession, CurrentUser
 from app.models.content import UserLibraryItem, DocChunk
@@ -8,10 +9,20 @@ from app.schemas.content import OCRExtractResponse
 router = APIRouter()
 
 
+def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
+
+
 @router.post("/extract", response_model=OCRExtractResponse)
 async def extract_text(
     file: UploadFile = File(...),
     language: str = Form("en"),
+    org_id: str = Form(None),
     current_user: CurrentUser = None,
     db: DBSession = None,
 ):
@@ -49,6 +60,7 @@ async def extract_text(
         file_size_mb=file_info.get("size_mb"),
         folder="ocr",
         is_processed=bool(extracted_text),
+        org_id=_parse_org_id(org_id),
     )
     db.add(item)
     await db.flush()

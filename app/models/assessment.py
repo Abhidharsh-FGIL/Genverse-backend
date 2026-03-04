@@ -12,6 +12,7 @@ class PracticeAssessment(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     subject: Mapped[str] = mapped_column(String(100), nullable=False)
     board: Mapped[str | None] = mapped_column(String(50))
@@ -71,6 +72,7 @@ class TopicMastery(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True)
     subject: Mapped[str] = mapped_column(String(100), nullable=False)
     topic: Mapped[str] = mapped_column(String(255), nullable=False)
     mastery_level: Mapped[float] = mapped_column(Float, default=0.0)  # 0-100

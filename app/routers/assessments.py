@@ -25,6 +25,27 @@ from app.services.points_service import PointsService
 router = APIRouter()
 
 
+def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
+    """Convert org_id string to UUID. Returns None for personal workspace."""
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
+
+
+def _apply_org_filter(q, column, org_id_param: str | None):
+    """Apply workspace filter to a SQLAlchemy query.
+    org_id_param='personal' or None → filter column IS NULL (personal workspace).
+    org_id_param=UUID string → filter column == UUID (org workspace).
+    """
+    parsed = _parse_org_id(org_id_param)
+    if parsed is None:
+        return q.where(column.is_(None))
+    return q.where(column == parsed)
+
+
 @router.post("/generate", response_model=AssessmentResponse, status_code=status.HTTP_201_CREATED)
 async def generate_assessment(payload: GenerateAssessmentRequest, current_user: CurrentUser, db: DBSession):
     """Use AI to generate practice assessment questions and save them."""
@@ -50,6 +71,7 @@ async def generate_assessment(payload: GenerateAssessmentRequest, current_user: 
 
     assessment = PracticeAssessment(
         created_by=current_user.id,
+        org_id=_parse_org_id(payload.org_id),
         title=payload.title,
         subject=payload.subject,
         board=payload.board,
@@ -76,6 +98,7 @@ async def save_assessment(payload: AssessmentSaveRequest, current_user: CurrentU
     """Save a reviewed/edited set of questions to the library (no AI generation)."""
     assessment = PracticeAssessment(
         created_by=current_user.id,
+        org_id=_parse_org_id(payload.org_id),
         title=payload.title,
         subject=payload.subject or "",
         board=payload.board,
@@ -100,8 +123,11 @@ async def list_assessments(
     current_user: CurrentUser,
     db: DBSession,
     subject: str | None = Query(None),
+    org_id: str | None = Query(None, description="'personal' or org UUID for workspace filtering"),
 ):
     q = select(PracticeAssessment).where(PracticeAssessment.created_by == current_user.id)
+    if org_id is not None:
+        q = _apply_org_filter(q, PracticeAssessment.org_id, org_id)
     if subject:
         q = q.where(PracticeAssessment.subject == subject)
     q = q.order_by(PracticeAssessment.created_at.desc())
@@ -179,17 +205,21 @@ async def get_attempt_history(
     current_user: CurrentUser,
     db: DBSession,
     limit: int = Query(50, le=200),
+    org_id: str | None = Query(None),
 ):
     """Return only evaluated (submitted) attempts by the current user, newest first."""
-    result = await db.execute(
+    q = (
         select(AssessmentAttempt)
         .where(
             AssessmentAttempt.user_id == current_user.id,
             AssessmentAttempt.status == "evaluated",
         )
-        .order_by(AssessmentAttempt.started_at.desc())
-        .limit(limit)
     )
+    if org_id is not None:
+        q = q.join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        q = _apply_org_filter(q, PracticeAssessment.org_id, org_id)
+    q = q.order_by(AssessmentAttempt.started_at.desc()).limit(limit)
+    result = await db.execute(q)
     return result.scalars().all()
 
 
@@ -198,6 +228,7 @@ async def get_assessment_trends(
     current_user: CurrentUser,
     db: DBSession,
     subject: str | None = Query(None),
+    org_id: str | None = Query(None),
 ):
     """Return per-subject score trend aggregates for the current user."""
     q = (
@@ -214,6 +245,8 @@ async def get_assessment_trends(
         )
         .group_by(PracticeAssessment.subject)
     )
+    if org_id is not None:
+        q = _apply_org_filter(q, PracticeAssessment.org_id, org_id)
     if subject:
         q = q.where(PracticeAssessment.subject == subject)
     result = await db.execute(q)
@@ -234,9 +267,12 @@ async def get_mastery(
     current_user: CurrentUser,
     db: DBSession,
     subject: str | None = Query(None),
+    org_id: str | None = Query(None),
 ):
     """Return topic mastery data for the current user."""
     q = select(TopicMastery).where(TopicMastery.user_id == current_user.id)
+    if org_id is not None:
+        q = _apply_org_filter(q, TopicMastery.org_id, org_id)
     if subject:
         q = q.where(TopicMastery.subject == subject)
     result = await db.execute(q)
@@ -278,14 +314,15 @@ async def get_all_attempts(
     current_user: CurrentUser,
     db: DBSession,
     limit: int = Query(50, le=200),
+    org_id: str | None = Query(None),
 ):
     """Return all assessment attempts by the current user."""
-    result = await db.execute(
-        select(AssessmentAttempt)
-        .where(AssessmentAttempt.user_id == current_user.id)
-        .order_by(AssessmentAttempt.started_at.desc())
-        .limit(limit)
-    )
+    q = select(AssessmentAttempt).where(AssessmentAttempt.user_id == current_user.id)
+    if org_id is not None:
+        q = q.join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        q = _apply_org_filter(q, PracticeAssessment.org_id, org_id)
+    q = q.order_by(AssessmentAttempt.started_at.desc()).limit(limit)
+    result = await db.execute(q)
     return result.scalars().all()
 
 
@@ -496,12 +533,14 @@ async def submit_attempt(
 
 async def _update_topic_mastery(user_id, assessment, evaluation, db):
     topics = assessment.topics or [assessment.subject]
+    assessment_org_id = getattr(assessment, "org_id", None)
     for topic in topics:
         result = await db.execute(
             select(TopicMastery).where(
                 TopicMastery.user_id == user_id,
                 TopicMastery.subject == assessment.subject,
                 TopicMastery.topic == topic,
+                TopicMastery.org_id == assessment_org_id if assessment_org_id else TopicMastery.org_id.is_(None),
             )
         )
         mastery = result.scalar_one_or_none()
@@ -509,6 +548,7 @@ async def _update_topic_mastery(user_id, assessment, evaluation, db):
         if not mastery:
             mastery = TopicMastery(
                 user_id=user_id,
+                org_id=assessment_org_id,
                 subject=assessment.subject,
                 topic=topic,
                 mastery_level=percentage,
@@ -542,8 +582,11 @@ async def get_topic_mastery(
     current_user: CurrentUser,
     db: DBSession,
     subject: str | None = Query(None),
+    org_id: str | None = Query(None),
 ):
     q = select(TopicMastery).where(TopicMastery.user_id == current_user.id)
+    if org_id is not None:
+        q = _apply_org_filter(q, TopicMastery.org_id, org_id)
     if subject:
         q = q.where(TopicMastery.subject == subject)
     result = await db.execute(q)

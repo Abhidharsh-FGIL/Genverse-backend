@@ -4,11 +4,20 @@ from sqlalchemy import select, func
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.classes import Class, Assignment, Submission, ClassStudent
-from app.models.assessment import AssessmentAttempt, TopicMastery
+from app.models.assessment import AssessmentAttempt, TopicMastery, PracticeAssessment
 from app.models.organization import Organization, OrgMember
 from app.models.user import User
 
 router = APIRouter()
+
+
+def _parse_org_id(org_id: str | None):
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
 
 
 @router.get("/teacher/class/{class_id}")
@@ -145,25 +154,46 @@ async def get_org_analytics(org_id: uuid.UUID, current_user: CurrentUser, db: DB
 
 
 @router.get("/user/progress")
-async def get_user_progress(current_user: CurrentUser, db: DBSession):
+async def get_user_progress(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
     """Individual user's personal progress summary."""
     from app.models.content import Ebook, MindMap, UserLibraryItem
     from app.models.ai import AiChat
 
-    assessments_result = await db.execute(
-        select(func.count(AssessmentAttempt.id)).where(
+    parsed_oid = _parse_org_id(org_id)
+
+    base_attempt_q = (
+        select(AssessmentAttempt.id)
+        .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        .where(
             AssessmentAttempt.user_id == current_user.id,
             AssessmentAttempt.status == "evaluated",
         )
     )
+    if org_id is not None:
+        base_attempt_q = base_attempt_q.where(
+            PracticeAssessment.org_id == parsed_oid if parsed_oid else PracticeAssessment.org_id.is_(None)
+        )
+
+    assessments_result = await db.execute(select(func.count()).select_from(base_attempt_q.subquery()))
     total_assessments = assessments_result.scalar_one()
 
-    avg_score_result = await db.execute(
-        select(func.avg(AssessmentAttempt.percentage)).where(
+    avg_q = (
+        select(func.avg(AssessmentAttempt.percentage))
+        .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        .where(
             AssessmentAttempt.user_id == current_user.id,
             AssessmentAttempt.status == "evaluated",
         )
     )
+    if org_id is not None:
+        avg_q = avg_q.where(
+            PracticeAssessment.org_id == parsed_oid if parsed_oid else PracticeAssessment.org_id.is_(None)
+        )
+    avg_score_result = await db.execute(avg_q)
     avg_score = avg_score_result.scalar_one() or 0
 
     ebook_count_result = await db.execute(
@@ -200,7 +230,11 @@ async def get_user_progress(current_user: CurrentUser, db: DBSession):
 
 
 @router.get("/user/monthly-comparison")
-async def get_monthly_comparison(current_user: CurrentUser, db: DBSession):
+async def get_monthly_comparison(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
     """This-month vs last-month counts for assessments, documents, chats, and avg score."""
     from datetime import datetime, timezone, timedelta
     from app.models.content import UserLibraryItem
@@ -209,6 +243,7 @@ async def get_monthly_comparison(current_user: CurrentUser, db: DBSession):
     now = datetime.now(timezone.utc)
     first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     first_last = (first_this - timedelta(days=1)).replace(day=1)
+    parsed_oid = _parse_org_id(org_id)
 
     async def count_rows(model, date_col, start, end):
         r = await db.execute(
@@ -217,9 +252,26 @@ async def get_monthly_comparison(current_user: CurrentUser, db: DBSession):
         )
         return r.scalar_one()
 
+    async def count_attempts(start, end):
+        q = (
+            select(func.count(AssessmentAttempt.id))
+            .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+            .where(
+                AssessmentAttempt.user_id == current_user.id,
+                AssessmentAttempt.submitted_at >= start,
+                AssessmentAttempt.submitted_at < end,
+            )
+        )
+        if org_id is not None:
+            q = q.where(
+                PracticeAssessment.org_id == parsed_oid if parsed_oid else PracticeAssessment.org_id.is_(None)
+            )
+        return (await db.execute(q)).scalar_one()
+
     async def avg_pct(start, end):
-        r = await db.execute(
+        q = (
             select(func.avg(AssessmentAttempt.percentage))
+            .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
             .where(
                 AssessmentAttempt.user_id == current_user.id,
                 AssessmentAttempt.status == "evaluated",
@@ -227,17 +279,21 @@ async def get_monthly_comparison(current_user: CurrentUser, db: DBSession):
                 AssessmentAttempt.submitted_at < end,
             )
         )
-        return round(r.scalar_one() or 0, 1)
+        if org_id is not None:
+            q = q.where(
+                PracticeAssessment.org_id == parsed_oid if parsed_oid else PracticeAssessment.org_id.is_(None)
+            )
+        return round((await db.execute(q)).scalar_one() or 0, 1)
 
     return {
         "thisMonth": {
-            "assessments": await count_rows(AssessmentAttempt, AssessmentAttempt.submitted_at, first_this, now),
+            "assessments": await count_attempts(first_this, now),
             "documents":   await count_rows(UserLibraryItem, UserLibraryItem.created_at, first_this, now),
             "chats":       await count_rows(AiChat, AiChat.created_at, first_this, now),
             "avgScore":    await avg_pct(first_this, now),
         },
         "lastMonth": {
-            "assessments": await count_rows(AssessmentAttempt, AssessmentAttempt.submitted_at, first_last, first_this),
+            "assessments": await count_attempts(first_last, first_this),
             "documents":   await count_rows(UserLibraryItem, UserLibraryItem.created_at, first_last, first_this),
             "chats":       await count_rows(AiChat, AiChat.created_at, first_last, first_this),
             "avgScore":    await avg_pct(first_last, first_this),
@@ -250,11 +306,12 @@ async def get_score_trend(
     current_user: CurrentUser,
     db: DBSession,
     limit: int = Query(12, le=30),
+    org_id: str | None = Query(None),
 ):
     """Last N assessed scores with real submission dates, sorted ascending."""
-    from app.models.assessment import PracticeAssessment
+    parsed_oid = _parse_org_id(org_id)
 
-    rows = (await db.execute(
+    q = (
         select(AssessmentAttempt, PracticeAssessment.subject)
         .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
         .where(
@@ -262,9 +319,13 @@ async def get_score_trend(
             AssessmentAttempt.status == "evaluated",
             AssessmentAttempt.submitted_at.isnot(None),
         )
-        .order_by(AssessmentAttempt.submitted_at.desc())
-        .limit(limit)
-    )).all()
+    )
+    if org_id is not None:
+        q = q.where(
+            PracticeAssessment.org_id == parsed_oid if parsed_oid else PracticeAssessment.org_id.is_(None)
+        )
+    q = q.order_by(AssessmentAttempt.submitted_at.desc()).limit(limit)
+    rows = (await db.execute(q)).all()
 
     return [
         {
@@ -277,10 +338,15 @@ async def get_score_trend(
 
 
 @router.get("/user/study-time")
-async def get_study_time(current_user: CurrentUser, db: DBSession):
+async def get_study_time(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
     """AI interactions + assessments grouped by subject — proxy for study activity distribution."""
     from app.models.ai import AiInteractionHistory
-    from app.models.assessment import PracticeAssessment
+
+    parsed_oid = _parse_org_id(org_id)
 
     ai_rows = (await db.execute(
         select(AiInteractionHistory)
@@ -295,12 +361,17 @@ async def get_study_time(current_user: CurrentUser, db: DBSession):
         subject = ctx.get("subject") or "General"
         subject_counts[subject] = subject_counts.get(subject, 0) + 1
 
-    attempt_rows = (await db.execute(
+    attempt_q = (
         select(PracticeAssessment.subject, func.count(AssessmentAttempt.id))
         .join(AssessmentAttempt, AssessmentAttempt.assessment_id == PracticeAssessment.id)
         .where(AssessmentAttempt.user_id == current_user.id)
         .group_by(PracticeAssessment.subject)
-    )).all()
+    )
+    if org_id is not None:
+        attempt_q = attempt_q.where(
+            PracticeAssessment.org_id == parsed_oid if parsed_oid else PracticeAssessment.org_id.is_(None)
+        )
+    attempt_rows = (await db.execute(attempt_q)).all()
     for subject, cnt in attempt_rows:
         s = subject or "General"
         subject_counts[s] = subject_counts.get(s, 0) + cnt
@@ -317,12 +388,14 @@ async def get_activity_heatmap(
     current_user: CurrentUser,
     db: DBSession,
     days: int = Query(30, le=90),
+    org_id: str | None = Query(None),
 ):
     """Daily activity count (AI chats + interactions + assessment attempts) for the last N days."""
     from datetime import datetime, timezone, timedelta, date
     from app.models.ai import AiInteractionHistory, AiChat
 
     since = datetime.now(timezone.utc) - timedelta(days=days)
+    parsed_oid = _parse_org_id(org_id)
 
     ai_rows = (await db.execute(
         select(
@@ -336,17 +409,23 @@ async def get_activity_heatmap(
         .group_by(func.date(AiInteractionHistory.created_at))
     )).all()
 
-    attempt_rows = (await db.execute(
+    attempt_q = (
         select(
             func.date(AssessmentAttempt.submitted_at).label("day"),
             func.count(AssessmentAttempt.id).label("cnt"),
         )
+        .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
         .where(
             AssessmentAttempt.user_id == current_user.id,
             AssessmentAttempt.submitted_at >= since,
         )
         .group_by(func.date(AssessmentAttempt.submitted_at))
-    )).all()
+    )
+    if org_id is not None:
+        attempt_q = attempt_q.where(
+            PracticeAssessment.org_id == parsed_oid if parsed_oid else PracticeAssessment.org_id.is_(None)
+        )
+    attempt_rows = (await db.execute(attempt_q)).all()
 
     chat_rows = (await db.execute(
         select(
@@ -378,25 +457,33 @@ async def get_activity_heatmap(
 
 
 @router.get("/user/recent-activity")
-async def get_recent_activity(current_user: CurrentUser, db: DBSession):
+async def get_recent_activity(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
     """Last 5 user actions merged across assessments, library, chats, and ebooks."""
     from datetime import datetime, timezone
-    from app.models.assessment import AssessmentAttempt, PracticeAssessment
     from app.models.content import UserLibraryItem, Ebook
     from app.models.ai import AiChat
 
+    parsed_oid = _parse_org_id(org_id)
     events = []
 
-    rows = (await db.execute(
+    attempt_q = (
         select(AssessmentAttempt, PracticeAssessment.title.label("ptitle"))
         .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
         .where(
             AssessmentAttempt.user_id == current_user.id,
             AssessmentAttempt.submitted_at.isnot(None),
         )
-        .order_by(AssessmentAttempt.submitted_at.desc())
-        .limit(5)
-    )).all()
+    )
+    if org_id is not None:
+        attempt_q = attempt_q.where(
+            PracticeAssessment.org_id == parsed_oid if parsed_oid else PracticeAssessment.org_id.is_(None)
+        )
+    attempt_q = attempt_q.order_by(AssessmentAttempt.submitted_at.desc()).limit(5)
+    rows = (await db.execute(attempt_q)).all()
     for attempt, title in rows:
         events.append({"type": "assessment", "label": f"Completed: {title or 'Assessment'}",
                        "icon": "📝", "ts": attempt.submitted_at})

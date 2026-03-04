@@ -8,6 +8,7 @@ class AiChatCreate(BaseModel):
     title: str
     scope: str = "personal"
     class_id: Optional[str] = None
+    org_id: Optional[str] = None
 
 
 class AiChatUpdate(BaseModel):

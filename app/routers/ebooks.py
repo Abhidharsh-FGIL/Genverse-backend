@@ -21,6 +21,23 @@ from app.services.audiobook_service import get_available_voices
 
 router = APIRouter()
 
+
+def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
+
+
+def _apply_org_filter(q, column, org_id_param: str | None):
+    parsed = _parse_org_id(org_id_param)
+    if parsed is None:
+        return q.where(column.is_(None))
+    return q.where(column == parsed)
+
+
 BOOK_SIZE_PAGE_COUNTS = {
     "short": 15,
     "medium": 30,
@@ -108,6 +125,7 @@ async def save_ebook(payload: EbookCreateRequest, current_user: CurrentUser, db:
 
     ebook = Ebook(
         user_id=current_user.id,
+        org_id=_parse_org_id(payload.org_id),
         title=payload.title,
         subject=payload.subject,
         grade=payload.grade,
@@ -129,12 +147,12 @@ async def save_ebook(payload: EbookCreateRequest, current_user: CurrentUser, db:
 
 
 @router.get("/", response_model=list[EbookResponse])
-async def list_ebooks(current_user: CurrentUser, db: DBSession):
-    result = await db.execute(
-        select(Ebook)
-        .where(Ebook.user_id == current_user.id)
-        .order_by(Ebook.created_at.desc())
-    )
+async def list_ebooks(current_user: CurrentUser, db: DBSession, org_id: str | None = Query(None)):
+    q = select(Ebook).where(Ebook.user_id == current_user.id)
+    if org_id is not None:
+        q = _apply_org_filter(q, Ebook.org_id, org_id)
+    q = q.order_by(Ebook.created_at.desc())
+    result = await db.execute(q)
     return result.scalars().all()
 
 

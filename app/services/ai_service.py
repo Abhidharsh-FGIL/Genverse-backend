@@ -1802,15 +1802,26 @@ Rules:
         context: dict | None,
     ) -> dict:
         """Perform career compatibility analysis."""
+        stream_text = (context or {}).get("stream", "Not specified")
         prompt = f"""Analyze career compatibility for a student:
 Interests: {', '.join(interests)}
 Strengths: {', '.join(strengths)}
 Target careers: {', '.join(target_careers or ['Not specified'])}
 Grade: {grade or 'Not specified'}
+Preferred stream: {stream_text}
 
-Return JSON:
+Return JSON with this exact structure:
 {{
-  "top_careers": ["..."],
+  "top_careers": [
+    {{
+      "title": "Career Title",
+      "compatibility": 85,
+      "description": "2-sentence description referencing why it fits this student",
+      "skills": ["Skill1", "Skill2", "Skill3", "Skill4"],
+      "education": "Recommended education path",
+      "reasons": ["Specific reason 1 from their data", "Specific reason 2"]
+    }}
+  ],
   "compatibility_scores": {{"career_name": 0-100}},
   "strengths_analysis": "...",
   "recommended_paths": ["..."],
@@ -1818,7 +1829,10 @@ Return JSON:
   "roadmap": "..."
 }}
 
-Return ONLY valid JSON.
+Rules:
+- top_careers: 4-6 careers ranked by compatibility (0-100), each with title, compatibility score, description, skills array, education path, and reasons array
+- compatibility_scores: map each career title to its compatibility number
+- Return ONLY valid JSON. No markdown fences.
 """
         response = await self.chat([{"role": "user", "content": prompt}], context)
         try:

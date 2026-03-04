@@ -16,6 +16,22 @@ from app.config import settings
 router = APIRouter()
 
 
+def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
+
+
+def _apply_org_filter(q, column, org_id_param: str | None):
+    parsed = _parse_org_id(org_id_param)
+    if parsed is None:
+        return q.where(column.is_(None))
+    return q.where(column == parsed)
+
+
 def _faiss() -> FAISSService:
     return FAISSService(settings.STORAGE_ROOT)
 
@@ -25,6 +41,7 @@ async def upload_document(
     file: UploadFile = File(...),
     folder: str = Form(None),
     tags: str = Form(None),
+    org_id: str = Form(None),
     current_user: CurrentUser = None,
     db: DBSession = None,
 ):
@@ -39,6 +56,7 @@ async def upload_document(
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
     item = UserLibraryItem(
         user_id=current_user.id,
+        org_id=_parse_org_id(org_id),
         title=file.filename or "Untitled",
         file_type=file_info.get("type"),
         storage_path=file_info.get("path"),
@@ -99,8 +117,11 @@ async def list_library_items(
     current_user: CurrentUser,
     db: DBSession,
     folder: str | None = Query(None),
+    org_id: str | None = Query(None),
 ):
     q = select(UserLibraryItem).where(UserLibraryItem.user_id == current_user.id)
+    if org_id is not None:
+        q = _apply_org_filter(q, UserLibraryItem.org_id, org_id)
     if folder:
         # Return only items in the requested folder
         q = q.where(UserLibraryItem.folder == folder)
@@ -174,9 +195,12 @@ async def list_library_items_by_fields(
     db: DBSession,
     fields: Optional[str] = Query(None),
     folder: Optional[str] = Query(None),
+    org_id: str | None = Query(None),
 ):
     """Alias for GET / that accepts an optional ?fields= param (ignored server-side)."""
     q = select(UserLibraryItem).where(UserLibraryItem.user_id == current_user.id)
+    if org_id is not None:
+        q = _apply_org_filter(q, UserLibraryItem.org_id, org_id)
     if folder:
         q = q.where(UserLibraryItem.folder == folder)
     else:

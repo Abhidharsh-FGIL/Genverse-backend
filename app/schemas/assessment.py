@@ -7,6 +7,7 @@ from typing import Optional, List, Any
 class AssessmentCreate(BaseModel):
     title: str
     subject: str
+    org_id: Optional[str] = None  # UUID string; None = personal workspace
     board: Optional[str] = None
     grade: Optional[int] = None
     topics: Optional[List[str]] = None
@@ -28,6 +29,7 @@ class AssessmentResponse(BaseModel):
     id: uuid.UUID
     title: str
     subject: str
+    org_id: Optional[uuid.UUID] = None
     board: Optional[str] = None
     grade: Optional[int] = None
     topics: Optional[Any] = None
@@ -116,6 +118,7 @@ class AssessmentSaveRequest(BaseModel):
     """Save a pre-generated (reviewed) assessment to the library."""
     title: str
     subject: Optional[str] = None
+    org_id: Optional[str] = None  # UUID string; None = personal workspace
     board: Optional[str] = None
     grade: Optional[int] = None
     topics: Optional[List[str]] = None

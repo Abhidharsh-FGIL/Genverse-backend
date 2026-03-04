@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, status
+from fastapi import APIRouter, status, Query
 from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
@@ -10,6 +10,22 @@ from app.services.ai_service import AIService
 from app.services.points_service import PointsService
 
 router = APIRouter()
+
+
+def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
+    if not org_id or org_id == "personal":
+        return None
+    try:
+        return uuid.UUID(org_id)
+    except ValueError:
+        return None
+
+
+def _apply_org_filter(q, column, org_id_param: str | None):
+    parsed = _parse_org_id(org_id_param)
+    if parsed is None:
+        return q.where(column.is_(None))
+    return q.where(column == parsed)
 
 
 @router.post("/generate", response_model=MindMapResponse, status_code=status.HTTP_201_CREATED)
@@ -29,6 +45,7 @@ async def generate_mindmap(payload: MindMapGenerateRequest, current_user: Curren
 
     mindmap = MindMap(
         user_id=current_user.id,
+        org_id=_parse_org_id(payload.org_id),
         title=f"Mind Map: {payload.topic}",
         topic=payload.topic,
         subject=payload.subject,
@@ -46,12 +63,12 @@ async def generate_mindmap(payload: MindMapGenerateRequest, current_user: Curren
 
 
 @router.get("/", response_model=list[MindMapResponse])
-async def list_mindmaps(current_user: CurrentUser, db: DBSession):
-    result = await db.execute(
-        select(MindMap)
-        .where(MindMap.user_id == current_user.id)
-        .order_by(MindMap.created_at.desc())
-    )
+async def list_mindmaps(current_user: CurrentUser, db: DBSession, org_id: str | None = Query(None)):
+    q = select(MindMap).where(MindMap.user_id == current_user.id)
+    if org_id is not None:
+        q = _apply_org_filter(q, MindMap.org_id, org_id)
+    q = q.order_by(MindMap.created_at.desc())
+    result = await db.execute(q)
     return result.scalars().all()
 
 

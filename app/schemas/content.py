@@ -106,6 +106,7 @@ class EbookCreateRequest(BaseModel):
     grade: Optional[int] = None
     page_count: Optional[int] = None
     points_used: Optional[int] = None
+    org_id: Optional[str] = None
 
 
 class EbookResponse(BaseModel):
@@ -156,6 +157,7 @@ class MindMapGenerateRequest(BaseModel):
     grade: Optional[int] = None
     board: Optional[str] = None
     depth: int = 3
+    org_id: Optional[str] = None
 
 
 class MindMapResponse(BaseModel):
@@ -175,6 +177,7 @@ class VideoScriptRequest(BaseModel):
     grade: Optional[int] = None
     duration_minutes: int = 5
     style: str = "educational"
+    org_id: Optional[str] = None
 
 
 class VideoProjectResponse(BaseModel):

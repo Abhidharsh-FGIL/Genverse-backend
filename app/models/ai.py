@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Boolean, Integer, Float, DateTime, Text, func, ForeignKey
+from sqlalchemy import String, Boolean, Integer, Float, DateTime, Text, func, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -12,6 +12,7 @@ class AiChat(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True)
     scope: Mapped[str] = mapped_column(String(50), default="personal")  # personal | class
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     class_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("classes.id"))
@@ -65,6 +66,9 @@ class AiChatSetting(Base):
 
 class AiContextSession(Base):
     __tablename__ = "ai_context_sessions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "workspace_id", name="uq_ai_context_user_workspace"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
