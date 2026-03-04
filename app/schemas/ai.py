@@ -147,6 +147,8 @@ class FollowUpResponse(BaseModel):
 class VideoRefsRequest(BaseModel):
     message: str
     response: str
+    grade: Optional[int] = None
+    student_mode: Optional[bool] = None
 
 
 class VideoResult(BaseModel):

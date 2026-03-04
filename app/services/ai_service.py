@@ -18,11 +18,12 @@ _SENTINEL = object()
 
 
 class AIService:
-    """Unified AI service wrapping Gemini and OpenAI."""
+    """Unified AI service wrapping Gemini, Anthropic Claude, and OpenAI."""
 
     def __init__(self):
         self._gemini_client = None
         self._openai_client = None
+        self._anthropic_client = None
 
     def _get_gemini(self):
         if not self._gemini_client and settings.GOOGLE_GEMINI_API_KEY:
@@ -36,6 +37,12 @@ class AIService:
             from openai import AsyncOpenAI
             self._openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         return self._openai_client
+
+    def _get_anthropic(self):
+        if not self._anthropic_client and settings.ANTHROPIC_API_KEY:
+            import anthropic
+            self._anthropic_client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+        return self._anthropic_client
 
     def _build_context_prompt(self, context: dict | None) -> str:
         if not context:
@@ -159,7 +166,25 @@ class AIService:
         )
 
         if has_files:
-            # File-based queries → OpenAI primary, Gemini fallback
+            # File-based queries → Anthropic Claude primary, OpenAI fallback, Gemini fallback
+            anthropic = self._get_anthropic()
+            if anthropic:
+                try:
+                    claude_messages = [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in messages if m["role"] != "system"
+                    ]
+                    if not claude_messages or claude_messages[0]["role"] != "user":
+                        claude_messages.insert(0, {"role": "user", "content": "Hello"})
+                    response = await anthropic.messages.create(
+                        model=settings.AI_DOCUMENT_MODEL,
+                        max_tokens=4096,
+                        system=system_prompt,
+                        messages=claude_messages,
+                    )
+                    return response.content[0].text
+                except Exception as e:
+                    print(f"[AIService] Anthropic chat failed: {e}", flush=True)
             openai = self._get_openai()
             if openai:
                 try:
@@ -246,6 +271,33 @@ class AIService:
             if delta:
                 yield delta
 
+    async def _stream_anthropic(self, system_prompt: str, messages: List[dict]) -> AsyncIterator[str]:
+        """Stream from Anthropic Claude (natively async)."""
+        client = self._get_anthropic()
+        if not client:
+            return
+
+        # Convert messages: Anthropic expects role=user/assistant only, system is separate
+        claude_messages = []
+        for m in messages:
+            role = m["role"]
+            if role == "system":
+                continue  # system goes in the system parameter
+            claude_messages.append({"role": role, "content": m["content"]})
+
+        # Ensure messages alternate user/assistant — merge consecutive same-role
+        if not claude_messages or claude_messages[0]["role"] != "user":
+            claude_messages.insert(0, {"role": "user", "content": "Hello"})
+
+        async with client.messages.stream(
+            model=settings.AI_DOCUMENT_MODEL,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=claude_messages,
+        ) as stream:
+            async for text in stream.text_stream:
+                yield text
+
     async def stream_chat(
         self, messages: List[dict], context: dict | None = None,
         chat_settings: dict | None = None, has_files: bool = False,
@@ -280,14 +332,21 @@ class AIService:
         )
 
         if has_files:
-            # File-based queries → OpenAI primary, Gemini fallback
+            # File-based queries → Anthropic Claude primary, OpenAI fallback, Gemini fallback
+            if self._get_anthropic():
+                try:
+                    async for chunk in self._stream_anthropic(system_prompt, messages):
+                        yield chunk
+                    return
+                except Exception as e:
+                    print(f"[AIService] Anthropic stream failed: {e}", flush=True)
             if self._get_openai():
                 try:
                     async for chunk in self._stream_openai(system_prompt, messages):
                         yield chunk
                     return
                 except Exception as e:
-                    print(f"[AIService] OpenAI stream failed: {e}", flush=True)
+                    print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
             if self._get_gemini():
                 try:
                     async for chunk in self._stream_gemini(full_prompt):
@@ -2640,11 +2699,27 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             pass
         return []
 
-    async def extract_video_search_query(self, user_message: str, ai_response: str) -> str:
+    async def extract_video_search_query(
+        self, user_message: str, ai_response: str,
+        grade: int | None = None, student_mode: bool = False,
+    ) -> str:
         """Extract the best YouTube search query from a Q&A exchange."""
+        grade_instruction = ""
+        if grade:
+            grade_instruction = (
+                f"\nThe student is in grade {grade}. The search query MUST include "
+                f"'grade {grade}' or 'class {grade}' to find age-appropriate content.\n"
+            )
+        elif student_mode:
+            grade_instruction = (
+                "\nStudent mode is on. Prefer educational/tutorial-style videos "
+                "suitable for students.\n"
+            )
+
         prompt = (
-            "Extract a concise, specific YouTube search query (5-8 words max) that would find "
-            "the most relevant educational video for this topic.\n\n"
+            "Extract a concise, specific YouTube search query (5-10 words max) that would find "
+            "the most relevant educational video for this topic.\n"
+            f"{grade_instruction}\n"
             f"User asked: {user_message[:300]}\n"
             f"Topic summary: {ai_response[:400]}\n\n"
             "Return ONLY the search query string, nothing else."

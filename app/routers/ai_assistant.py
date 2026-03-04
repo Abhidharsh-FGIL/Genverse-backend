@@ -580,10 +580,13 @@ async def get_video_refs(
     search_query = await ai.extract_video_search_query(
         user_message=payload.message,
         ai_response=payload.response,
+        grade=payload.grade,
+        student_mode=payload.student_mode or False,
     )
 
     from app.services.youtube_service import YouTubeService
     yt = YouTubeService()
+    print(f"youtube query is {search_query}")
     videos = await yt.search_videos(query=search_query, max_results=3)
     await _persist_enhancement(db, chat_id, "video_refs", [v if isinstance(v, dict) else v.model_dump() for v in videos])
     return VideoRefsResponse(videos=videos)
