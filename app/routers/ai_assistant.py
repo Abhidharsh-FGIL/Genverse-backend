@@ -306,42 +306,51 @@ async def send_message_stream(
     if inline_docs:
         messages = _inject_inline_docs(messages, payload.message, inline_docs)
 
+    # Detect if files are involved (vault selection or inline upload)
+    has_files = bool(selected_files) or bool(inline_docs)
+
     async def event_stream():
         full_response = ""
-        async for chunk in ai.stream_chat(messages=messages, context=payload.context, chat_settings=chat_settings or None):
-            full_response += chunk
-            # Encode newlines so the SSE "data:" line stays intact (decoded by client)
-            encoded = chunk.replace('\n', '\\n')
-            yield f"data: {encoded}\n\n"
+        try:
+            async for chunk in ai.stream_chat(messages=messages, context=payload.context, chat_settings=chat_settings or None, has_files=has_files):
+                full_response += chunk
+                # Encode newlines so the SSE "data:" line stays intact (decoded by client)
+                encoded = chunk.replace('\n', '\\n')
+                yield f"data: {encoded}\n\n"
+        except Exception as e:
+            print(f"[StreamChat] Streaming error: {e}", flush=True)
 
         # Save assistant message after streaming completes
-        async with db as session:
-            assistant_msg = AiChatMessage(
-                chat_id=chat_id,
-                role="assistant",
-                content=full_response,
-                enhancements_json={"settings_snapshot": chat_settings} if chat_settings else None,
-            )
-            session.add(assistant_msg)
-            chat_obj = await session.get(AiChat, chat_id)
-            if chat_obj:
-                from datetime import datetime, timezone
-                chat_obj.updated_at = datetime.now(timezone.utc)
-            # Track interaction for analytics (study-time, activity-heatmap)
-            ctx = payload.context or {}
-            session.add(AiInteractionHistory(
-                user_id=current_user.id,
-                service="ai-assistant",
-                query=payload.message[:500] if payload.message else None,
-                response_summary=full_response[:200] if full_response else None,
-                context_snapshot={
-                    "subject":  ctx.get("subject"),
-                    "grade":    ctx.get("grade"),
-                    "board":    ctx.get("board"),
-                    "language": ctx.get("language"),
-                },
-            ))
-            await session.commit()
+        try:
+            async with db as session:
+                assistant_msg = AiChatMessage(
+                    chat_id=chat_id,
+                    role="assistant",
+                    content=full_response,
+                    enhancements_json={"settings_snapshot": chat_settings} if chat_settings else None,
+                )
+                session.add(assistant_msg)
+                chat_obj = await session.get(AiChat, chat_id)
+                if chat_obj:
+                    from datetime import datetime, timezone
+                    chat_obj.updated_at = datetime.now(timezone.utc)
+                # Track interaction for analytics (study-time, activity-heatmap)
+                ctx = payload.context or {}
+                session.add(AiInteractionHistory(
+                    user_id=current_user.id,
+                    service="ai-assistant",
+                    query=payload.message[:500] if payload.message else None,
+                    response_summary=full_response[:200] if full_response else None,
+                    context_snapshot={
+                        "subject":  ctx.get("subject"),
+                        "grade":    ctx.get("grade"),
+                        "board":    ctx.get("board"),
+                        "language": ctx.get("language"),
+                    },
+                ))
+                await session.commit()
+        except Exception as e:
+            print(f"[StreamChat] DB save error: {e}", flush=True)
 
         yield "data: [DONE]\n\n"
 
@@ -407,7 +416,10 @@ async def send_message(
     if inline_docs:
         messages = _inject_inline_docs(messages, payload.message, inline_docs)
 
-    response_text = await ai.chat(messages=messages, context=payload.context)
+    # Detect if files are involved (vault selection or inline upload)
+    has_files = bool(selected_files) or bool(inline_docs)
+
+    response_text = await ai.chat(messages=messages, context=payload.context, has_files=has_files)
 
     assistant_msg = AiChatMessage(
         chat_id=chat_id,
