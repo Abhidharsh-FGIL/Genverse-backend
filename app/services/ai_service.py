@@ -4,14 +4,17 @@ AI Service - Wraps Google Gemini (primary) and OpenAI (fallback) for all AI oper
 Configure the AI provider via .env:
   GOOGLE_GEMINI_API_KEY=...
   OPENAI_API_KEY=...
-  AI_PRIMARY_MODEL=gemini-2.5-flash
+  AI_PRIMARY_MODEL=gemini-2.5-pro
 """
 import json
 import re
+import asyncio
 from typing import AsyncIterator, List, Optional, Any, Dict
 from pathlib import Path
 
 from app.config import settings
+
+_SENTINEL = object()
 
 
 class AIService:
@@ -122,18 +125,30 @@ class AIService:
 
         return "\n".join(parts) if parts else ""
 
-    async def chat(self, messages: List[dict], context: dict | None = None, chat_settings: dict | None = None) -> str:
-        """Non-streaming chat with AI."""
+    async def chat(
+        self, messages: List[dict], context: dict | None = None,
+        chat_settings: dict | None = None, has_files: bool = False,
+    ) -> str:
+        """Non-streaming chat with AI.
+
+        Routing:
+          - has_files=True  → OpenAI (better at document Q&A), Gemini fallback
+          - has_files=False → Gemini Pro (direct questions), OpenAI fallback
+        """
         context_str = self._build_context_prompt(context)
         settings_str = self._build_settings_prompt(chat_settings)
         system_prompt = (
             "You are Genverse.ai, an AI-powered educational assistant. "
-            "FORMATTING RULES — follow these strictly:\n"
-            "1. Math: use $...$ for inline math and $$...$$ for display/block math. "
+            "IMPORTANT RULES — follow these strictly:\n"
+            "1. NEVER mention your training data cutoff, knowledge cutoff date, or any date-based limitation "
+            "(e.g. never say 'As of late 2023', 'As of my last update', 'my training data goes up to', "
+            "'I don't have information after', etc.). Present information confidently without disclaimers "
+            "about when you were trained. If you are unsure about something, say so without referencing dates.\n"
+            "2. Math: use $...$ for inline math and $$...$$ for display/block math. "
             "Never use \\(...\\) or \\[...\\] notation.\n"
-            "2. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
-            "3. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
-            "4. Lists, headings, bold, italic, code blocks: use standard Markdown syntax."
+            "3. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
+            "4. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
+            "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax."
         )
         if context_str:
             system_prompt += f"\n{context_str}"
@@ -143,41 +158,118 @@ class AIService:
             f"{m['role'].upper()}: {m['content']}" for m in messages
         )
 
-        gemini = self._get_gemini()
-        if gemini:
-            try:
-                response = gemini.generate_content(full_prompt)
-                return response.text
-            except Exception:
-                pass
-
-        openai = self._get_openai()
-        if openai:
-            try:
-                response = await openai.chat.completions.create(
-                    model=settings.AI_FALLBACK_MODEL,
-                    messages=[{"role": "system", "content": system_prompt}] + messages,
-                )
-                return response.choices[0].message.content
-            except Exception:
-                pass
+        if has_files:
+            # File-based queries → OpenAI primary, Gemini fallback
+            openai = self._get_openai()
+            if openai:
+                try:
+                    response = await openai.chat.completions.create(
+                        model=settings.AI_FALLBACK_MODEL,
+                        messages=[{"role": "system", "content": system_prompt}] + messages,
+                    )
+                    return response.choices[0].message.content
+                except Exception:
+                    pass
+            gemini = self._get_gemini()
+            if gemini:
+                try:
+                    response = gemini.generate_content(full_prompt)
+                    return response.text
+                except Exception:
+                    pass
+        else:
+            # Direct questions → Gemini primary, OpenAI fallback
+            gemini = self._get_gemini()
+            if gemini:
+                try:
+                    response = gemini.generate_content(full_prompt)
+                    return response.text
+                except Exception:
+                    pass
+            openai = self._get_openai()
+            if openai:
+                try:
+                    response = await openai.chat.completions.create(
+                        model=settings.AI_FALLBACK_MODEL,
+                        messages=[{"role": "system", "content": system_prompt}] + messages,
+                    )
+                    return response.choices[0].message.content
+                except Exception:
+                    pass
 
         return "AI service is not configured or all providers failed. Please check your API keys."
 
+    async def _stream_gemini(self, full_prompt: str) -> AsyncIterator[str]:
+        """Stream from Gemini without blocking the event loop.
+
+        Gemini's SDK is synchronous, so we call next() on the iterator
+        inside asyncio.to_thread to keep the event loop free. This lets
+        FastAPI flush each SSE chunk to the client immediately.
+        """
+        gemini = self._get_gemini()
+        if not gemini:
+            return
+
+        # Start the streaming call in a thread (the initial request blocks)
+        def _start_stream():
+            return gemini.generate_content(full_prompt, stream=True)
+
+        response = await asyncio.to_thread(_start_stream)
+        it = iter(response)
+
+        while True:
+            # Get next chunk without blocking the event loop
+            chunk = await asyncio.to_thread(next, it, _SENTINEL)
+            if chunk is _SENTINEL:
+                break
+            try:
+                text = chunk.text
+                if text:
+                    yield text
+            except (ValueError, AttributeError):
+                # Thinking/reasoning chunks may not have .text — skip
+                continue
+
+    async def _stream_openai(self, system_prompt: str, messages: List[dict]) -> AsyncIterator[str]:
+        """Stream from OpenAI (natively async)."""
+        openai = self._get_openai()
+        if not openai:
+            return
+
+        stream = await openai.chat.completions.create(
+            model=settings.AI_FALLBACK_MODEL,
+            messages=[{"role": "system", "content": system_prompt}] + messages,
+            stream=True,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+
     async def stream_chat(
-        self, messages: List[dict], context: dict | None = None, chat_settings: dict | None = None
+        self, messages: List[dict], context: dict | None = None,
+        chat_settings: dict | None = None, has_files: bool = False,
     ) -> AsyncIterator[str]:
-        """SSE streaming chat with AI."""
+        """SSE streaming chat with AI.
+
+        Routing:
+          - has_files=True  → OpenAI (better at document Q&A), Gemini fallback
+          - has_files=False → Gemini Pro (direct questions), OpenAI fallback
+        """
         context_str = self._build_context_prompt(context)
         settings_str = self._build_settings_prompt(chat_settings)
         system_prompt = (
             "You are Genverse.ai, an AI-powered educational assistant. "
-            "FORMATTING RULES — follow these strictly:\n"
-            "1. Math: use $...$ for inline math and $$...$$ for display/block math. "
+            "IMPORTANT RULES — follow these strictly:\n"
+            "1. NEVER mention your training data cutoff, knowledge cutoff date, or any date-based limitation "
+            "(e.g. never say 'As of late 2023', 'As of my last update', 'my training data goes up to', "
+            "'I don't have information after', etc.). Present information confidently without disclaimers "
+            "about when you were trained. If you are unsure about something, say so without referencing dates.\n"
+            "2. Math: use $...$ for inline math and $$...$$ for display/block math. "
             "Never use \\(...\\) or \\[...\\] notation.\n"
-            "2. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
-            "3. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
-            "4. Lists, headings, bold, italic, code blocks: use standard Markdown syntax."
+            "3. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
+            "4. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
+            "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax."
         )
         if context_str:
             system_prompt += f"\n{context_str}"
@@ -187,29 +279,38 @@ class AIService:
             f"{m['role'].upper()}: {m['content']}" for m in messages
         )
 
-        gemini = self._get_gemini()
-        if gemini:
-            try:
-                response = gemini.generate_content(full_prompt, stream=True)
-                for chunk in response:
-                    if chunk.text:
-                        yield chunk.text
-                return
-            except Exception:
-                pass
-
-        openai = self._get_openai()
-        if openai:
-            stream = await openai.chat.completions.create(
-                model=settings.AI_FALLBACK_MODEL,
-                messages=[{"role": "system", "content": system_prompt}] + messages,
-                stream=True,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
-            return
+        if has_files:
+            # File-based queries → OpenAI primary, Gemini fallback
+            if self._get_openai():
+                try:
+                    async for chunk in self._stream_openai(system_prompt, messages):
+                        yield chunk
+                    return
+                except Exception as e:
+                    print(f"[AIService] OpenAI stream failed: {e}", flush=True)
+            if self._get_gemini():
+                try:
+                    async for chunk in self._stream_gemini(full_prompt):
+                        yield chunk
+                    return
+                except Exception as e:
+                    print(f"[AIService] Gemini stream fallback failed: {e}", flush=True)
+        else:
+            # Direct questions → Gemini primary, OpenAI fallback
+            if self._get_gemini():
+                try:
+                    async for chunk in self._stream_gemini(full_prompt):
+                        yield chunk
+                    return
+                except Exception as e:
+                    print(f"[AIService] Gemini stream failed: {e}", flush=True)
+            if self._get_openai():
+                try:
+                    async for chunk in self._stream_openai(system_prompt, messages):
+                        yield chunk
+                    return
+                except Exception as e:
+                    print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
 
         yield "AI service not configured."
 

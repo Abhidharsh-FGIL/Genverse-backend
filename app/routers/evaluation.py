@@ -39,28 +39,6 @@ from app.services.ai_service import AIService
 router = APIRouter()
 
 
-# ---- Email Test (temporary — remove after debugging) ----
-
-@router.get("/test-email")
-async def test_email(to: str = Query(...)):
-    """Temporary test endpoint: GET /api/v1/evaluation/test-email?to=someone@example.com"""
-    import sys
-    from app.services.email_service import send_assessment_invitation
-    print(f"[TestEmail] Sending test email to {to}", flush=True)
-    sys.stdout.flush()
-    try:
-        await send_assessment_invitation(
-            to_emails=[to],
-            assessment_title="Test Assessment",
-            assessment_id="test-123",
-            teacher_name="Test Teacher",
-        )
-        return {"status": "sent", "to": to}
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"status": "failed", "error": str(e)}
-
 
 # ---- Question Papers ----
 
