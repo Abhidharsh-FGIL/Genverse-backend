@@ -1,10 +1,13 @@
 """
-AI Service - Wraps Google Gemini (primary) and OpenAI (fallback) for all AI operations.
+AI Service - Unified AI routing for all operations.
 
-Configure the AI provider via .env:
-  GOOGLE_GEMINI_API_KEY=...
-  OPENAI_API_KEY=...
-  AI_PRIMARY_MODEL=gemini-2.5-pro
+Model routing (configurable via .env):
+  Direct questions  → AI_PRIMARY_MODEL  (Gemini)
+  File-based Q&A    → AI_DOCUMENT_MODEL (Claude)
+  Fallback          → AI_FALLBACK_MODEL (OpenAI)
+
+API keys:
+  GOOGLE_GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY
 """
 import json
 import re
