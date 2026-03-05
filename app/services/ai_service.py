@@ -47,22 +47,111 @@ class AIService:
             self._anthropic_client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
         return self._anthropic_client
 
+    def _get_grade_band(self, grade: int | None) -> str:
+        """Return a descriptive grade band for calibrating responses."""
+        if not grade:
+            return ""
+        if grade <= 3:
+            return "early-primary"
+        elif grade <= 6:
+            return "upper-primary"
+        elif grade <= 9:
+            return "middle-school"
+        else:
+            return "high-school"
+
     def _build_context_prompt(self, context: dict | None) -> str:
         if not context:
             return ""
+
+        grade = context.get("grade")
+        board = context.get("board")
+        subject = context.get("subject")
+        language = context.get("language")
+        student_mode = context.get("student_mode")
+
         parts = []
-        if context.get("grade"):
-            parts.append(f"Grade: {context['grade']}")
-        if context.get("board"):
-            parts.append(f"Board: {context['board']}")
-        if context.get("subject"):
-            parts.append(f"Subject: {context['subject']}")
-        if context.get("language"):
-            parts.append(f"Response language: {context['language']}")
-        if context.get("difficulty"):
-            parts.append(f"Difficulty level: {context['difficulty']}")
-        if context.get("tone"):
-            parts.append(f"Tone: {context['tone']}")
+
+        # Grade-calibrated student profile
+        if grade:
+            band = self._get_grade_band(grade)
+            grade_profiles = {
+                "early-primary": (
+                    f"The student is in Grade {grade} (ages 6-8). "
+                    "Use very simple words and short sentences a young child can understand. "
+                    "Explain with fun analogies, stories, colours, animals, or everyday objects. "
+                    "Avoid abstract concepts — make everything concrete and visual. "
+                    "Use a warm, playful, encouraging tone like a favourite teacher."
+                ),
+                "upper-primary": (
+                    f"The student is in Grade {grade} (ages 9-11). "
+                    "Use clear, simple language with age-appropriate vocabulary. "
+                    "Introduce basic technical terms but always explain them. "
+                    "Use relatable examples from daily life, school, sports, or nature. "
+                    "Keep explanations structured but friendly — not too formal."
+                ),
+                "middle-school": (
+                    f"The student is in Grade {grade} (ages 12-14). "
+                    "Use moderately detailed explanations with proper terminology. "
+                    "Students at this level are building foundational understanding — "
+                    "explain concepts clearly, define key terms, and use relevant examples. "
+                    "Encourage critical thinking with 'why' and 'how' connections."
+                ),
+                "high-school": (
+                    f"The student is in Grade {grade} (ages 15-17). "
+                    "Use precise academic language appropriate for senior students. "
+                    "Students are preparing for board exams and competitive entrances — "
+                    "be thorough, cover edge cases, include exam-relevant tips where appropriate. "
+                    "Connect topics to real-world applications and higher studies."
+                ),
+            }
+            parts.append(grade_profiles.get(band, f"The student is in Grade {grade}."))
+
+        # Board-specific curriculum alignment
+        if board:
+            board_upper = board.upper()
+            board_instructions = {
+                "CBSE": (
+                    "Follow CBSE/NCERT curriculum standards and terminology. "
+                    "Use NCERT textbook conventions for definitions and formulas. "
+                    "Structure answers the way CBSE board exams expect — point-wise, with key terms highlighted."
+                ),
+                "ICSE": (
+                    "Follow ICSE/ISC curriculum standards. "
+                    "ICSE expects deeper conceptual understanding and application-based answers. "
+                    "Use slightly more detailed explanations than CBSE and include application examples."
+                ),
+                "STATE": (
+                    "Follow the State Board curriculum approach. "
+                    "Use simple, direct explanations matching state textbook patterns."
+                ),
+                "IB": (
+                    "Follow IB (International Baccalaureate) curriculum approach. "
+                    "Emphasise inquiry-based learning, global perspectives, and critical analysis. "
+                    "Encourage the student to form their own conclusions supported by evidence."
+                ),
+                "CAMBRIDGE": (
+                    "Follow Cambridge (IGCSE/A-Level) curriculum standards. "
+                    "Use precise academic English, structured arguments, and evidence-based reasoning. "
+                    "Include exam technique tips where relevant."
+                ),
+            }
+            # Match board name flexibly
+            matched = None
+            for key in board_instructions:
+                if key in board_upper:
+                    matched = key
+                    break
+            if matched:
+                parts.append(board_instructions[matched])
+            else:
+                parts.append(f"Follow {board} curriculum standards and conventions.")
+
+        if subject:
+            parts.append(f"Subject focus: {subject}. Keep your response relevant to this subject area.")
+        if language and language.lower() != "english":
+            parts.append(f"Respond in {language}. Use {language} script and phrasing naturally.")
+
         return "\n".join(parts) if parts else ""
 
     def _build_settings_prompt(self, chat_settings: dict | None) -> str:
@@ -71,34 +160,85 @@ class AIService:
             return ""
         parts = []
 
+        # Personality — how the AI should behave
         personality_map = {
-            "mentor": "Act as a supportive mentor who guides with encouragement and wisdom. Inspire curiosity and celebrate progress.",
-            "coach": "Act as a focused, results-driven coach. Be direct, action-oriented, and push the student to think critically and improve.",
-            "tutor": "Act as a patient tutor who explains concepts step by step, checking for understanding.",
-            "friend": "Act as a knowledgeable friend — explain things in a casual, relatable, conversational way without being overly formal.",
-            "professor": "Act as an authoritative professor delivering comprehensive, academically rigorous responses with precise terminology.",
-            "technical-expert": "Act as a senior technical expert. Use precise, industry-standard terminology, dive into implementation details, and reference best practices.",
-            "helpful": "Be helpful and informative in your responses.",
+            "mentor": (
+                "Act as a supportive mentor. Guide with encouragement and wisdom. "
+                "Ask thought-provoking questions to help the student discover answers themselves. "
+                "Celebrate effort and progress, not just correct answers. "
+                "When correcting mistakes, be gentle — frame it as learning."
+            ),
+            "coach": (
+                "Act as a focused, results-driven coach. Be direct and action-oriented. "
+                "Push the student to think critically — don't give answers immediately, "
+                "guide them with leading questions. Set clear expectations and challenge them to improve. "
+                "Praise effort but always raise the bar."
+            ),
+            "tutor": (
+                "Act as a patient, methodical tutor. Break down every concept into clear steps. "
+                "After each explanation, verify understanding with a quick check question. "
+                "If the student seems confused, try a different approach or analogy. "
+                "Never rush — understanding matters more than coverage."
+            ),
+            "friend": (
+                "Act as a knowledgeable, relatable friend. Explain things casually, "
+                "using everyday language, pop culture references, and humour where appropriate. "
+                "Avoid sounding like a textbook — be conversational and approachable."
+            ),
+            "professor": (
+                "Act as an authoritative professor. Deliver comprehensive, academically rigorous responses. "
+                "Use precise terminology and formal structure. Cite concepts, theories, and frameworks. "
+                "Maintain an intellectual but respectful tone."
+            ),
+            "technical-expert": (
+                "Act as a senior technical expert. Use precise, industry-standard terminology. "
+                "Dive into implementation details, cover edge cases, and reference best practices. "
+                "Assume the student wants depth, not surface-level explanations."
+            ),
+            "helpful": "Be helpful, clear, and informative in your responses.",
         }
         personality = chat_settings.get("personality", "helpful")
         parts.append(personality_map.get(personality, personality_map["helpful"]))
 
+        # Difficulty — how deep and complex the response should be
         difficulty_map = {
-            "easy": "Use very simple language suitable for complete beginners. Avoid technical jargon entirely; prefer everyday analogies and short sentences.",
-            "medium": "Use clear explanations with moderate technical depth, suitable for intermediate learners who know the basics.",
-            "hard": "Use advanced concepts and technical terminology appropriate for advanced learners. Do not over-explain foundational concepts.",
-            "expert": "Assume expert-level knowledge. Skip introductory definitions, focus on nuance, edge cases, trade-offs, and cutting-edge aspects of the topic.",
+            "easy": (
+                "Difficulty: EASY. Use the simplest possible language. "
+                "No jargon, no technical terms unless you explain them immediately. "
+                "Prefer everyday analogies and short sentences. "
+                "If explaining a formula, show it step-by-step with numbers, not just symbols."
+            ),
+            "medium": (
+                "Difficulty: MEDIUM. Use clear explanations with moderate technical depth. "
+                "Define key terms when first introduced. Balance simplicity with accuracy. "
+                "Include one or two examples to reinforce understanding."
+            ),
+            "hard": (
+                "Difficulty: HARD. Use advanced concepts and proper technical terminology. "
+                "Do not over-explain basics — the student knows the foundations. "
+                "Focus on deeper understanding, exceptions, and interconnections between topics."
+            ),
+            "expert": (
+                "Difficulty: EXPERT. Assume expert-level knowledge. "
+                "Skip introductory definitions entirely. Focus on nuance, edge cases, "
+                "trade-offs, proofs, derivations, and cutting-edge aspects. "
+                "Use precise notation and formal reasoning."
+            ),
         }
         difficulty = chat_settings.get("difficulty", "medium")
         parts.append(difficulty_map.get(difficulty, difficulty_map["medium"]))
 
+        # Content length
         length_map = {
-            "small": "Be extremely brief — answer in 1-3 sentences maximum. No preamble, no lists, just the core answer.",
-            "brief": "Keep responses concise (1-2 paragraphs max). Get to the point quickly.",
-            "summary": "Give a focused summary response (2-3 paragraphs). Cover the key points without going into excessive detail.",
-            "medium": "Provide moderately detailed responses covering key points without being exhaustive.",
-            "detailed": "Provide comprehensive, in-depth explanations covering all relevant aspects thoroughly with examples and structure.",
-            "deep-dive": "Provide an exhaustive, thorough deep-dive. Cover every important aspect, subtlety, edge case, and example. Use headings and structure to organise the response.",
+            "small": "LENGTH: Be extremely brief — 1-3 sentences maximum. Just the core answer, nothing extra.",
+            "brief": "LENGTH: Keep it concise — 1-2 short paragraphs. Get to the point fast.",
+            "summary": "LENGTH: Give a focused summary — 2-3 paragraphs covering key points without excessive detail.",
+            "medium": "LENGTH: Provide a moderately detailed response covering key points with some examples.",
+            "detailed": "LENGTH: Provide a comprehensive, in-depth response with thorough explanations, examples, and structure.",
+            "deep-dive": (
+                "LENGTH: Provide an exhaustive deep-dive. Cover every important aspect, "
+                "edge case, and example. Use headings and sub-sections to organise."
+            ),
         }
         content_length = chat_settings.get("content_length", "medium")
         parts.append(length_map.get(content_length, length_map["medium"]))
@@ -107,16 +247,13 @@ class AIService:
             parts.append(
                 "IMPORTANT — Explain in 3 Ways: Structure your response with these three clearly labelled sections "
                 "directly inside your answer (do NOT add a separate card or section after — include all three here):\n"
-                "**🎯 Analogy:** A simple, relatable analogy or metaphor that makes the concept easy to grasp.\n"
-                "**⚙️ Technical:** A precise, formal definition or technical explanation.\n"
-                "**🌍 Real-World Example:** A concrete, real-world application or example of the concept in action."
+                "**Analogy:** A simple, relatable analogy or metaphor that makes the concept easy to grasp.\n"
+                "**Technical:** A precise, formal definition or technical explanation.\n"
+                "**Real-World Example:** A concrete, real-world application or example of the concept in action."
             )
 
         if chat_settings.get("examples"):
-            parts.append("Always include concrete, real-world examples to illustrate concepts.")
-
-        # mind_map is now handled as a separate visual card — no inline bullet outline needed.
-        # The mind map is generated via a dedicated endpoint after the response completes.
+            parts.append("Always include concrete, real-world examples to illustrate every concept you explain.")
 
         output_mode = chat_settings.get("output_mode", "text")
         if output_mode == "structured":
@@ -126,8 +263,14 @@ class AIService:
 
         if chat_settings.get("student_mode"):
             parts.append(
-                "You are in Student Mode. Use encouraging language, celebrate correct answers, "
-                "and break down complex topics into digestible steps."
+                "STUDENT MODE is ON. You are talking to a student, not a professional. "
+                "Always remember:\n"
+                "- Use encouraging, supportive language throughout.\n"
+                "- When the student gets something right, acknowledge it warmly.\n"
+                "- When they're wrong, correct gently — 'Almost! Let's look at it this way…'\n"
+                "- Break complex topics into numbered steps they can follow.\n"
+                "- End with a quick recap or a 'check your understanding' question when appropriate.\n"
+                "- Never be condescending — be the teacher every student wishes they had."
             )
 
         # Note: followup, next_steps, and practice are handled as separate UI cards
