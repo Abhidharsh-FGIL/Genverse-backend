@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     AI_PRIMARY_MODEL: str = "gemini-2.5-flash"
     AI_FALLBACK_MODEL: str = "gpt-4o-mini"
+    AI_DOCUMENT_MODEL: str = "claude-sonnet-4-20250514"
 
     # YouTube Data API
     YOUTUBE_API_KEY: str = ""
