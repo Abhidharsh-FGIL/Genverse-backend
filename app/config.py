@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
 
+    # Content Safety
+    CONTENT_GUARD_ENABLED: bool = True
+    CONTENT_GUARD_LLM_CLASSIFIER: bool = True
+
     # Feature flags
     ENABLE_EMAIL_NOTIFICATIONS: bool = False
     ENABLE_BACKGROUND_TASKS: bool = False

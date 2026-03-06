@@ -60,6 +60,341 @@ class AIService:
         else:
             return "high-school"
 
+    # ------------------------------------------------------------------
+    # Grade × Board fused profile builders
+    # ------------------------------------------------------------------
+
+    def _build_grade_board_profile(self, grade: int, band: str, board_key: str) -> str:
+        """Build a single fused instruction that merges grade AND board so they
+        create measurably different outputs.  The board modifies vocabulary
+        ceiling, depth, structure, example style, and response length relative
+        to the grade baseline."""
+
+        # --- Age-range label ---
+        age_map = {
+            "early-primary": "ages 6-8",
+            "upper-primary": "ages 9-11",
+            "middle-school": "ages 12-14",
+            "high-school": "ages 15-17",
+        }
+        age = age_map.get(band, "")
+
+        # --- Per-board OUTPUT RULES that create visible differences ---
+        # Each tuple: (vocab_rule, structure_rule, depth_rule, example_rule,
+        #              length_rule, engagement_rule, curriculum_note)
+        board_rules = {
+            "STATE": {
+                "label": "State Board",
+                "vocab": (
+                    "Use ONLY the simplest everyday words. Prefer one-syllable or two-syllable words. "
+                    "If a technical term is unavoidable, immediately follow it with '(that means …)' in the simplest possible words. "
+                    "Write as if the student thinks in their regional language and reads English as a second language."
+                ),
+                "structure": (
+                    "Use VERY short bullet points — max 8-10 words per bullet. "
+                    "One idea per bullet. NO paragraphs. NO long sentences. "
+                    "Use numbered lists for steps. Keep total response SHORT (aim for 40-60% the length of a CBSE answer)."
+                ),
+                "depth": (
+                    "Cover ONLY the basic fact or definition. Do NOT go deeper unless asked. "
+                    "One example is enough. Skip edge cases, history, or 'why' explanations unless the student asks."
+                ),
+                "examples": (
+                    "Use local, everyday Indian examples: village life, markets, farming, cooking, festivals, family. "
+                    "Avoid Western or unfamiliar references. Make examples feel like home."
+                ),
+                "engagement": (
+                    "Keep it warm and encouraging but brief. A simple 'Good question!' is enough. "
+                    "Ask ONE simple check question at the end, nothing more."
+                ),
+                "curriculum": (
+                    "Follow State Board textbook patterns. Answers should look like what their textbook says — "
+                    "plain, direct, definition-style. State Board rewards brevity and correctness."
+                ),
+            },
+            "CBSE": {
+                "label": "CBSE",
+                "vocab": (
+                    "Use standard textbook English matching NCERT language level. "
+                    "Introduce key terms with **bold** and explain them clearly. "
+                    "Language should feel like reading an NCERT chapter — neither too simple nor too complex."
+                ),
+                "structure": (
+                    "Structure answers POINT-WISE with key terms **bolded** — this is the CBSE exam-answer format. "
+                    "Use numbered points for processes/steps. Use bullet points for lists of features/types. "
+                    "Include clear headings or sub-sections for longer answers. Medium-length response."
+                ),
+                "depth": (
+                    "Cover the concept thoroughly as NCERT does: definition + explanation + example. "
+                    "Include ONE worked example for Maths/Science. Mention diagram descriptions where relevant. "
+                    "Cover the standard scope — not too shallow, not too deep."
+                ),
+                "examples": (
+                    "Use examples from NCERT textbooks when possible. Otherwise use Indian context: "
+                    "Indian geography, Indian history, Indian daily life. Mix of rural and urban references."
+                ),
+                "engagement": (
+                    "Be structured and clear. Include a 'Think about it' prompt or a check question. "
+                    "For higher grades, include exam tips: 'In board exams, this is often asked as…'"
+                ),
+                "curriculum": (
+                    "Follow NCERT terminology and definitions EXACTLY — students are tested on specific wording. "
+                    "Use the same concept ordering as NCERT chapters. For definitions, prefer the textbook phrasing."
+                ),
+            },
+            "ICSE": {
+                "label": "ICSE",
+                "vocab": (
+                    "Use richer vocabulary than CBSE — ICSE students are exposed to more advanced English. "
+                    "Introduce technical terms confidently and use them throughout. "
+                    "Sentences can be longer and more nuanced. Use academic but accessible language."
+                ),
+                "structure": (
+                    "Use PARAGRAPH-form answers — ICSE expects flowing, well-written responses, not just bullet points. "
+                    "Structure with clear topic sentences. Use bullets only for lists of items. "
+                    "Answers should be MORE DETAILED than CBSE-style — about 30-50% longer."
+                ),
+                "depth": (
+                    "Go deeper than the basic definition — explain WHY, not just WHAT. "
+                    "Include the reasoning behind concepts. Show cause-and-effect chains. "
+                    "For Science, include experiment details, observations, and inferences. "
+                    "For Maths, show alternative methods when they exist."
+                ),
+                "examples": (
+                    "Use a mix of Indian and international examples. ICSE values broader exposure. "
+                    "Include real-world applications: 'This is used in…' or 'Scientists discovered this when…' "
+                    "Multiple examples are welcome to show different facets of a concept."
+                ),
+                "engagement": (
+                    "Encourage analytical thinking: 'Why do you think this happens?' "
+                    "Pose application questions: 'How would you use this in…?' "
+                    "For older students, include comparison questions: 'How is this different from…?'"
+                ),
+                "curriculum": (
+                    "Follow ICSE/ISC syllabus depth. Use textbook approaches from Selina, Concise, Frank publishers. "
+                    "ICSE tests understanding over memorisation — answers should demonstrate comprehension."
+                ),
+            },
+            "IB": {
+                "label": "IB (International Baccalaureate)",
+                "vocab": (
+                    "Use sophisticated, globally-aware vocabulary. Even for young students, introduce precise terms "
+                    "and build vocabulary actively. Use words like 'investigate', 'explore', 'consider'. "
+                    "Language should feel international — no regional bias."
+                ),
+                "structure": (
+                    "Use an INQUIRY-BASED structure: pose a question → explore → discover → reflect. "
+                    "Weave questions INTO the explanation, not just at the end. "
+                    "Use IB command terms naturally (describe, explain, analyse, evaluate). "
+                    "Responses should be the MOST DETAILED of all boards — thoroughness is valued."
+                ),
+                "depth": (
+                    "Go DEEP — explore multiple angles, perspectives, and connections. "
+                    "Connect to other subjects (interdisciplinary links). "
+                    "Include 'big picture' thinking: how does this connect to global issues, ethics, or other cultures? "
+                    "Encourage the student to form their own conclusions."
+                ),
+                "examples": (
+                    "Use GLOBAL, DIVERSE examples from different countries and cultures. "
+                    "Include current events, real-world problems, and sustainability connections. "
+                    "Avoid culturally narrow examples — IB values international-mindedness."
+                ),
+                "engagement": (
+                    "Make it highly interactive and inquiry-driven. Ask open-ended questions throughout. "
+                    "Include 'What do you think?' and 'How might this be different in another country?' "
+                    "Connect to TOK (Theory of Knowledge) concepts where natural. "
+                    "End with a reflection or exploration prompt."
+                ),
+                "curriculum": (
+                    "Follow IB curriculum philosophy. Reference IB assessment criteria and command terms. "
+                    "IB values process over product — show thinking, not just answers."
+                ),
+            },
+            "CAMBRIDGE": {
+                "label": "Cambridge (IGCSE/A-Level)",
+                "vocab": (
+                    "Use precise, formal academic English. Cambridge values exactness in language. "
+                    "Technical terms should be used correctly from the start with clear definitions. "
+                    "Avoid colloquial language — maintain an academic register throughout."
+                ),
+                "structure": (
+                    "Use a LOGICAL ARGUMENT structure: claim → evidence → reasoning → conclusion. "
+                    "Answers should be well-structured with clear progression. "
+                    "Use subheadings for longer responses. Include units, significant figures for Science/Maths. "
+                    "Response length should be DETAILED — Cambridge rewards thorough, precise answers."
+                ),
+                "depth": (
+                    "Be THOROUGH and PRECISE. Cover definitions, explanations, worked examples, and edge cases. "
+                    "For Science: include proper working with units at every step. "
+                    "For Maths: show full algebraic working. "
+                    "Include exam technique tips: mark allocation awareness, command word interpretation."
+                ),
+                "examples": (
+                    "Use international, scientifically rigorous examples. "
+                    "Include real-world applications with proper data/figures where relevant. "
+                    "Cambridge values evidence-based reasoning — examples should support arguments."
+                ),
+                "engagement": (
+                    "Be intellectually rigorous but supportive. Pose analytical questions. "
+                    "Include 'Examiner tip' callouts for exam-relevant advice. "
+                    "For higher grades, include past-paper style practice questions."
+                ),
+                "curriculum": (
+                    "Follow Cambridge International syllabus learning objectives. "
+                    "Use Cambridge-prescribed conventions and terminology. "
+                    "Cambridge emphasises structured, evidence-based reasoning throughout."
+                ),
+            },
+        }
+
+        rules = board_rules[board_key]
+
+        # --- Grade-specific engagement style ---
+        engagement_styles = {
+            "early-primary": (
+                "TONE: Warm, playful, like their favourite teacher.\n"
+                "- Start with a fun hook: a tiny story, 'imagine this…', or a surprising fact.\n"
+                "- Use everyday objects, animals, food as analogies.\n"
+                "- Use 'First… Then… Finally…' patterns for steps.\n"
+                "- Celebrate curiosity: 'Great question!' or 'You're thinking like a little scientist!'\n"
+                "- Suggest a fun try-at-home activity when the topic allows."
+            ),
+            "upper-primary": (
+                "TONE: Friendly and encouraging, like a cool older sibling who knows stuff.\n"
+                "- Open with 'Did you know?' fun facts or relatable scenarios.\n"
+                "- Use daily life, sports, nature examples they'd connect with.\n"
+                "- Include 'Think about it' moments and quick challenges.\n"
+                "- Break complex topics into numbered steps.\n"
+                "- End with 'What would happen if…?' scenarios."
+            ),
+            "middle-school": (
+                "TONE: Clear and structured, balancing depth with accessibility.\n"
+                "- Start with thought-provoking real-world connections.\n"
+                "- Encourage critical thinking: 'What would happen if we changed X?'\n"
+                "- Walk through reasoning step-by-step.\n"
+                "- Connect concepts across subjects.\n"
+                "- Present common misconceptions and ask them to spot the error."
+            ),
+            "high-school": (
+                "TONE: Precise and academic but still supportive.\n"
+                "- Open with a conceptual question or real-world problem.\n"
+                "- Use Socratic prompts: 'Think about this before reading the answer…'\n"
+                "- Include 'Exam corner' tips and common pitfalls.\n"
+                "- Connect to competitive exams (JEE, NEET, CUET) where relevant.\n"
+                "- End with a practice problem or discussion question."
+            ),
+        }
+
+        return (
+            f"STUDENT PROFILE: Grade {grade} ({age}) — {rules['label']}\n\n"
+            f"VOCABULARY RULES (follow strictly):\n{rules['vocab']}\n\n"
+            f"RESPONSE STRUCTURE (follow strictly):\n{rules['structure']}\n\n"
+            f"DEPTH & DETAIL:\n{rules['depth']}\n\n"
+            f"EXAMPLES & ANALOGIES:\n{rules['examples']}\n\n"
+            f"INTERACTIVE ENGAGEMENT:\n{rules['engagement']}\n"
+            f"{engagement_styles.get(band, '')}\n\n"
+            f"CURRICULUM ALIGNMENT:\n{rules['curriculum']}"
+        )
+
+    def _build_grade_only_profile(self, grade: int, band: str) -> str:
+        """Grade profile when no board is selected — the original behaviour."""
+        age_map = {
+            "early-primary": "ages 6-8",
+            "upper-primary": "ages 9-11",
+            "middle-school": "ages 12-14",
+            "high-school": "ages 15-17",
+        }
+        age = age_map.get(band, "")
+        profiles = {
+            "early-primary": (
+                f"The student is in Grade {grade} ({age}).\n"
+                "LANGUAGE & TONE:\n"
+                "- Use very simple words and short sentences a young child can understand.\n"
+                "- Use a warm, playful, encouraging tone — like their favourite teacher.\n"
+                "- Avoid abstract concepts — make everything concrete and visual.\n"
+                "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
+                "- Start explanations with a fun hook: a tiny story, a 'imagine this…' scenario, or a surprising fact.\n"
+                "- Use everyday objects, animals, colours, and food as analogies.\n"
+                "- Sprinkle in mini-challenges: 'Can you guess what happens next?' or 'Let's count together!'\n"
+                "- After explaining, ask a simple check question.\n"
+                "- Celebrate their curiosity: 'What a great question!'\n"
+                "- Use patterns like 'First… Then… Finally…' to make steps easy to follow.\n"
+                "- If the topic allows, suggest a fun activity: 'Try this at home: …'"
+            ),
+            "upper-primary": (
+                f"The student is in Grade {grade} ({age}).\n"
+                "LANGUAGE & TONE:\n"
+                "- Use clear, simple language with age-appropriate vocabulary.\n"
+                "- Introduce technical terms but always explain them in plain words right after.\n"
+                "- Keep explanations structured but friendly — not too formal.\n"
+                "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
+                "- Open with a 'Did you know?' fun fact or a relatable scenario.\n"
+                "- Use examples from daily life, school, sports, nature.\n"
+                "- Include 'Think about it' moments and quick challenges.\n"
+                "- Break complex topics into numbered steps with clear transitions.\n"
+                "- End with a thought-provoking 'What would happen if…?' scenario."
+            ),
+            "middle-school": (
+                f"The student is in Grade {grade} ({age}).\n"
+                "LANGUAGE & TONE:\n"
+                "- Use moderately detailed explanations with proper terminology.\n"
+                "- Define key terms when first introduced, then use them naturally.\n"
+                "- Be clear and structured, balancing depth with accessibility.\n"
+                "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
+                "- Start with a thought-provoking question or real-world connection.\n"
+                "- Encourage critical thinking: 'What do you think would happen if we changed X?'\n"
+                "- Walk through logic step-by-step.\n"
+                "- Connect concepts across subjects.\n"
+                "- Include quick self-check questions."
+            ),
+            "high-school": (
+                f"The student is in Grade {grade} ({age}).\n"
+                "LANGUAGE & TONE:\n"
+                "- Use precise academic language appropriate for senior students.\n"
+                "- Students are preparing for board exams and competitive entrances.\n"
+                "- Be thorough, cover edge cases, include exam-relevant tips.\n"
+                "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
+                "- Open with a conceptual question or real-world problem.\n"
+                "- Use Socratic-style prompts.\n"
+                "- Include 'Exam corner' tips and 'Common pitfall' callouts.\n"
+                "- Connect to competitive exam relevance (JEE, NEET, CUET).\n"
+                "- End with a practice problem or discussion question."
+            ),
+        }
+        return profiles.get(band, f"The student is in Grade {grade}.")
+
+    def _build_board_only_profile(self, board_key: str) -> str:
+        """Board profile when no grade is selected."""
+        board_profiles = {
+            "STATE": (
+                "BOARD: State Board\n"
+                "Use the simplest possible language. Short sentences, basic vocabulary. "
+                "Bullet points over paragraphs. Local everyday examples. "
+                "Keep answers brief and direct — State Board rewards correctness and brevity."
+            ),
+            "CBSE": (
+                "BOARD: CBSE\n"
+                "Follow NCERT terminology and conventions. Structure answers point-wise with **bold** key terms. "
+                "Use textbook-standard English. Include worked examples for Maths/Science."
+            ),
+            "ICSE": (
+                "BOARD: ICSE\n"
+                "Use richer vocabulary and paragraph-form answers. Explain 'why' not just 'what'. "
+                "Go deeper than surface definitions. Include real-world applications."
+            ),
+            "IB": (
+                "BOARD: IB\n"
+                "Use inquiry-based approach. Sophisticated vocabulary, global examples, multiple perspectives. "
+                "Encourage the student to form their own conclusions. Reference IB command terms."
+            ),
+            "CAMBRIDGE": (
+                "BOARD: Cambridge\n"
+                "Use precise formal academic English. Structure: claim -> evidence -> reasoning -> conclusion. "
+                "Include full working with units. Exam technique tips where relevant."
+            ),
+        }
+        return board_profiles.get(board_key, f"Follow {board_key} curriculum standards.")
+
     def _build_context_prompt(self, context: dict | None) -> str:
         if not context:
             return ""
@@ -72,80 +407,32 @@ class AIService:
 
         parts = []
 
-        # Grade-calibrated student profile
-        if grade:
-            band = self._get_grade_band(grade)
-            grade_profiles = {
-                "early-primary": (
-                    f"The student is in Grade {grade} (ages 6-8). "
-                    "Use very simple words and short sentences a young child can understand. "
-                    "Explain with fun analogies, stories, colours, animals, or everyday objects. "
-                    "Avoid abstract concepts — make everything concrete and visual. "
-                    "Use a warm, playful, encouraging tone like a favourite teacher."
-                ),
-                "upper-primary": (
-                    f"The student is in Grade {grade} (ages 9-11). "
-                    "Use clear, simple language with age-appropriate vocabulary. "
-                    "Introduce basic technical terms but always explain them. "
-                    "Use relatable examples from daily life, school, sports, or nature. "
-                    "Keep explanations structured but friendly — not too formal."
-                ),
-                "middle-school": (
-                    f"The student is in Grade {grade} (ages 12-14). "
-                    "Use moderately detailed explanations with proper terminology. "
-                    "Students at this level are building foundational understanding — "
-                    "explain concepts clearly, define key terms, and use relevant examples. "
-                    "Encourage critical thinking with 'why' and 'how' connections."
-                ),
-                "high-school": (
-                    f"The student is in Grade {grade} (ages 15-17). "
-                    "Use precise academic language appropriate for senior students. "
-                    "Students are preparing for board exams and competitive entrances — "
-                    "be thorough, cover edge cases, include exam-relevant tips where appropriate. "
-                    "Connect topics to real-world applications and higher studies."
-                ),
-            }
-            parts.append(grade_profiles.get(band, f"The student is in Grade {grade}."))
+        # --- Combined grade × board profile ---
+        # Grade and board are merged into ONE instruction block so they interact
+        # properly. The board modifies vocabulary ceiling, response depth, structure,
+        # and example style *relative to* the grade baseline — creating visible
+        # differences even at the same grade level.
 
-        # Board-specific curriculum alignment
+        band = self._get_grade_band(grade) if grade else None
+        board_key = None
         if board:
             board_upper = board.upper()
-            board_instructions = {
-                "CBSE": (
-                    "Follow CBSE/NCERT curriculum standards and terminology. "
-                    "Use NCERT textbook conventions for definitions and formulas. "
-                    "Structure answers the way CBSE board exams expect — point-wise, with key terms highlighted."
-                ),
-                "ICSE": (
-                    "Follow ICSE/ISC curriculum standards. "
-                    "ICSE expects deeper conceptual understanding and application-based answers. "
-                    "Use slightly more detailed explanations than CBSE and include application examples."
-                ),
-                "STATE": (
-                    "Follow the State Board curriculum approach. "
-                    "Use simple, direct explanations matching state textbook patterns."
-                ),
-                "IB": (
-                    "Follow IB (International Baccalaureate) curriculum approach. "
-                    "Emphasise inquiry-based learning, global perspectives, and critical analysis. "
-                    "Encourage the student to form their own conclusions supported by evidence."
-                ),
-                "CAMBRIDGE": (
-                    "Follow Cambridge (IGCSE/A-Level) curriculum standards. "
-                    "Use precise academic English, structured arguments, and evidence-based reasoning. "
-                    "Include exam technique tips where relevant."
-                ),
-            }
-            # Match board name flexibly
-            matched = None
-            for key in board_instructions:
-                if key in board_upper:
-                    matched = key
+            for k in ("CBSE", "ICSE", "STATE", "IB", "CAMBRIDGE"):
+                if k in board_upper:
+                    board_key = k
                     break
-            if matched:
-                parts.append(board_instructions[matched])
-            else:
-                parts.append(f"Follow {board} curriculum standards and conventions.")
+
+        if grade and board_key:
+            # Build a single fused instruction
+            parts.append(self._build_grade_board_profile(grade, band, board_key))
+        elif grade:
+            # Grade only (no board selected) — use default grade profile
+            parts.append(self._build_grade_only_profile(grade, band))
+        elif board_key:
+            # Board only (no grade) — just board instructions
+            parts.append(self._build_board_only_profile(board_key))
+        elif board:
+            parts.append(f"Follow {board} curriculum standards and conventions.")
 
         if subject:
             parts.append(f"Subject focus: {subject}. Keep your response relevant to this subject area.")
@@ -263,14 +550,36 @@ class AIService:
 
         if chat_settings.get("student_mode"):
             parts.append(
-                "STUDENT MODE is ON. You are talking to a student, not a professional. "
-                "Always remember:\n"
-                "- Use encouraging, supportive language throughout.\n"
-                "- When the student gets something right, acknowledge it warmly.\n"
-                "- When they're wrong, correct gently — 'Almost! Let's look at it this way…'\n"
-                "- Break complex topics into numbered steps they can follow.\n"
-                "- End with a quick recap or a 'check your understanding' question when appropriate.\n"
-                "- Never be condescending — be the teacher every student wishes they had."
+                "STUDENT MODE is ON. You are talking directly to a student, not a professional or teacher.\n"
+                "CONTENT GUARDRAILS (strictly enforced in student mode):\n"
+                "- You are an EDUCATIONAL assistant ONLY. Always answer questions that are relevant to learning, "
+                "academics, school subjects, homework, general knowledge, or personal development.\n"
+                "- If a student asks about something clearly non-educational (entertainment gossip, dating, social media drama), "
+                "gently redirect them: 'That's interesting! But as your study buddy, I'm best at helping with learning. "
+                "What subject are you working on?'\n"
+                "- NEVER provide content involving: explicit violence, self-harm, sexual content, drug use instructions, "
+                "weapons creation, or anything harmful to a minor.\n"
+                "- If a student asks about a sensitive topic that IS part of curriculum (e.g., reproduction in biology, "
+                "wars in history, chemical hazards in chemistry), answer it factually and age-appropriately for their grade. "
+                "These are legitimate academic topics — do not refuse them.\n"
+                "- Do NOT provide personal opinions on politics, religion, or controversial social issues. "
+                "Present multiple perspectives factually and let the student form their own views.\n"
+                "- If unsure whether a topic is appropriate, err on the side of answering educationally — "
+                "curious students should never feel shamed for asking questions.\n"
+                "CORE RULES:\n"
+                "- Use encouraging, supportive language throughout — be the teacher every student wishes they had.\n"
+                "- When correcting mistakes, be gentle: 'Almost! Let's look at it this way…' or 'Good thinking! Just one small thing…'\n"
+                "- When they get something right, celebrate it: 'Exactly right!' or 'You nailed it!'\n"
+                "- Never be condescending or patronising.\n"
+                "MAKE IT INTERACTIVE:\n"
+                "- Don't just lecture — engage. Weave in questions, prompts, and challenges naturally throughout.\n"
+                "- Use 'Let's think about this together…' to walk through reasoning collaboratively.\n"
+                "- After explaining a concept, include a quick check: 'Does that make sense? Here's a quick one to test it: …'\n"
+                "- Use scaffolded hints when they're stuck: give a nudge first, then more detail if needed.\n"
+                "- Relate the topic to things students care about — school life, future careers, or everyday situations.\n"
+                "- When appropriate, present the concept as a mini-story or scenario before the formal explanation.\n"
+                "- End responses with something forward-looking: a question to ponder, a challenge to try, or a 'next time you see X, notice how…' moment.\n"
+                "- Keep the energy positive and curious — learning should feel like discovery, not a chore."
             )
 
         # Note: followup, next_steps, and practice are handled as separate UI cards
@@ -288,10 +597,44 @@ class AIService:
           - has_files=True  → OpenAI (better at document Q&A), Gemini fallback
           - has_files=False → Gemini Pro (direct questions), OpenAI fallback
         """
+        # --- Content Guard: pre-generation check ---
+        # Only run for user-facing chat calls (context/chat_settings present).
+        # Internal service calls (mindmap, infographic, lesson plan, etc.) pass
+        # context=None & chat_settings=None — skip the guard for those.
+        grade_context_instruction = None
+        guard = None
+        is_user_chat = context is not None or chat_settings is not None
+
+        if is_user_chat:
+            from app.services.content_guard import ContentGuardService, GuardAction
+
+            student_mode = bool(
+                (chat_settings or {}).get("student_mode")
+                or (context or {}).get("student_mode")
+            )
+            grade = (context or {}).get("grade")
+            guard = ContentGuardService(student_mode=student_mode, grade=grade)
+
+            user_query = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    user_query = m.get("content", "")
+                    break
+
+            if user_query:
+                guard_result = await guard.run_input_pipeline(user_query)
+                guard.log_guard_event(user_query, guard_result)
+                if guard_result.action != GuardAction.ALLOW:
+                    return guard_result.message
+                grade_context_instruction = guard_result.grade_context
+        # --- End pre-generation check ---
+
         context_str = self._build_context_prompt(context)
         settings_str = self._build_settings_prompt(chat_settings)
         system_prompt = (
-            "You are Genverse.ai, an AI-powered educational assistant. "
+            "You are Genverse.ai, an AI-powered educational assistant built for students. "
+            "You are part of a learning platform used by school students from Grade 1 to Grade 12. "
+            "Every response you give should be helpful, age-appropriate, and focused on learning.\n\n"
             "IMPORTANT RULES — follow these strictly:\n"
             "1. NEVER mention your training data cutoff, knowledge cutoff date, or any date-based limitation "
             "(e.g. never say 'As of late 2023', 'As of my last update', 'my training data goes up to', "
@@ -301,20 +644,35 @@ class AIService:
             "Never use \\(...\\) or \\[...\\] notation.\n"
             "3. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
             "4. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
-            "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax."
+            "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax.\n"
+            "6. STUDENT SAFETY — this platform is used by minors (ages 6-17). You MUST:\n"
+            "   - NEVER provide instructions for violence, self-harm, weapons, illegal activities, or explicit sexual content.\n"
+            "   - NEVER use profanity, slang that is inappropriate for minors, or sexually suggestive language.\n"
+            "   - If asked about harmful topics, politely decline and redirect to educational alternatives.\n"
+            "   - For sensitive curriculum topics (biology reproduction, history of wars, chemical hazards), "
+            "answer factually and age-appropriately — these are valid educational topics.\n"
+            "   - Do NOT provide personal opinions on politics, religion, or controversial social issues. "
+            "Present multiple perspectives factually.\n"
+            "7. STAY EDUCATIONAL — You are a study buddy. Your purpose is to help students learn. "
+            "If a query is clearly non-educational (gossip, dating, social media drama), "
+            "briefly acknowledge it and gently steer back: 'I'm best at helping with learning! What subject are you working on?'"
         )
         if context_str:
             system_prompt += f"\n{context_str}"
         if settings_str:
             system_prompt += f"\n\n{settings_str}"
+        if grade_context_instruction:
+            system_prompt += f"\n\n{grade_context_instruction}"
         full_prompt = system_prompt + "\n\n" + "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in messages
         )
 
+        response_text: str | None = None
+
         if has_files:
             # File-based queries → Anthropic Claude primary, OpenAI fallback, Gemini fallback
             anthropic = self._get_anthropic()
-            if anthropic:
+            if anthropic and response_text is None:
                 try:
                     claude_messages = [
                         {"role": m["role"], "content": m["content"]}
@@ -328,47 +686,59 @@ class AIService:
                         system=system_prompt,
                         messages=claude_messages,
                     )
-                    return response.content[0].text
+                    response_text = response.content[0].text
                 except Exception as e:
                     print(f"[AIService] Anthropic chat failed: {e}", flush=True)
             openai = self._get_openai()
-            if openai:
+            if openai and response_text is None:
                 try:
                     response = await openai.chat.completions.create(
                         model=settings.AI_FALLBACK_MODEL,
                         messages=[{"role": "system", "content": system_prompt}] + messages,
                     )
-                    return response.choices[0].message.content
+                    response_text = response.choices[0].message.content
                 except Exception:
                     pass
             gemini = self._get_gemini()
-            if gemini:
+            if gemini and response_text is None:
                 try:
                     response = gemini.generate_content(full_prompt)
-                    return response.text
+                    response_text = response.text
                 except Exception:
                     pass
         else:
             # Direct questions → Gemini primary, OpenAI fallback
             gemini = self._get_gemini()
-            if gemini:
+            if gemini and response_text is None:
                 try:
                     response = gemini.generate_content(full_prompt)
-                    return response.text
+                    response_text = response.text
                 except Exception:
                     pass
             openai = self._get_openai()
-            if openai:
+            if openai and response_text is None:
                 try:
                     response = await openai.chat.completions.create(
                         model=settings.AI_FALLBACK_MODEL,
                         messages=[{"role": "system", "content": system_prompt}] + messages,
                     )
-                    return response.choices[0].message.content
+                    response_text = response.choices[0].message.content
                 except Exception:
                     pass
 
-        return "AI service is not configured or all providers failed. Please check your API keys."
+        if response_text is None:
+            return "AI service is not configured or all providers failed. Please check your API keys."
+
+        # --- Content Guard: post-generation output check ---
+        if guard is not None:
+            from app.services.content_guard import GuardAction
+            output_check = guard.check_output(response_text)
+            if output_check.action != GuardAction.ALLOW:
+                guard.log_guard_event(user_query, output_check)
+                return output_check.message
+        # --- End output check ---
+
+        return response_text
 
     async def _stream_gemini(self, full_prompt: str) -> AsyncIterator[str]:
         """Stream from Gemini without blocking the event loop.
@@ -454,10 +824,39 @@ class AIService:
           - has_files=True  → OpenAI (better at document Q&A), Gemini fallback
           - has_files=False → Gemini Pro (direct questions), OpenAI fallback
         """
+        # --- Content Guard: pre-generation check ---
+        from app.services.content_guard import ContentGuardService, GuardAction
+
+        student_mode = bool(
+            (chat_settings or {}).get("student_mode")
+            or (context or {}).get("student_mode")
+        )
+        grade = (context or {}).get("grade")
+        guard = ContentGuardService(student_mode=student_mode, grade=grade)
+
+        user_query = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                user_query = m.get("content", "")
+                break
+
+        grade_context_instruction = None
+        if user_query:
+            guard_result = await guard.run_input_pipeline(user_query)
+            guard.log_guard_event(user_query, guard_result)
+            if guard_result.action != GuardAction.ALLOW:
+                yield guard_result.message
+                return
+            # Carry grade-relevance context for the system prompt
+            grade_context_instruction = guard_result.grade_context
+        # --- End pre-generation check ---
+
         context_str = self._build_context_prompt(context)
         settings_str = self._build_settings_prompt(chat_settings)
         system_prompt = (
-            "You are Genverse.ai, an AI-powered educational assistant. "
+            "You are Genverse.ai, an AI-powered educational assistant built for students. "
+            "You are part of a learning platform used by school students from Grade 1 to Grade 12. "
+            "Every response you give should be helpful, age-appropriate, and focused on learning.\n\n"
             "IMPORTANT RULES — follow these strictly:\n"
             "1. NEVER mention your training data cutoff, knowledge cutoff date, or any date-based limitation "
             "(e.g. never say 'As of late 2023', 'As of my last update', 'my training data goes up to', "
@@ -467,57 +866,91 @@ class AIService:
             "Never use \\(...\\) or \\[...\\] notation.\n"
             "3. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
             "4. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
-            "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax."
+            "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax.\n"
+            "6. STUDENT SAFETY — this platform is used by minors (ages 6-17). You MUST:\n"
+            "   - NEVER provide instructions for violence, self-harm, weapons, illegal activities, or explicit sexual content.\n"
+            "   - NEVER use profanity, slang that is inappropriate for minors, or sexually suggestive language.\n"
+            "   - If asked about harmful topics, politely decline and redirect to educational alternatives.\n"
+            "   - For sensitive curriculum topics (biology reproduction, history of wars, chemical hazards), "
+            "answer factually and age-appropriately — these are valid educational topics.\n"
+            "   - Do NOT provide personal opinions on politics, religion, or controversial social issues. "
+            "Present multiple perspectives factually.\n"
+            "7. STAY EDUCATIONAL — You are a study buddy. Your purpose is to help students learn. "
+            "If a query is clearly non-educational (gossip, dating, social media drama), "
+            "briefly acknowledge it and gently steer back: 'I'm best at helping with learning! What subject are you working on?'"
         )
         if context_str:
             system_prompt += f"\n{context_str}"
         if settings_str:
             system_prompt += f"\n\n{settings_str}"
+        if grade_context_instruction:
+            system_prompt += f"\n\n{grade_context_instruction}"
         full_prompt = system_prompt + "\n\n" + "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in messages
         )
 
-        if has_files:
-            # File-based queries → Anthropic Claude primary, OpenAI fallback, Gemini fallback
-            if self._get_anthropic():
-                try:
-                    async for chunk in self._stream_anthropic(system_prompt, messages):
-                        yield chunk
-                    return
-                except Exception as e:
-                    print(f"[AIService] Anthropic stream failed: {e}", flush=True)
-            if self._get_openai():
-                try:
-                    async for chunk in self._stream_openai(system_prompt, messages):
-                        yield chunk
-                    return
-                except Exception as e:
-                    print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
-            if self._get_gemini():
-                try:
-                    async for chunk in self._stream_gemini(full_prompt):
-                        yield chunk
-                    return
-                except Exception as e:
-                    print(f"[AIService] Gemini stream fallback failed: {e}", flush=True)
-        else:
-            # Direct questions → Gemini primary, OpenAI fallback
-            if self._get_gemini():
-                try:
-                    async for chunk in self._stream_gemini(full_prompt):
-                        yield chunk
-                    return
-                except Exception as e:
-                    print(f"[AIService] Gemini stream failed: {e}", flush=True)
-            if self._get_openai():
-                try:
-                    async for chunk in self._stream_openai(system_prompt, messages):
-                        yield chunk
-                    return
-                except Exception as e:
-                    print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
+        # --- Helper: stream from providers with output safety check ---
+        accumulated = ""
+        next_check_at = 500  # check output every ~500 chars
 
-        yield "AI service not configured."
+        async def _provider_stream():
+            """Yield chunks from the appropriate provider chain."""
+            if has_files:
+                if self._get_anthropic():
+                    try:
+                        async for chunk in self._stream_anthropic(system_prompt, messages):
+                            yield chunk
+                        return
+                    except Exception as e:
+                        print(f"[AIService] Anthropic stream failed: {e}", flush=True)
+                if self._get_openai():
+                    try:
+                        async for chunk in self._stream_openai(system_prompt, messages):
+                            yield chunk
+                        return
+                    except Exception as e:
+                        print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
+                if self._get_gemini():
+                    try:
+                        async for chunk in self._stream_gemini(full_prompt):
+                            yield chunk
+                        return
+                    except Exception as e:
+                        print(f"[AIService] Gemini stream fallback failed: {e}", flush=True)
+            else:
+                if self._get_gemini():
+                    try:
+                        async for chunk in self._stream_gemini(full_prompt):
+                            yield chunk
+                        return
+                    except Exception as e:
+                        print(f"[AIService] Gemini stream failed: {e}", flush=True)
+                if self._get_openai():
+                    try:
+                        async for chunk in self._stream_openai(system_prompt, messages):
+                            yield chunk
+                        return
+                    except Exception as e:
+                        print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
+            yield "AI service not configured."
+
+        async for chunk in _provider_stream():
+            accumulated += chunk
+            yield chunk
+            # Periodic output safety check
+            if len(accumulated) >= next_check_at:
+                next_check_at += 500
+                output_check = guard.check_output(accumulated)
+                if output_check.action != GuardAction.ALLOW:
+                    guard.log_guard_event(user_query, output_check)
+                    yield "\n\n" + output_check.message
+                    return
+
+        # Final output check on complete text
+        output_check = guard.check_output(accumulated)
+        if output_check.action != GuardAction.ALLOW:
+            guard.log_guard_event(user_query, output_check)
+            yield "\n\n" + output_check.message
 
     async def ask_document(self, query: str, context: str, ai_context: dict | None = None) -> str:
         """RAG query against extracted document text."""
@@ -1366,6 +1799,13 @@ Subject: {subject or "General"}
 Grade: {grade or "General"}
 Board: {board or "General"}
 Depth: {depth} levels
+
+ACCURACY & SPELLING (CRITICAL):
+- Every word in every node label MUST be spelled correctly.
+- Scientific terms, proper nouns, formulas, and dates must be 100% accurate.
+- Double-check all technical vocabulary and terminology before including it.
+- Use proper capitalisation for proper nouns and sentence-case for other labels.
+- Do NOT abbreviate in a way that changes meaning or creates ambiguity.
 
 Return JSON with this structure:
 {{
@@ -2631,15 +3071,134 @@ Return ONLY valid JSON.
             if negative_marking else ""
         )
 
+        # ── Difficulty-specific instructions ──────────────────────────────
+        difficulty_instructions = {
+            "easy": (
+                "DIFFICULTY CALIBRATION: EASY.\n"
+                "- Questions should test basic recall and straightforward understanding.\n"
+                "- MCQ distractors should be clearly different from the correct answer.\n"
+                "- Avoid multi-step problems, tricky wording, or edge cases.\n"
+                "- Answers should be directly findable in the textbook."
+            ),
+            "medium": (
+                "DIFFICULTY CALIBRATION: MEDIUM.\n"
+                "- Questions should test understanding and basic application.\n"
+                "- Include a mix of direct recall and conceptual questions.\n"
+                "- MCQ distractors should be plausible but distinguishable with knowledge.\n"
+                "- Some questions should require 2-step reasoning."
+            ),
+            "hard": (
+                "DIFFICULTY CALIBRATION: HARD.\n"
+                "- Questions should test application, analysis, and higher-order thinking.\n"
+                "- MCQ distractors should include common student misconceptions.\n"
+                "- Include multi-step problems that require connecting concepts.\n"
+                "- Questions should challenge students who have studied the material thoroughly."
+            ),
+        }
+        difficulty_section = difficulty_instructions.get(difficulty, difficulty_instructions["medium"])
+
         allowed_types_str = " | ".join(f'"{t}"' for t in types)
 
-        prompt = f"""You are an expert question paper setter. Generate exactly {question_count} questions for an institutional evaluation paper.
+        # ── Grade-specific and board-specific generation instructions ────
+        grade_instruction = ""
+        if grade:
+            if grade <= 3:
+                grade_instruction = (
+                    f"GRADE CALIBRATION: Grade {grade} (ages 6-8, early primary).\n"
+                    "- Use very simple, familiar language. Sentences should be short and clear.\n"
+                    "- Questions should test basic recognition, recall, and simple understanding.\n"
+                    "- Avoid abstract or multi-step reasoning. Focus on concrete, visual concepts.\n"
+                    "- MCQ options should be clearly distinct — no tricky or confusable choices.\n"
+                    "- Fill-in-the-blank answers should be single, common words.\n"
+                    "- Use everyday examples (animals, food, colours, family, school)."
+                )
+            elif grade <= 6:
+                grade_instruction = (
+                    f"GRADE CALIBRATION: Grade {grade} (ages 9-11, upper primary).\n"
+                    "- Use clear, age-appropriate language. Technical terms only if part of the syllabus.\n"
+                    "- Questions can involve basic application and simple reasoning.\n"
+                    "- MCQ distractors should be plausible but not confusingly similar.\n"
+                    "- Short answers should expect 2-3 clear sentences.\n"
+                    "- Include relatable examples from daily life, nature, and school."
+                )
+            elif grade <= 9:
+                grade_instruction = (
+                    f"GRADE CALIBRATION: Grade {grade} (ages 12-14, middle school).\n"
+                    "- Use proper academic terminology as expected in the curriculum.\n"
+                    "- Questions should include comprehension, application, and basic analysis.\n"
+                    "- MCQ options can be closer in phrasing — test genuine understanding.\n"
+                    "- Short/long answers should require structured responses with reasoning.\n"
+                    "- Case-based and assertion-reason MCQs are appropriate at this level."
+                )
+            else:
+                grade_instruction = (
+                    f"GRADE CALIBRATION: Grade {grade} (ages 15-17, high school / board exam level).\n"
+                    "- Use precise academic language matching board exam standards.\n"
+                    "- Questions should span all Bloom's levels including analysis, evaluation, and application.\n"
+                    "- MCQ options should include common misconceptions as distractors.\n"
+                    "- Long answers should match the depth and format of actual board exam questions.\n"
+                    "- Include numericals, derivations, or case studies where the subject demands it.\n"
+                    "- Exam-pattern awareness: match the style students will face in actual exams."
+                )
+
+        board_instruction = ""
+        if board:
+            board_upper = (board or "").upper()
+            if "CBSE" in board_upper:
+                board_instruction = (
+                    "BOARD ALIGNMENT: CBSE / NCERT.\n"
+                    "- Follow NCERT textbook content, definitions, and terminology strictly.\n"
+                    "- Question patterns should match CBSE board exam format.\n"
+                    "- Use the exact phrasing and conventions from NCERT books.\n"
+                    "- For science/math, follow the notation and methods used in NCERT."
+                )
+            elif "ICSE" in board_upper:
+                board_instruction = (
+                    "BOARD ALIGNMENT: ICSE / ISC.\n"
+                    "- Follow ICSE curriculum standards which expect deeper conceptual understanding.\n"
+                    "- Questions should be slightly more application-oriented than CBSE.\n"
+                    "- Include questions that test comprehension and interpretation.\n"
+                    "- Long answers should demonstrate structured analytical thinking."
+                )
+            elif "IB" in board_upper:
+                board_instruction = (
+                    "BOARD ALIGNMENT: IB (International Baccalaureate).\n"
+                    "- Focus on inquiry-based, conceptual understanding.\n"
+                    "- Questions should encourage critical thinking and global perspectives.\n"
+                    "- Include questions that ask students to evaluate, compare, or construct arguments.\n"
+                    "- Use international contexts and examples, not region-specific."
+                )
+            elif "CAMBRIDGE" in board_upper or "IGCSE" in board_upper:
+                board_instruction = (
+                    "BOARD ALIGNMENT: Cambridge (IGCSE / A-Level).\n"
+                    "- Follow Cambridge exam format and marking scheme conventions.\n"
+                    "- Questions should test precise factual knowledge and application.\n"
+                    "- Use command words as defined by Cambridge (state, describe, explain, evaluate, etc.).\n"
+                    "- Long answers should follow the structured response format expected in Cambridge exams."
+                )
+            elif "STATE" in board_upper:
+                board_instruction = (
+                    "BOARD ALIGNMENT: State Board.\n"
+                    "- Use simple, direct question patterns matching state board exam style.\n"
+                    "- Follow state textbook content and terminology.\n"
+                    "- Questions should be straightforward — less tricky than CBSE/ICSE."
+                )
+            else:
+                board_instruction = f"BOARD ALIGNMENT: {board}. Follow {board} curriculum standards and question patterns."
+
+        prompt = f"""You are an expert question paper setter for school students. Generate exactly {question_count} questions for an institutional evaluation paper.
 
 SUBJECTS: {all_subjects_str}
 GRADE: {f'Grade {grade}' if grade else 'General'}{f' ({board})' if board else ''}
-DIFFICULTY: {difficulty}
+
+{difficulty_section}
+
 {blooms_section}
 {neg_section}
+
+{grade_instruction}
+
+{board_instruction}
 
 ALLOWED QUESTION TYPES — STRICTLY: {allowed_types_str}
 You MUST NOT generate any question with a "type" outside this list.
@@ -2909,6 +3468,13 @@ STRICT Rules:
 7. Aim for 4-8 first-level children, each with 2-5 sub-children.
 8. No repetition. No markdown. No code fences. Raw JSON only.
 
+ACCURACY & SPELLING RULES (CRITICAL — strictly follow):
+9. Every word in every node label MUST be spelled correctly. Double-check all scientific terms, proper nouns, dates, and technical vocabulary.
+10. Copy names, formulas, and technical terms EXACTLY as they appear in the explanation. Do NOT rephrase them in a way that introduces errors.
+11. If the explanation mentions a person, place, formula, or date — verify it matches the source text character-by-character before including it.
+12. Do NOT abbreviate words in a way that changes meaning or creates ambiguity.
+13. Use proper capitalisation for proper nouns and sentence-case for other labels.
+
 Return ONLY this JSON structure:
 {{
   "label": "Main Topic",
@@ -2993,7 +3559,13 @@ Return ONLY this JSON structure:
             "- Make text readable and well-spaced\n"
             "- Professional infographic style suitable for students\n"
             "- Dark or colored background with contrasting text\n"
-            "- Do NOT leave large empty spaces — fill with relevant visual elements"
+            "- Do NOT leave large empty spaces — fill with relevant visual elements\n\n"
+            "ACCURACY & SPELLING (CRITICAL):\n"
+            "- Every word, name, term, date, and formula MUST be spelled correctly.\n"
+            "- Copy scientific terms, proper nouns, and formulas EXACTLY from the key information above.\n"
+            "- Double-check ALL text before rendering — any spelling mistake will make the infographic unusable.\n"
+            "- Use proper capitalisation for headings and proper nouns.\n"
+            "- If including numbers or statistics, verify they match the source information exactly."
         )
 
         try:
@@ -3040,6 +3612,12 @@ Language: {language}
 ── AI EXPLANATION ──
 {explanation}
 ── END ──
+
+ACCURACY & SPELLING (CRITICAL):
+- Every word, name, term, date, and formula in the output MUST be spelled correctly.
+- Copy scientific terms, proper nouns, and formulas EXACTLY from the explanation above.
+- Double-check ALL text strings before including them — spelling mistakes make the infographic unusable.
+- Use proper capitalisation for headings and proper nouns.
 
 Return ONLY raw JSON with: title, subtitle, sections (array of heading/icon/color/facts/highlight), keyTakeaway.
 Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shield, Brain, Heart, TrendingUp, BarChart, Layers"""
