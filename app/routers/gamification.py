@@ -44,7 +44,7 @@ async def _get_or_create_ws_gamification(
             WorkspaceGamification.org_id == parsed_oid,
         )
     result = await db.execute(q)
-    row = result.scalar_one_or_none()
+    row = result.scalars().first()
     if not row:
         row = WorkspaceGamification(user_id=user_id, org_id=parsed_oid, xp=0, streak=0)
         db.add(row)

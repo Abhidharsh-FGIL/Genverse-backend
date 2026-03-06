@@ -90,7 +90,7 @@ async def get_gradebook(class_id: uuid.UUID, current_user: CurrentUser, db: DBSe
                     Submission.student_id == student.id,
                 )
             )
-            sub = sub_result.scalar_one_or_none()
+            sub = sub_result.scalars().first()
             if sub and sub.grade:
                 score = sub.grade.get("totalScore", 0)
                 max_score = sub.grade.get("maxScore", assignment.points)

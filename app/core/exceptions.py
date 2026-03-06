@@ -81,6 +81,20 @@ class FeatureGatedException(HTTPException):
         )
 
 
+class UsageLimitException(HTTPException):
+    def __init__(self, feature_key: str, period: str, limit: int):
+        super().__init__(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "usage_limit_exceeded",
+                "feature_key": feature_key,
+                "period": period,
+                "limit": limit,
+                "message": f"You've reached the {period} limit ({limit}) for '{feature_key}'.",
+            },
+        )
+
+
 class StorageLimitException(HTTPException):
     def __init__(self, used_mb: float, limit_mb: float):
         super().__init__(

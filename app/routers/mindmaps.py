@@ -32,6 +32,7 @@ def _apply_org_filter(q, column, org_id_param: str | None):
 async def generate_mindmap(payload: MindMapGenerateRequest, current_user: CurrentUser, db: DBSession):
     """Generate a visual mind map using AI."""
     points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="mindmap", db=db)
     await points_service.deduct(user_id=current_user.id, action="generate_mindmap", db=db)
 
     ai = AIService()
@@ -54,9 +55,6 @@ async def generate_mindmap(payload: MindMapGenerateRequest, current_user: Curren
         mindmap_json=mindmap_json,
     )
     db.add(mindmap)
-
-    # Award XP
-    current_user.xp = (current_user.xp or 0) + 15
     await db.commit()
     await db.refresh(mindmap)
     return mindmap

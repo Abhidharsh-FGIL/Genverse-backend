@@ -36,9 +36,9 @@ from app.core.exceptions import (
 router = APIRouter()
 
 ADDON_POINT_MAP = {
-    "point_pack_100": 100,
-    "point_pack_500": 500,
-    "point_pack_1000": 1000,
+    "starter_200": 200,
+    "learner_500": 500,
+    "pro_1500": 1500,
 }
 
 
@@ -52,7 +52,7 @@ async def _get_active_subscription(
             select(Subscription).where(
                 Subscription.org_id == org_id,
                 Subscription.status.in_(["active", "trialing"]),
-            )
+            ).order_by(Subscription.updated_at.desc())
         )
     else:
         result = await db.execute(
@@ -60,9 +60,9 @@ async def _get_active_subscription(
                 Subscription.user_id == user_id,
                 Subscription.workspace_type == "individual",
                 Subscription.status.in_(["active", "trialing"]),
-            )
+            ).order_by(Subscription.updated_at.desc())
         )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 @router.get("", response_model=SubscriptionResponse)
@@ -98,6 +98,12 @@ async def get_plan(plan_name: str, db: DBSession):
     if not plan:
         raise NotFoundException(f"Plan '{plan_name}' not found")
     return plan
+
+
+@router.get("/point-costs")
+async def list_point_costs(db: DBSession):
+    result = await db.execute(select(PointCost))
+    return result.scalars().all()
 
 
 @router.get("/feature-limits", response_model=list[FeatureLimitResponse])
@@ -186,7 +192,7 @@ async def deduct_points(
     cost_result = await db.execute(
         select(PointCost).where(PointCost.action == payload.action)
     )
-    point_cost = cost_result.scalar_one_or_none()
+    point_cost = cost_result.scalars().first()
     if not point_cost:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown action")
 

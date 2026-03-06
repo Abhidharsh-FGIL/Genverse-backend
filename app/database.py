@@ -122,6 +122,16 @@ async def run_migrations() -> None:
                 await conn.execute(text(alter_sql))
                 await conn.execute(text(index_sql))
 
+        # Add max_file_size_mb to plan_definitions if missing
+        mfs_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'plan_definitions' AND column_name = 'max_file_size_mb'"
+        ))
+        if not mfs_exists.scalar():
+            await conn.execute(text(
+                "ALTER TABLE plan_definitions ADD COLUMN max_file_size_mb INTEGER DEFAULT 5"
+            ))
+
 
 async def close_db() -> None:
     await engine.dispose()

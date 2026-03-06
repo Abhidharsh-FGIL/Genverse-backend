@@ -49,8 +49,9 @@ def _apply_org_filter(q, column, org_id_param: str | None):
 @router.post("/generate", response_model=AssessmentResponse, status_code=status.HTTP_201_CREATED)
 async def generate_assessment(payload: GenerateAssessmentRequest, current_user: CurrentUser, db: DBSession):
     """Use AI to generate practice assessment questions and save them."""
-    # Deduct points: 2 pts per 10 questions
+    # Check feature access + usage, then deduct points
     points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="create_assessment", db=db)
     await points_service.deduct(
         user_id=current_user.id,
         action="generate_assessment",

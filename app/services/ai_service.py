@@ -2175,9 +2175,9 @@ Return ONLY the JSON array. No markdown fences, no extra text."""
                 "strengths": [],
                 "weak_areas": [],
                 "goals": [
-                    {"title": "Take your first assessment", "type": "explore", "priority": 90, "subject": None, "action_href": "/u/assessments"},
-                    {"title": "Create a topic-based quiz", "type": "explore", "priority": 75, "subject": None, "action_href": "/u/assessments"},
-                    {"title": "Upload study material to vault", "type": "explore", "priority": 50, "subject": None, "action_href": "/u/library"},
+                    {"title": "Take your first assessment", "type": "explore", "priority": 90, "subject": None, "topic": None, "action_href": "/u/assessments"},
+                    {"title": "Create a topic-based quiz", "type": "explore", "priority": 75, "subject": None, "topic": None, "action_href": "/u/assessments"},
+                    {"title": "Upload study material to vault", "type": "explore", "priority": 50, "subject": None, "topic": None, "action_href": "/u/library"},
                 ],
                 "total_attempts": 0,
                 "overall_avg": 0,
@@ -2215,7 +2215,8 @@ Based on ALL this data, generate a coaching summary with this exact JSON structu
       "title": "Specific action title, max 8 words",
       "type": "retry|practice|upgrade|explore|streak",
       "priority": 85,
-      "subject": "subject name or null",
+      "subject": "the broad subject like Physics, Mathematics, Biology, etc. or null",
+      "topic": "the SPECIFIC topic to practice like Gravity, Quadratic Equations, Photosynthesis, Newton's Laws, etc. MUST be a real topic name from the data above, NOT the subject name. This will be used to pre-fill an assessment creation form.",
       "action_href": "/u/assessments"
     }}
   ]
@@ -2227,6 +2228,7 @@ Rules:
 - goals: exactly 3-5 specific goals ordered by priority (highest first)
 - goal priority: retry failed (<60%) = 85-95, improve weak = 70-84, upgrade difficulty = 55-70, explore new = 30-55
 - momentum: "improving" if recent scores are higher than older ones, "declining" if going down, "steady" otherwise
+- CRITICAL for goals: "topic" must be an actual specific topic name extracted from the mastery or attempt data (e.g. "Gravity", "Thermodynamics", "Algebra"). Do NOT use the subject name (like "General" or "Physics") as the topic. If the data has topics like "Gravity (General)", the topic should be "Gravity" and subject should be "General Physics" or similar. If no specific topic exists, set topic to null.
 - Return ONLY valid JSON. No markdown fences."""
 
         response = await self.chat([{"role": "user", "content": prompt}])
@@ -2248,7 +2250,7 @@ Rules:
                 "momentum": "steady",
                 "strengths": [],
                 "weak_areas": [],
-                "goals": [{"title": "Keep taking assessments", "type": "practice", "priority": 70, "subject": None, "action_href": "/u/assessments"}],
+                "goals": [{"title": "Keep taking assessments", "type": "practice", "priority": 70, "subject": None, "topic": None, "action_href": "/u/assessments"}],
                 "total_attempts": total_attempts,
                 "overall_avg": overall_avg,
                 "best_score": best_overall,

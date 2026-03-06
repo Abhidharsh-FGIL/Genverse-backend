@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, HTTPException, status, Query
+from fastapi import APIRouter, HTTPException, status, Query, UploadFile, File
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -8,6 +8,7 @@ from app.dependencies import DBSession, CurrentUser
 from app.models.user import User, UserRole
 from app.models.ai import AiContextSession
 from app.schemas.user import UserResponse, UserUpdate, AiContextRequest, AiContextResponse
+from app.services.storage_service import StorageService
 
 router = APIRouter()
 
@@ -37,6 +38,48 @@ async def update_profile(payload: UserUpdate, current_user: CurrentUser, db: DBS
         setattr(current_user, key, value)
     await db.commit()
     # Reload with roles so the role property is accessible
+    result = await db.execute(
+        select(User).options(selectinload(User.roles)).where(User.id == current_user.id)
+    )
+    return result.scalar_one()
+
+
+@router.post("/me/avatar", response_model=UserResponse)
+async def upload_avatar(
+    file: UploadFile = File(...),
+    current_user: CurrentUser = None,
+    db: DBSession = None,
+):
+    """Upload a profile photo. Accepts JPEG, PNG, WebP (max 2 MB)."""
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files are allowed")
+
+    content = await file.read()
+    if len(content) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image must be under 2 MB")
+    await file.seek(0)
+
+    storage = StorageService()
+    file_info = await storage.upload_file(
+        file=file,
+        bucket="avatars",
+        prefix=str(current_user.id),
+    )
+
+    from app.config import settings as _settings
+    from pathlib import Path as _Path
+
+    try:
+        storage_root = _Path(_settings.STORAGE_ROOT).resolve()
+        abs_path = _Path(file_info["path"]).resolve()
+        rel = abs_path.relative_to(storage_root)
+        avatar_url = f"/uploads/{rel.as_posix()}"
+    except Exception:
+        avatar_url = file_info.get("path", "")
+
+    current_user.avatar_url = avatar_url
+    await db.commit()
+
     result = await db.execute(
         select(User).options(selectinload(User.roles)).where(User.id == current_user.id)
     )

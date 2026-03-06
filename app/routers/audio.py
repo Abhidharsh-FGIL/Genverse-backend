@@ -14,6 +14,7 @@ async def audio_qa(payload: AudioQARequest, current_user: CurrentUser, db: DBSes
     The response can be used for audio playback on the frontend.
     """
     points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db)
     await points_service.deduct(user_id=current_user.id, action="basic_chat", db=db)
 
     ai = AIService()

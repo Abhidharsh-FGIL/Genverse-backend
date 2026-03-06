@@ -14,7 +14,7 @@ class UserLibraryItem(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
     org_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
-    file_type: Mapped[str | None] = mapped_column(String(50))  # pdf, docx, txt, jpg, etc.
+    file_type: Mapped[str | None] = mapped_column(String(255))  # MIME type or extension
     storage_path: Mapped[str | None] = mapped_column(String(1000))
     file_size_mb: Mapped[float | None] = mapped_column(Float)
     folder: Mapped[str | None] = mapped_column(String(255))

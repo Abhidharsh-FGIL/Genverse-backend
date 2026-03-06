@@ -1,12 +1,17 @@
+import re
 import uuid
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status
 from app.dependencies import DBSession, CurrentUser
 from app.models.content import UserLibraryItem, DocChunk
 from app.services.ai_service import AIService
 from app.services.storage_service import StorageService
+from app.services.points_service import PointsService
 from app.schemas.content import OCRExtractResponse
 
 router = APIRouter()
+
+# Regex to strip null bytes and non-printable control chars (keep \n \r \t)
+_INVALID_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
 
 def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
@@ -38,6 +43,16 @@ async def extract_text(
             detail="Unsupported file type for OCR",
         )
 
+    # Check usage limits and deduct points (cost=3, xp=3 from seed)
+    parsed_org = _parse_org_id(org_id)
+    points_service = PointsService()
+    await points_service.check_and_increment_usage(
+        user_id=current_user.id, feature_key="ocr_extraction", db=db, org_id=parsed_org,
+    )
+    await points_service.deduct(
+        user_id=current_user.id, action="ocr_extraction", db=db, org_id=parsed_org,
+    )
+
     storage = StorageService()
     file_info = await storage.upload_file(
         file=file,
@@ -65,13 +80,17 @@ async def extract_text(
     db.add(item)
     await db.flush()
 
+    # Sanitize: strip null bytes and control chars that PostgreSQL rejects
+    if extracted_text:
+        extracted_text = _INVALID_CHARS.sub('', extracted_text)
+
     # Store extracted text as chunks for later retrieval via GET /library/{id}/text
     if extracted_text:
         chunks = ai.chunk_text(extracted_text)
         for i, chunk in enumerate(chunks):
             db.add(DocChunk(
                 library_item_id=item.id,
-                chunk_text=chunk,
+                chunk_text=_INVALID_CHARS.sub('', chunk),
                 chunk_order=i,
             ))
 

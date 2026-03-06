@@ -79,6 +79,7 @@ async def generate_insights(
         await db.commit()
 
     points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="insights", db=db)
     await points_service.deduct(user_id=current_user.id, action="generate_insights", db=db)
 
     ai = AIService()
@@ -229,11 +230,15 @@ async def get_insight_feed(
 @router.get("/news/common")
 async def get_common_news(
     current_user: CurrentUser,
+    db: DBSession,
     category: str = Query("all"),
     language: str = Query("en"),
     max_results: int = Query(10, le=30),
 ):
     """Fetch real-time Google News articles by category via RapidAPI."""
+    points_service = PointsService()
+    await points_service.deduct(user_id=current_user.id, action="news_feed", db=db)
+
     svc = NewsService()
     return await svc.get_common_news(category=category, language=language, max_results=max_results)
 
@@ -246,6 +251,9 @@ async def get_personal_news(
     max_results: int = Query(10, le=30),
 ):
     """Fetch real-time news personalised to the user's learning context via RapidAPI."""
+    points_service = PointsService()
+    await points_service.deduct(user_id=current_user.id, action="news_feed", db=db)
+
     from app.models.ai import AiContextSession, AiInteractionHistory
     from app.models.assessment import TopicMastery
 
@@ -500,6 +508,10 @@ async def generate_recommendations(
     from sqlalchemy import delete as sql_delete
 
     parsed_oid = _parse_org_id(org_id)
+
+    # Deduct 1 point for regenerating recommendations
+    points_service = PointsService()
+    await points_service.deduct(user_id=current_user.id, action="view_recommendations", db=db)
 
     # Remove old pending recommendations for this workspace
     del_q = sql_delete(Recommendation).where(

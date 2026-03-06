@@ -21,9 +21,20 @@ from app.core.exceptions import NotFoundException
 from app.services.ai_service import AIService
 from app.services.faiss_service import FAISSService
 from app.services.points_service import PointsService
+from app.models.subscription import PointCost
 from app.config import settings
 
 router = APIRouter()
+
+# Maps chat_settings keys to point_cost action names for sub-feature billing
+ENHANCEMENT_COST_MAP = {
+    "followup":    "chat_followup",
+    "next_steps":  "chat_next_steps",
+    "video_refs":  "chat_video_refs",
+    "mind_map":    "chat_mindmap",
+    "infographic": "chat_infographic",
+    "practice":    "chat_practice",
+}
 
 
 def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
@@ -240,9 +251,12 @@ async def send_message_stream(
     if not chat:
         raise NotFoundException("Chat not found")
 
-    # Deduct points before AI call
+    # Check feature access + usage limits
     points_service = PointsService()
-    await points_service.deduct(user_id=current_user.id, action="basic_chat", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db)
+
+    # NOTE: Points deduction is deferred until after chat_settings are resolved (below)
+    # so we can calculate the total cost including enabled enhancements.
 
     # Save user message — store any attached filenames in sources_json so the
     # frontend can render them as file chips above the message bubble.
@@ -290,6 +304,25 @@ async def send_message_stream(
     # Client-supplied settings overlay DB values (kept for backwards compatibility)
     if payload.chat_settings:
         chat_settings.update(payload.chat_settings)
+
+    # Calculate total cost: base chat + enabled enhancement sub-features
+    enabled_actions = [
+        action for key, action in ENHANCEMENT_COST_MAP.items()
+        if chat_settings.get(key)
+    ]
+    base_result = await db.execute(select(PointCost).where(PointCost.action == "basic_chat"))
+    base_pc = base_result.scalars().first()
+    total_cost = base_pc.cost if base_pc else 1
+    total_xp = (base_pc.xp_reward or 0) if base_pc else 0
+    if enabled_actions:
+        enh_result = await db.execute(select(PointCost).where(PointCost.action.in_(enabled_actions)))
+        for pc in enh_result.scalars().all():
+            total_cost += pc.cost
+            total_xp += pc.xp_reward or 0
+    await points_service.deduct_custom(
+        user_id=current_user.id, action="basic_chat", db=db,
+        cost_override=total_cost, xp_override=total_xp,
+    )
 
     # Get chat history
     history_result = await db.execute(
@@ -396,7 +429,24 @@ async def send_message(
         raise NotFoundException("Chat not found")
 
     points_service = PointsService()
-    await points_service.deduct(user_id=current_user.id, action="basic_chat", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db)
+
+    # Calculate dynamic cost based on enabled enhancements
+    cs = payload.chat_settings or {}
+    enabled_actions = [action for key, action in ENHANCEMENT_COST_MAP.items() if cs.get(key)]
+    base_result = await db.execute(select(PointCost).where(PointCost.action == "basic_chat"))
+    base_pc = base_result.scalars().first()
+    total_cost = base_pc.cost if base_pc else 1
+    total_xp = (base_pc.xp_reward or 0) if base_pc else 0
+    if enabled_actions:
+        enh_result = await db.execute(select(PointCost).where(PointCost.action.in_(enabled_actions)))
+        for pc in enh_result.scalars().all():
+            total_cost += pc.cost
+            total_xp += pc.xp_reward or 0
+    await points_service.deduct_custom(
+        user_id=current_user.id, action="basic_chat", db=db,
+        cost_override=total_cost, xp_override=total_xp,
+    )
 
     user_msg = AiChatMessage(chat_id=chat_id, role="user", content=payload.message)
     db.add(user_msg)
@@ -701,6 +751,7 @@ async def generate_practice_assessment_preview(
 ):
     """Generate AI practice questions for review — does NOT save to DB."""
     points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="create_assessment", db=db)
     await points_service.deduct(user_id=current_user.id, action="generate_assessment", db=db)
 
     # Resolve topic list: prefer explicit multi_topics, fall back to splitting topic string

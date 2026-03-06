@@ -31,6 +31,7 @@ class PlanDefinitionResponse(BaseModel):
     workspace_type: str
     monthly_points: int
     storage_mb: int
+    max_file_size_mb: int = 5
     max_seats: Optional[int] = None
     description: Optional[str] = None
 

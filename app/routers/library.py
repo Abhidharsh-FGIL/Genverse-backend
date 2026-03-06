@@ -1,10 +1,11 @@
 import uuid
 from typing import Optional
-from fastapi import APIRouter, status, UploadFile, File, Form, Query
-from sqlalchemy import select, delete as sql_delete
+from fastapi import APIRouter, status, UploadFile, File, Form, Query, HTTPException
+from sqlalchemy import select, delete as sql_delete, func as sa_func
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.content import UserLibraryItem, DocChunk
+from app.models.subscription import Subscription, PlanDefinition
 from app.schemas.content import LibraryItemResponse, LibraryItemUpdate, VaultQueryRequest, VaultQueryResponse
 from app.core.exceptions import NotFoundException
 from app.services.storage_service import StorageService
@@ -36,6 +37,26 @@ def _faiss() -> FAISSService:
     return FAISSService(settings.STORAGE_ROOT)
 
 
+@router.get("/storage-usage")
+async def get_storage_usage(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str = Query(None),
+):
+    """Return total storage used in MB by summing file_size_mb of all library items."""
+    parsed_org = _parse_org_id(org_id)
+    q = select(sa_func.coalesce(sa_func.sum(UserLibraryItem.file_size_mb), 0)).where(
+        UserLibraryItem.user_id == current_user.id
+    )
+    if parsed_org is None:
+        q = q.where(UserLibraryItem.org_id.is_(None))
+    else:
+        q = q.where(UserLibraryItem.org_id == parsed_org)
+    result = await db.execute(q)
+    total_mb = result.scalar() or 0
+    return {"storage_used_mb": round(float(total_mb), 2)}
+
+
 @router.post("/upload", response_model=LibraryItemResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document(
     file: UploadFile = File(...),
@@ -46,6 +67,44 @@ async def upload_document(
     db: DBSession = None,
 ):
     """Upload a document to the knowledge vault. Text extraction + embedding happens inline."""
+    # Enforce plan-based file size limit
+    content = await file.read()
+    file_size_mb = len(content) / (1024 * 1024)
+    await file.seek(0)  # reset for StorageService
+
+    parsed_oid = _parse_org_id(org_id)
+    if parsed_oid:
+        sub_q = select(Subscription).where(
+            Subscription.org_id == parsed_oid,
+            Subscription.status.in_(["active", "trialing"]),
+        )
+    else:
+        sub_q = select(Subscription).where(
+            Subscription.user_id == current_user.id,
+            Subscription.workspace_type == "individual",
+            Subscription.status.in_(["active", "trialing"]),
+        )
+    sub_result = await db.execute(sub_q.order_by(Subscription.updated_at.desc()))
+    sub = sub_result.scalars().first()
+    plan_name = sub.plan if sub else "free"
+
+    plan_def_result = await db.execute(
+        select(PlanDefinition).where(PlanDefinition.plan == plan_name)
+    )
+    plan_def = plan_def_result.scalars().first()
+    max_file_mb = plan_def.max_file_size_mb if plan_def else 5
+
+    if file_size_mb > max_file_mb:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "error": "file_too_large",
+                "max_size_mb": max_file_mb,
+                "file_size_mb": round(file_size_mb, 1),
+                "message": f"File is {round(file_size_mb, 1)} MB. Your plan allows up to {max_file_mb} MB per file.",
+            },
+        )
+
     storage = StorageService()
     file_info = await storage.upload_file(
         file=file,
@@ -68,9 +127,6 @@ async def upload_document(
     db.add(item)
     await db.commit()
     await db.refresh(item)
-
-    # Award XP for document upload
-    current_user.xp = (current_user.xp or 0) + 5
 
     # Text extraction → semantic chunking → FAISS embedding
     ai = AIService()
@@ -357,8 +413,9 @@ async def query_vault(payload: VaultQueryRequest, current_user: CurrentUser, db:
     feeds them to the AI as context.  Falls back to recency-based retrieval when
     the user has no FAISS index yet.
     """
-    # Deduct points
+    # Check feature access, then deduct points
     points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="vault_ai_chat", db=db)
     await points_service.deduct(user_id=current_user.id, action="rag_query", db=db)
 
     ai = AIService()

@@ -8,6 +8,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.content import Ebook, Audiobook
+from app.models.subscription import PointCost
 from app.schemas.content import (
     EbookGenerateRequest, EbookResponse, AudiobookGenerateRequest, AudiobookResponse,
     AudiobookVoicesResponse,
@@ -73,18 +74,32 @@ async def generate_outline(payload: EbookOutlineRequest, current_user: CurrentUs
 @router.post("/generate", response_model=EbookGeneratedContent)
 async def generate_ebook(payload: EbookGenerateRequest, current_user: CurrentUser, db: DBSession):
     """Generate eBook content using AI and deduct points. Does NOT save to DB — call POST / to save."""
-    resolved_page_count = payload.page_count
     resolved_size = payload.book_size or "short"
-    if resolved_page_count is None:
-        resolved_page_count = BOOK_SIZE_PAGE_COUNTS.get(resolved_size, 15)
     chapter_range = BOOK_SIZE_CHAPTER_RANGES.get(resolved_size, (3, 5))
 
+    # Calculate page count from actual chapters (~3 pages per chapter)
+    PAGES_PER_CHAPTER = {"short": 3, "medium": 3, "large": 3}
+    num_chapters = len(payload.chapters) if payload.chapters else chapter_range[0]
+    resolved_page_count = payload.page_count
+    if resolved_page_count is None:
+        resolved_page_count = num_chapters * PAGES_PER_CHAPTER.get(resolved_size, 3)
+
     points_service = PointsService()
-    cost = resolved_page_count * 5
+    # Gate medium/large books by plan
+    if resolved_size == "large":
+        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_large", db=db)
+    elif resolved_size == "medium":
+        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_medium", db=db)
+    # Look up per-page cost from DB (seed value = 1 pt/page)
+    pc_result = await db.execute(select(PointCost).where(PointCost.action == "generate_ebook"))
+    pc = pc_result.scalars().first()
+    per_page_cost = pc.cost if pc else 1
+    cost = resolved_page_count * per_page_cost
     await points_service.deduct_custom(
         user_id=current_user.id,
         action="generate_ebook",
         db=db,
+        cost_override=cost,
     )
 
     # Convert structured chapters to flat outline if no legacy outline provided
@@ -138,9 +153,6 @@ async def save_ebook(payload: EbookCreateRequest, current_user: CurrentUser, db:
     )
     db.add(ebook)
 
-    # Award XP
-    current_user.xp = (current_user.xp or 0) + 25
-
     await db.commit()
     await db.refresh(ebook)
     return ebook
@@ -189,6 +201,11 @@ async def download_ebook_pdf(ebook_id: uuid.UUID, current_user: CurrentUser, db:
     if not ebook:
         raise NotFoundException("eBook not found")
 
+    # Check usage + deduct download cost
+    points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_pdf", db=db)
+    await points_service.deduct(user_id=current_user.id, action="ebook_download_pdf", db=db)
+
     pdf_bytes = await run_in_threadpool(generate_pdf, ebook.ebook_json, ebook.title)
     safe_name = urllib.parse.quote(ebook.title, safe="")
     return Response(
@@ -210,6 +227,11 @@ async def download_ebook_doc(ebook_id: uuid.UUID, current_user: CurrentUser, db:
     ebook = result.scalar_one_or_none()
     if not ebook:
         raise NotFoundException("eBook not found")
+
+    # Check usage + deduct download cost
+    points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_docx", db=db)
+    await points_service.deduct(user_id=current_user.id, action="ebook_download_docx", db=db)
 
     docx_bytes = await run_in_threadpool(generate_docx, ebook.ebook_json, ebook.title)
     safe_name = urllib.parse.quote(ebook.title, safe="")
@@ -300,8 +322,9 @@ async def generate_audiobook(
     if not ebook:
         raise NotFoundException("eBook not found")
 
-    # Deduct points
+    # Check feature access, then deduct points
     points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_audio", db=db)
     await points_service.deduct(user_id=current_user.id, action="generate_audiobook", db=db)
 
     ai = AIService()

@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     GOOGLE_GEMINI_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
+    ANTHROPIC_API_KEY: str = ""
     AI_PRIMARY_MODEL: str = "gemini-2.5-flash"
     AI_FALLBACK_MODEL: str = "gpt-4o-mini"
 

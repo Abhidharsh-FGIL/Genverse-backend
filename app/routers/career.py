@@ -46,6 +46,11 @@ async def get_career_profile(
     workspace_tag = org_id or "personal"
     cache_key = f"career-profile:{current_user.id}:{workspace_tag}"
 
+    # Only deduct 1 point on explicit refresh, not on normal page view
+    if force_refresh:
+        points_service = PointsService()
+        await points_service.deduct(user_id=current_user.id, action="view_career_profile", db=db)
+
     if not force_refresh:
         try:
             result = await db.execute(
@@ -98,10 +103,11 @@ async def analyze_career(
     db: DBSession,
     org_id: str | None = Query(None),
 ):
-    """Run career compatibility analysis using AI. Cost: 8 pts."""
+    """Run career compatibility analysis using AI. Cost: 2 pts."""
     parsed_oid = _parse_org_id(org_id)
 
     points_service = PointsService()
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="career_guidance", db=db)
     await points_service.deduct(user_id=current_user.id, action="career_guidance", db=db)
 
     ai = AIService()
@@ -121,7 +127,7 @@ async def analyze_career(
         target_careers=payload.target_careers,
         analysis_json=analysis,
         compatibility_scores=analysis.get("compatibility_scores"),
-        points_used=8,
+        points_used=2,
     )
     db.add(session)
     await db.commit()
