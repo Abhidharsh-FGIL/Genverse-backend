@@ -21,6 +21,7 @@ class StorageService:
         "audio-responses": "audio-responses",
         "past-papers": "past-papers",
         "chat-attachments": "chat-attachments",
+        "public-library": "public-library",
     }
 
     def _get_bucket_path(self, bucket: str) -> Path:

@@ -48,6 +48,7 @@ from app.models.content import (
     VideoProject,
     PastPaper,
 )
+from app.models.public_library import PublicFolder, PublicFile, PublicFileChunk
 from app.models.gamification import Badge, StudentBadge, Title, StudentTitle
 from app.models.insights import UserInsight, InsightArticle, CareerGuidanceSession, Recommendation
 from app.models.communication import GroupChat, GroupChatMessage, ChatReadReceipt
@@ -78,4 +79,5 @@ __all__ = [
     "GroupChat", "GroupChatMessage", "ChatReadReceipt",
     "AiChat", "AiChatMessage", "AiChatSetting", "AiContextSession",
     "AiInteractionHistory", "IntelligenceCache",
+    "PublicFolder", "PublicFile", "PublicFileChunk",
 ]
