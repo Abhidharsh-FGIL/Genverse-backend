@@ -29,7 +29,7 @@ async def get_current_user(
     if not user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload",
+            detail="Your session is invalid. Please sign in again.",
         )
     result = await db.execute(
         select(User).options(selectinload(User.roles)).where(User.id == user_id)
@@ -38,7 +38,7 @@ async def get_current_user(
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
+            detail="Your account could not be found. Please sign in again.",
         )
     return user
 

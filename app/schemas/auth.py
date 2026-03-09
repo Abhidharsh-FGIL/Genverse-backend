@@ -7,6 +7,7 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str
     role: str = "normal_user"  # normal_user | teacher | student | guardian
+    otp: str  # 6-digit OTP from email verification
 
     @field_validator("password")
     @classmethod
@@ -41,6 +42,7 @@ class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+    is_new_user: bool = False
 
 
 class RefreshTokenRequest(BaseModel):
@@ -49,18 +51,24 @@ class RefreshTokenRequest(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+    frontend_url: str = ""  # optional: frontend sends its origin so the reset link is correct
 
 
 class ResetPasswordRequest(BaseModel):
     token: str
-    new_password: str
+    password: str
 
-    @field_validator("new_password")
+    @field_validator("password")
     @classmethod
     def validate_password(cls, v: str) -> str:
         if len(v) < 8:
             raise ValueError("Password must be at least 8 characters")
         return v
+
+
+class GoogleLoginRequest(BaseModel):
+    token: str
+    auto_signup: bool = False
 
 
 class ChangePasswordRequest(BaseModel):
@@ -73,3 +81,12 @@ class ChangePasswordRequest(BaseModel):
         if len(v) < 8:
             raise ValueError("Password must be at least 8 characters")
         return v
+
+
+class SendOtpRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyOtpRequest(BaseModel):
+    email: EmailStr
+    otp: str

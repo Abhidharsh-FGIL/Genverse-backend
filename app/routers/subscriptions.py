@@ -1,9 +1,12 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, status, Query
+from pydantic import BaseModel
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import stripe
+from app.config import settings
 from app.dependencies import DBSession, CurrentUser, OptionalCurrentUser
 from app.models.subscription import (
     Subscription,
@@ -172,12 +175,37 @@ async def upgrade_plan(
     if not plan:
         raise NotFoundException("Plan not found")
 
+    old_balance = sub.points_balance
+    is_downgrade_to_free = payload.plan == "free"
+
     sub.plan = payload.plan
     sub.status = "active"
     sub.points_monthly_quota = plan.monthly_points
-    sub.points_balance = plan.monthly_points
     sub.storage_limit_mb = plan.storage_mb
     sub.max_seats = plan.max_seats
+
+    if is_downgrade_to_free:
+        # Downgrade to free: keep existing balance, don't add 100 again
+        sub.points_balance = old_balance
+        sub.current_period_start = None
+        sub.current_period_end = None
+    else:
+        # Upgrade: carry over existing points + add new plan's monthly quota
+        sub.points_balance = old_balance + plan.monthly_points
+        now = datetime.now(timezone.utc)
+        sub.current_period_start = now
+        sub.current_period_end = now + timedelta(days=30)
+
+        # Record the plan upgrade as a point transaction (credit)
+        txn = PointTransaction(
+            subscription_id=sub.id,
+            user_id=current_user.id,
+            action=f"plan_upgrade_{payload.plan}",
+            points_used=-plan.monthly_points,  # negative = credit
+            balance_after=sub.points_balance,
+        )
+        db.add(txn)
+
     await db.commit()
     return {"message": "Plan upgraded", "plan": payload.plan}
 
@@ -194,7 +222,7 @@ async def deduct_points(
     )
     point_cost = cost_result.scalars().first()
     if not point_cost:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown action")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This action is not recognized. Please try again or contact support.")
 
     sub = await _get_active_subscription(
         db, current_user.id, uuid.UUID(org_id) if org_id else None
@@ -261,7 +289,7 @@ async def buy_addon(
 
     points_to_add = ADDON_POINT_MAP.get(payload.addon_type)
     if not points_to_add:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown addon type")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This point pack is not available. Please select a valid option.")
 
     total_points = points_to_add * payload.quantity
     addon = SubscriptionAddon(
@@ -277,3 +305,94 @@ async def buy_addon(
     return sub
 
 
+class ToggleAutoRenewRequest(BaseModel):
+    auto_renew: bool
+
+
+@router.post("/auto-renew")
+async def toggle_auto_renew(
+    payload: ToggleAutoRenewRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
+    """Enable or disable auto-renewal for the current subscription."""
+    sub = await _get_active_subscription(
+        db, current_user.id, uuid.UUID(org_id) if org_id else None
+    )
+    if not sub:
+        raise NoSubscriptionException()
+    if sub.plan == "free":
+        raise HTTPException(status_code=400, detail="Free plan does not support auto-renewal")
+
+    sub.auto_renew = payload.auto_renew
+
+    # If disabling auto-renew, cancel the recurring subscription on the payment gateway
+    if not payload.auto_renew:
+        if sub.stripe_subscription_id:
+            try:
+                stripe.api_key = settings.STRIPE_API_KEY
+                stripe.Subscription.modify(
+                    sub.stripe_subscription_id,
+                    cancel_at_period_end=True,
+                )
+            except Exception as e:
+                print(f"[Subscription] Failed to update Stripe subscription: {e}", flush=True)
+
+        if sub.phonepe_subscription_id:
+            try:
+                from app.routers.payments import _cancel_phonepe_subscription
+                await _cancel_phonepe_subscription(sub.phonepe_subscription_id)
+                sub.phonepe_subscription_id = None  # Clear mandate reference
+            except Exception as e:
+                print(f"[Subscription] Failed to cancel PhonePe subscription: {e}", flush=True)
+
+    # If re-enabling auto-renew for Stripe, resume the subscription
+    if payload.auto_renew and sub.stripe_subscription_id:
+        try:
+            stripe.api_key = settings.STRIPE_API_KEY
+            stripe.Subscription.modify(
+                sub.stripe_subscription_id,
+                cancel_at_period_end=False,
+            )
+        except Exception as e:
+            print(f"[Subscription] Failed to resume Stripe subscription: {e}", flush=True)
+
+    await db.commit()
+    return {
+        "auto_renew": sub.auto_renew,
+        "message": f"Auto-renewal {'enabled' if sub.auto_renew else 'disabled'}. "
+                   + ("Your plan will continue until the end of the billing period." if not payload.auto_renew else ""),
+    }
+
+
+@router.get("/billing")
+async def get_billing_info(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
+    """Get billing information including next billing date and auto-renewal status."""
+    sub = await _get_active_subscription(
+        db, current_user.id, uuid.UUID(org_id) if org_id else None
+    )
+    if not sub:
+        raise NoSubscriptionException()
+
+    # Get plan display name
+    plan_result = await db.execute(
+        select(PlanDefinition).where(PlanDefinition.plan == sub.plan)
+    )
+    plan_def = plan_result.scalar_one_or_none()
+
+    return {
+        "plan": sub.plan,
+        "plan_display_name": plan_def.display_name if plan_def else sub.plan,
+        "price_inr": plan_def.price_inr if plan_def else 0,
+        "status": sub.status,
+        "auto_renew": sub.auto_renew,
+        "payment_gateway": sub.payment_gateway,
+        "current_period_start": sub.current_period_start.isoformat() if sub.current_period_start else None,
+        "current_period_end": sub.current_period_end.isoformat() if sub.current_period_end else None,
+        "next_billing_date": sub.current_period_end.isoformat() if sub.current_period_end and sub.auto_renew else None,
+    }

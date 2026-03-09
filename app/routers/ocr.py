@@ -40,7 +40,7 @@ async def extract_text(
     if file.content_type not in allowed_types:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail="Unsupported file type for OCR",
+            detail="This file type is not supported for OCR. Please upload a PDF, JPEG, PNG, GIF, or WebP file.",
         )
 
     # Check usage limits and deduct points (cost=3, xp=3 from seed)

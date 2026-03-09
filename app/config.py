@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
+    # Google OAuth
+    GOOGLE_CLIENT_ID: str = "314078026446-sovdc3nrc2sg6rbv1mns1c2f2a08r3tp.apps.googleusercontent.com"
+
     # AI Providers
     GOOGLE_GEMINI_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
@@ -81,8 +84,25 @@ class Settings(BaseSettings):
     MAIL_STARTTLS: bool = True
     MAIL_SSL_TLS: bool = False
 
-    # Frontend
+    # Payment Gateways — PhonePe Standard Checkout v2
+    PHONEPE_CLIENT_ID: str = ""
+    PHONEPE_CLIENT_SECRET: str = ""
+    PHONEPE_CLIENT_VERSION: int = 1
+    PHONEPE_ENV: str = "SANDBOX"  # SANDBOX or PRODUCTION
+
+    # Stripe (international cards)
+    STRIPE_API_KEY: str = ""
+    STRIPE_ENDPOINT_SECRET: str = ""
+
+    @property
+    def phonepe_base_url(self) -> str:
+        if self.PHONEPE_ENV == "PRODUCTION":
+            return "https://api.phonepe.com/apis/pg"
+        return "https://api-preprod.phonepe.com/apis/pg-sandbox"
+
+    # Frontend / Backend URLs
     FRONTEND_URL: str = "http://localhost:8080"
+    BACKEND_URL: str = "http://localhost:8000"
 
     # CORS
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:3000"

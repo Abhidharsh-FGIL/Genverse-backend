@@ -36,6 +36,11 @@ async def update_profile(payload: UserUpdate, current_user: CurrentUser, db: DBS
 
     for key, value in update_data.items():
         setattr(current_user, key, value)
+
+    # If role was updated during onboarding, mark onboarding as complete
+    # (takes priority over any explicit onboarding_completed value in the payload)
+    if new_role and not current_user.onboarding_completed:
+        current_user.onboarding_completed = True
     await db.commit()
     # Reload with roles so the role property is accessible
     result = await db.execute(

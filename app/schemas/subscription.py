@@ -18,6 +18,8 @@ class SubscriptionResponse(BaseModel):
     trial_ends_at: Optional[datetime] = None
     current_period_start: Optional[datetime] = None
     current_period_end: Optional[datetime] = None
+    auto_renew: bool = False
+    payment_gateway: Optional[str] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -93,6 +95,7 @@ class AddonResponse(BaseModel):
     subscription_id: uuid.UUID
     addon_type: str
     quantity: int
+    points_added: int = 0
     purchased_at: datetime
     expires_at: Optional[datetime] = None
 

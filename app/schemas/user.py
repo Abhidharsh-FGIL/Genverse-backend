@@ -26,6 +26,7 @@ class UserUpdate(BaseModel):
     language: Optional[str] = None
     subjects: Optional[List[str]] = None
     role: Optional[str] = None
+    onboarding_completed: Optional[bool] = None
 
     @field_validator("role")
     @classmethod
@@ -44,6 +45,7 @@ class UserResponse(UserBase):
     xp: int
     streak: int
     is_active: bool
+    onboarding_completed: bool = True
     last_login_date: Optional[datetime] = None
     created_at: datetime
 

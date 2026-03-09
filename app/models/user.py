@@ -34,6 +34,8 @@ class User(Base):
     xp: Mapped[int] = mapped_column(Integer, default=0)
     streak: Mapped[int] = mapped_column(Integer, default=0)
     last_login_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    auth_provider: Mapped[str] = mapped_column(String(20), default="email")  # "email" or "google"
+    onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -58,6 +60,32 @@ class User(Base):
     ai_chats: Mapped[list["AiChat"]] = relationship(back_populates="user", cascade="all, delete-orphan")  # noqa: F821
     library_items: Mapped[list["UserLibraryItem"]] = relationship(back_populates="user", cascade="all, delete-orphan")  # noqa: F821
     subscriptions: Mapped[list["Subscription"]] = relationship(back_populates="user")  # noqa: F821
+
+
+class EmailVerification(Base):
+    __tablename__ = "email_verifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    otp_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class UserRole(Base):

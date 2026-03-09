@@ -28,6 +28,7 @@ from app.routers import (
     announcements,
     analytics,
     audio,
+    payments,
 )
 
 _API = "/api/v1"
@@ -61,6 +62,7 @@ _ROUTES = [
     (announcements.router,   "/announcements",    ["Announcements"]),
     (analytics.router,       "/analytics",        ["Analytics"]),
     (audio.router,           "/audio",            ["Audio QA"]),
+    (payments.router,        "/payments",         ["Payments"]),
 ]
 
 

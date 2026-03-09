@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 import os
 
 from fastapi import FastAPI
@@ -8,13 +9,17 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import close_db, run_migrations
 from app.routers import register_routers
+from app.services.renewal_scheduler import run_renewal_scheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(settings.STORAGE_ROOT, exist_ok=True)
     await run_migrations()
+    # Start background renewal scheduler
+    renewal_task = asyncio.create_task(run_renewal_scheduler())
     yield
+    renewal_task.cancel()
     await close_db()
 
 

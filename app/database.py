@@ -132,6 +132,16 @@ async def run_migrations() -> None:
                 "ALTER TABLE plan_definitions ADD COLUMN max_file_size_mb INTEGER DEFAULT 5"
             ))
 
+        # Add phonepe_subscription_id to subscriptions if missing
+        ppsid_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'subscriptions' AND column_name = 'phonepe_subscription_id'"
+        ))
+        if not ppsid_exists.scalar():
+            await conn.execute(text(
+                "ALTER TABLE subscriptions ADD COLUMN phonepe_subscription_id VARCHAR(255)"
+            ))
+
 
 async def close_db() -> None:
     await engine.dispose()
