@@ -533,7 +533,10 @@ async def _fulfil_purchase(
 @router.post("/checkout", response_model=CheckoutResponse)
 async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, db: DBSession):
     """Create a checkout session for PhonePe or Stripe."""
-    merchant_order_id = f"{current_user.id}_{payload.item_id}_{int(datetime.now(timezone.utc).timestamp())}"
+    # PhonePe merchantOrderId max = 63 chars. Use short UUID hex (no dashes) to save space.
+    short_uid = str(current_user.id).replace("-", "")[:16]
+    ts = int(datetime.now(timezone.utc).timestamp())
+    merchant_order_id = f"{short_uid}_{payload.item_id}_{ts}"
 
     if payload.gateway == "phonepe":
         if not settings.PHONEPE_CLIENT_ID:
@@ -843,6 +846,17 @@ async def stripe_webhook(request: Request, db: DBSession):
                     stripe_subscription_id=subscription_id,
                     is_renewal=True,
                 )
+                from app.services.notification_service import create_notification
+                from app.models.notification import NotificationType
+                await create_notification(
+                    db, user_id=user_id,
+                    notification_type=NotificationType.PAYMENT_SUCCESS,
+                    title="Payment Successful",
+                    body=f"Your {item_id.replace('_', ' ').title()} plan has been renewed successfully.",
+                    icon="check-circle-2", priority="normal",
+                    data_json={"plan": item_id, "link": "/u/plans"},
+                )
+                await db.commit()
 
     elif event_type == "customer.subscription.deleted":
         # Subscription cancelled or expired
@@ -888,6 +902,16 @@ async def stripe_webhook(request: Request, db: DBSession):
                         balance_after=sub.points_balance,
                     )
                     db.add(txn)
+                    from app.services.notification_service import create_notification
+                    from app.models.notification import NotificationType
+                    await create_notification(
+                        db, user_id=user_id,
+                        notification_type=NotificationType.PAYMENT_FAILURE,
+                        title="Payment Failed",
+                        body=f"Your plan renewal payment failed. Please update your payment method to avoid service interruption.",
+                        icon="alert-circle", priority="high",
+                        data_json={"plan": sub.plan, "link": "/u/plans"},
+                    )
                     await db.commit()
                     print(f"[Stripe Webhook] Recorded renewal failure for user {user_id}", flush=True)
 
@@ -941,6 +965,17 @@ async def phonepe_recurring_webhook(request: Request, db: DBSession):
             phonepe_subscription_id=merchant_sub_id,
             is_renewal=True,
         )
+        from app.services.notification_service import create_notification
+        from app.models.notification import NotificationType
+        await create_notification(
+            db, user_id=sub.user_id,
+            notification_type=NotificationType.PAYMENT_SUCCESS,
+            title="Payment Successful",
+            body=f"Your {sub.plan.replace('_', ' ').title()} plan has been renewed successfully.",
+            icon="check-circle-2",
+            data_json={"plan": sub.plan, "link": "/u/plans"},
+        )
+        await db.commit()
         return {"status": "ok"}
 
     elif state in ("FAILED", "DECLINED"):
@@ -953,6 +988,16 @@ async def phonepe_recurring_webhook(request: Request, db: DBSession):
             balance_after=sub.points_balance,
         )
         db.add(txn)
+        from app.services.notification_service import create_notification as _create_notif
+        from app.models.notification import NotificationType as _NT
+        await _create_notif(
+            db, user_id=sub.user_id,
+            notification_type=_NT.PAYMENT_FAILURE,
+            title="Payment Failed",
+            body=f"Your plan renewal payment failed. Please update your payment method.",
+            icon="alert-circle", priority="high",
+            data_json={"plan": sub.plan, "link": "/u/plans"},
+        )
         await db.commit()
         return {"status": "ok"}
 

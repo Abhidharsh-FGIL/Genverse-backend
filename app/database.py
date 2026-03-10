@@ -132,6 +132,35 @@ async def run_migrations() -> None:
                 "ALTER TABLE plan_definitions ADD COLUMN max_file_size_mb INTEGER DEFAULT 5"
             ))
 
+        # Create notifications table if it doesn't exist
+        notif_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'notifications'"
+        ))
+        if not notif_exists.scalar():
+            await conn.execute(text("""
+                CREATE TABLE notifications (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                    org_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
+                    notification_type VARCHAR(50) NOT NULL,
+                    category VARCHAR(30) NOT NULL DEFAULT 'system',
+                    title VARCHAR(500) NOT NULL,
+                    body TEXT NOT NULL,
+                    data_json JSONB,
+                    icon VARCHAR(50),
+                    priority VARCHAR(10) NOT NULL DEFAULT 'normal',
+                    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_dismissed BOOLEAN NOT NULL DEFAULT FALSE,
+                    expires_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX idx_notif_user ON notifications(user_id)"))
+            await conn.execute(text("CREATE INDEX idx_notif_user_unread ON notifications(user_id, is_read, is_dismissed)"))
+            await conn.execute(text("CREATE INDEX idx_notif_user_created ON notifications(user_id, created_at DESC)"))
+            await conn.execute(text("CREATE INDEX idx_notif_type ON notifications(notification_type)"))
+            await conn.execute(text("CREATE INDEX idx_notif_expires ON notifications(expires_at)"))
+
         # Add phonepe_subscription_id to subscriptions if missing
         ppsid_exists = await conn.execute(text(
             "SELECT 1 FROM information_schema.columns "

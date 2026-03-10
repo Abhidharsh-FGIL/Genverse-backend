@@ -20,6 +20,8 @@ from app.database import AsyncSessionLocal
 from app.models.subscription import Subscription, PlanDefinition, PointTransaction
 from app.models.user import User
 from app.services.email_service import send_renewal_reminder
+from app.services.notification_service import create_notification
+from app.models.notification import NotificationType
 from app.config import settings
 
 
@@ -193,6 +195,20 @@ async def _check_renewals():
                 balance_after=sub.points_balance,
             )
             db.add(txn)
+
+            # In-app notification for plan expiry
+            await create_notification(
+                db,
+                user_id=sub.user_id,
+                notification_type=NotificationType.PLAN_EXPIRED,
+                title="Your plan has expired",
+                body=f"Your {old_plan.replace('_', ' ').title()} plan has expired. Renew to keep using premium features.",
+                icon="credit-card",
+                org_id=sub.org_id,
+                data_json={"plan": old_plan, "link": "/u/plans"},
+                priority="high",
+            )
+
             print(f"[RenewalScheduler] Expired subscription {sub.id} (plan: {old_plan})", flush=True)
 
         await db.commit()

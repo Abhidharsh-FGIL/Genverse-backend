@@ -3,8 +3,10 @@ from fastapi import APIRouter, status, Query
 from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
-from app.models.classes import Announcement, AnnouncementComment
+from app.models.classes import Announcement, AnnouncementComment, ClassStudent
 from app.models.user import User
+from app.models.notification import NotificationType
+from app.services.notification_service import create_notification_for_many
 from app.schemas.classes import (
     AnnouncementCreate, AnnouncementResponse, CommentCreate, CommentResponse
 )
@@ -24,6 +26,22 @@ async def create_announcement(payload: AnnouncementCreate, current_user: Current
     db.add(announcement)
     await db.commit()
     await db.refresh(announcement)
+
+    # Notify class students about the announcement
+    student_rows = (await db.execute(
+        select(ClassStudent.student_id).where(ClassStudent.class_id == announcement.class_id)
+    )).scalars().all()
+    if student_rows:
+        await create_notification_for_many(
+            db,
+            user_ids=list(student_rows),
+            notification_type=NotificationType.NEW_ANNOUNCEMENT,
+            title="New Announcement",
+            body=payload.content[:200] + ("…" if len(payload.content) > 200 else ""),
+            icon="megaphone",
+            data_json={"class_id": str(announcement.class_id), "link": f"/student/classes/{announcement.class_id}"},
+        )
+        await db.commit()
 
     r = AnnouncementResponse.model_validate(announcement)
     r.author_name = current_user.name

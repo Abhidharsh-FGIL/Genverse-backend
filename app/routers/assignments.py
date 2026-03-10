@@ -7,6 +7,9 @@ from app.models.classes import Assignment, Class
 from app.schemas.classes import AssignmentCreate, AssignmentUpdate, AssignmentResponse, SuggestQuestionsRequest
 from app.core.exceptions import NotFoundException, ForbiddenException
 from app.services.ai_service import AIService
+from app.models.classes import ClassStudent
+from app.models.notification import NotificationType
+from app.services.notification_service import create_notification_for_many
 
 router = APIRouter()
 
@@ -35,6 +38,28 @@ async def create_assignment(payload: AssignmentCreate, current_user: CurrentUser
     db.add(assignment)
     await db.commit()
     await db.refresh(assignment)
+
+    # Notify students about the new assignment
+    if payload.target_student_ids:
+        student_ids = [uuid.UUID(sid) for sid in payload.target_student_ids]
+    else:
+        rows = (await db.execute(
+            select(ClassStudent.student_id).where(ClassStudent.class_id == assignment.class_id)
+        )).scalars().all()
+        student_ids = list(rows)
+    if student_ids:
+        await create_notification_for_many(
+            db,
+            user_ids=student_ids,
+            notification_type=NotificationType.ASSIGNMENT_POSTED,
+            title=f"New Assignment: {assignment.title}",
+            body=f"A new assignment has been posted in {class_.name}.",
+            icon="file-text",
+            org_id=class_.org_id if hasattr(class_, 'org_id') else None,
+            data_json={"assignment_id": str(assignment.id), "class_id": str(class_.id), "link": f"/student/classes/{class_.id}"},
+        )
+        await db.commit()
+
     return assignment
 
 

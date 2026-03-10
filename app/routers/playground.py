@@ -15,6 +15,13 @@ router = APIRouter()
 
 VALID_MODES = {"experiment", "play", "challenge", "imagine"}
 
+
+def _resolve_role_grade(payload, current_user) -> tuple[str, int | None]:
+    """Use the authenticated user's profile role & grade when the frontend sends defaults/nulls."""
+    role = current_user.role or payload.role
+    grade = payload.grade if payload.grade is not None else getattr(current_user, "grade", None)
+    return role, grade
+
 # Map playground mode → feature_key for plan gating
 MODE_FEATURE_KEY = {
     "experiment": "playground_rapid_mcq",
@@ -238,8 +245,9 @@ async def playground_match_pairs(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5,
     )
+    role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
-    pairs = await ai.playground_match_pairs(payload.topic, payload.role, payload.grade)
+    pairs = await ai.playground_match_pairs(payload.topic, role, grade)
     return {"pairs": pairs, "topic": payload.topic}
 
 
@@ -255,8 +263,9 @@ async def playground_swipe_facts(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5,
     )
+    role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
-    facts = await ai.playground_swipe_facts(payload.topic, payload.role, payload.grade)
+    facts = await ai.playground_swipe_facts(payload.topic, role, grade)
     return {"facts": facts, "topic": payload.topic}
 
 
@@ -273,8 +282,9 @@ async def playground_speed_quiz(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5,
     )
+    role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
-    result = await ai.playground_speed_quiz(payload.topic, payload.role, payload.grade)
+    result = await ai.playground_speed_quiz(payload.topic, role, grade)
     return {"questions": result.get("questions", []),
             "challenger": result.get("challenger", {}),
             "topic": payload.topic}
@@ -293,8 +303,9 @@ async def playground_roleplay(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5,
     )
+    role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
-    scenario = await ai.playground_roleplay(payload.topic, payload.role, payload.grade)
+    scenario = await ai.playground_roleplay(payload.topic, role, grade)
     return {"scenario": scenario, "topic": payload.topic}
 
 
@@ -311,8 +322,9 @@ async def playground_imagine(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5,
     )
+    role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
-    scenario = await ai.playground_imagine(payload.topic, payload.role, payload.grade)
+    scenario = await ai.playground_imagine(payload.topic, role, grade)
     return {"scenario": scenario, "topic": payload.topic}
 
 
@@ -327,9 +339,10 @@ async def playground_imagine_evaluate(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5,
     )
+    role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
     evaluation = await ai.playground_imagine_evaluate(
         payload.topic, payload.question, payload.answer,
-        payload.max_points, payload.role, payload.grade
+        payload.max_points, role, grade
     )
     return {"evaluation": evaluation}

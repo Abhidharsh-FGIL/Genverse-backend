@@ -51,6 +51,7 @@ from app.models.content import (
 from app.models.public_library import PublicFolder, PublicFile, PublicFileChunk
 from app.models.gamification import Badge, StudentBadge, Title, StudentTitle
 from app.models.insights import UserInsight, InsightArticle, CareerGuidanceSession, Recommendation
+from app.models.notification import Notification, NotificationType
 from app.models.communication import GroupChat, GroupChatMessage, ChatReadReceipt
 from app.models.ai import (
     AiChat,
@@ -76,6 +77,7 @@ __all__ = [
     "UserLibraryItem", "DocChunk", "Ebook", "Audiobook", "MindMap", "VideoProject", "PastPaper",
     "Badge", "StudentBadge", "Title", "StudentTitle",
     "UserInsight", "InsightArticle", "CareerGuidanceSession", "Recommendation",
+    "Notification", "NotificationType",
     "GroupChat", "GroupChatMessage", "ChatReadReceipt",
     "AiChat", "AiChatMessage", "AiChatSetting", "AiContextSession",
     "AiInteractionHistory", "IntelligenceCache",

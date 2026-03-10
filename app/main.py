@@ -10,16 +10,19 @@ from app.config import settings
 from app.database import close_db, run_migrations
 from app.routers import register_routers
 from app.services.renewal_scheduler import run_renewal_scheduler
+from app.services.notification_scheduler import run_notification_scheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(settings.STORAGE_ROOT, exist_ok=True)
     await run_migrations()
-    # Start background renewal scheduler
+    # Start background schedulers
     renewal_task = asyncio.create_task(run_renewal_scheduler())
+    notification_task = asyncio.create_task(run_notification_scheduler())
     yield
     renewal_task.cancel()
+    notification_task.cancel()
     await close_db()
 
 

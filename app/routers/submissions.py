@@ -8,6 +8,8 @@ from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.classes import Submission, Assignment
+from app.models.notification import NotificationType
+from app.services.notification_service import create_notification
 from app.schemas.classes import (
     SubmissionCreate, SubmissionGradeRequest, SubmissionResponse, AutoGradeRequest
 )
@@ -160,6 +162,18 @@ async def patch_submission(
     if payload.remediation_plan is not None:
         submission.remediation_plan = payload.remediation_plan
 
+    # Notify student when graded
+    if payload.grade is not None:
+        await create_notification(
+            db,
+            user_id=submission.student_id,
+            notification_type=NotificationType.SUBMISSION_GRADED,
+            title="Submission Graded",
+            body=f"Your submission has been graded by your teacher.",
+            icon="check-circle-2",
+            data_json={"submission_id": str(submission.id), "link": f"/student/assignments"},
+        )
+
     await db.commit()
     await db.refresh(submission)
     return submission
@@ -182,6 +196,17 @@ async def grade_submission(
     submission.graded_by = current_user.id
     submission.graded_at = datetime.now(timezone.utc)
     submission.status = "returned" if payload.return_to_student else "graded"
+
+    await create_notification(
+        db,
+        user_id=submission.student_id,
+        notification_type=NotificationType.SUBMISSION_GRADED,
+        title="Submission Graded",
+        body=f"Your submission has been graded and {'returned' if payload.return_to_student else 'marked'}.",
+        icon="check-circle-2",
+        data_json={"submission_id": str(submission.id), "link": f"/student/assignments"},
+    )
+
     await db.commit()
     await db.refresh(submission)
     return submission

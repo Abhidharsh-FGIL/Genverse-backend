@@ -30,6 +30,7 @@ from app.routers import (
     audio,
     payments,
     public_library,
+    notifications,
 )
 
 _API = "/api/v1"
@@ -65,6 +66,7 @@ _ROUTES = [
     (audio.router,           "/audio",            ["Audio QA"]),
     (payments.router,        "/payments",         ["Payments"]),
     (public_library.router,  "/public-library",   ["Public Library"]),
+    (notifications.router,   "/notifications",    ["Notifications"]),
 ]
 
 
