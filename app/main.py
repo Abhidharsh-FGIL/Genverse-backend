@@ -50,10 +50,16 @@ app.add_middleware(
 )
 
 @app.middleware("http")
-async def strip_trailing_slash(request: Request, call_next):
-    """Strip trailing slashes so /folders/ hits the /folders route."""
-    if request.url.path != "/" and request.url.path.endswith("/"):
-        request.scope["path"] = request.url.path.rstrip("/")
+async def normalize_path(request: Request, call_next):
+    """Normalize request paths: strip trailing slashes and fix double /api prefix."""
+    path = request.scope.get("path", "")
+    # Fix double /api prefix (e.g. /api/api/v1/... → /api/v1/...)
+    if path.startswith("/api/api/"):
+        path = path.replace("/api/api/", "/api/", 1)
+    # Strip trailing slashes
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    request.scope["path"] = path
     return await call_next(request)
 
 if os.path.exists(settings.STORAGE_ROOT):
