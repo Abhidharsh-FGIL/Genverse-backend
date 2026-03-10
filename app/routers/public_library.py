@@ -154,6 +154,7 @@ async def get_folder(
                 "subject": f.subject,
                 "file_type": f.file_type,
                 "file_size_mb": f.file_size_mb,
+                "storage_path": f.storage_path,
                 "is_processed": f.is_processed,
                 "created_at": f.created_at.isoformat() if f.created_at else None,
             }
@@ -397,3 +398,21 @@ async def search_public_library(
         })
 
     return {"results": results}
+
+
+# ── Signed URL (no auth) ────────────────────────────────────────────────────
+
+@router.get("/signed-url/")
+async def get_signed_url(
+    path: str = Query(..., description="Absolute storage path of the file"),
+):
+    """Convert an absolute storage path to a serving URL (no auth required)."""
+    from pathlib import Path as _Path
+    try:
+        storage_root = _Path(settings.STORAGE_ROOT).resolve()
+        abs_path = _Path(path).resolve()
+        rel = abs_path.relative_to(storage_root)
+        url = f"/uploads/{rel.as_posix()}"
+    except Exception:
+        url = None
+    return {"url": url}
