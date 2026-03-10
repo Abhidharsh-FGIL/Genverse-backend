@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -29,6 +29,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
+    redirect_slashes=False,
     description=(
         "Genverse.ai Backend API — AI-first EdTech platform providing "
         "multi-tenant educational management, AI-driven content generation, "
@@ -47,6 +48,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def strip_trailing_slash(request: Request, call_next):
+    """Strip trailing slashes so /folders/ hits the /folders route."""
+    if request.url.path != "/" and request.url.path.endswith("/"):
+        request.scope["path"] = request.url.path.rstrip("/")
+    return await call_next(request)
 
 if os.path.exists(settings.STORAGE_ROOT):
     app.mount("/uploads", StaticFiles(directory=settings.STORAGE_ROOT), name="uploads")
