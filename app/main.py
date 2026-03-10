@@ -29,7 +29,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    redirect_slashes=False,
     description=(
         "Genverse.ai Backend API — AI-first EdTech platform providing "
         "multi-tenant educational management, AI-driven content generation, "
