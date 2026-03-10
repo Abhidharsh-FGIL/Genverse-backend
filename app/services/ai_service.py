@@ -2300,14 +2300,16 @@ Return a JSON object with a "questions" array. Each question must follow this sc
 - type: one of "mcq", "fill-blank", "short-answer", "true-false", "match"
 - text: the question text
 - points: integer (2 for fill-blank/true-false, 5 for mcq/short-answer, 10 for match)
-- For MCQ: include "options" (array of 4 strings) and "correctAnswer" (index 0-3 as number)
-- For fill-blank: include "correctAnswer" as a string
+- For MCQ: include "options" (array of 4 strings), "correctAnswer" (index 0-3 as number), and "explanation" (1-2 sentences explaining why the correct answer is right)
+- For fill-blank: include "correctAnswer" as a string and "explanation" (1-2 sentences explaining the answer)
 - For true-false: include "correctAnswer" as "true" or "false"
 - For match: include "matchPairs" as array of {{"left": "...", "right": "..."}} (4-5 pairs)
 - For short-answer: no extra fields needed
 
+The "explanation" field is REQUIRED for MCQ and fill-blank questions. It helps students understand why the answer is correct.
+
 Return ONLY valid JSON, no markdown.
-Example: {{"questions": [{{"type": "mcq", "text": "...", "options": ["A","B","C","D"], "correctAnswer": 0, "points": 5}}]}}
+Example: {{"questions": [{{"type": "mcq", "text": "...", "options": ["A","B","C","D"], "correctAnswer": 0, "points": 5, "explanation": "Tuple is immutable because..."}}]}}
 """
         try:
             response = await self.chat([{"role": "user", "content": prompt}])
