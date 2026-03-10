@@ -69,7 +69,7 @@ class Settings(BaseSettings):
 
     # Storage
     STORAGE_ROOT: str = "./uploads"
-    MAX_UPLOAD_SIZE_MB: int = 50
+    MAX_UPLOAD_SIZE_MB: int = 150
 
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"

@@ -75,7 +75,7 @@ OPENAI_API_KEY=<your-openai-api-key>       # optional fallback
 
 # --- Storage ---
 STORAGE_ROOT=./uploads
-MAX_UPLOAD_SIZE_MB=50
+MAX_UPLOAD_SIZE_MB=150
 
 # --- CORS (comma-separated origins of your React frontend) ---
 CORS_ORIGINS=http://localhost:5173,http://localhost:3000
