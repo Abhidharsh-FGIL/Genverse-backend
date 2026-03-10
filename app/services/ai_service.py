@@ -1057,9 +1057,14 @@ Answer:"""
 
         # ── Source instruction ───────────────────────────────────────────────
         if source_text and source_text.strip():
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "Assessment prompt: using source_text (%d chars, truncating to 12000)",
+                len(source_text),
+            )
             source_section = (
                 "SOURCE TEXT (generate questions ONLY from this content, do not use outside knowledge):\n"
-                f"---\n{source_text[:5000]}\n---"
+                f"---\n{source_text[:12000]}\n---"
             )
         else:
             source_section = f"Generate questions based on your educational knowledge of: {topics_str}"

@@ -132,6 +132,16 @@ async def run_migrations() -> None:
                 "ALTER TABLE plan_definitions ADD COLUMN max_file_size_mb INTEGER DEFAULT 5"
             ))
 
+        # Add chunks_embedded to public_files if missing
+        ce_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'public_files' AND column_name = 'chunks_embedded'"
+        ))
+        if not ce_exists.scalar():
+            await conn.execute(text(
+                "ALTER TABLE public_files ADD COLUMN chunks_embedded INTEGER DEFAULT 0"
+            ))
+
         # Add phonepe_subscription_id to subscriptions if missing
         ppsid_exists = await conn.execute(text(
             "SELECT 1 FROM information_schema.columns "

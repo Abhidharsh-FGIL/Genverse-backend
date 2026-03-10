@@ -8,6 +8,7 @@ from sqlalchemy import select
 from app.dependencies import DBSession, CurrentUser
 from app.models.ai import AiChat, AiChatMessage, AiChatSetting, AiInteractionHistory
 from app.models.content import UserLibraryItem, DocChunk
+from app.models.public_library import PublicFile, PublicFileChunk
 from app.schemas.ai import (
     AiChatCreate, AiChatUpdate, AiChatResponse, AiMessageResponse,
     SendMessageRequest, ChatSettingsUpdate, ChatSettingsResponse,
@@ -149,6 +150,86 @@ def _inject_inline_docs(messages: list[dict], question: str, inline_docs: list[d
         updated[-1] = {"role": "user", "content": enriched}
     else:
         updated.append({"role": "user", "content": enriched})
+    return updated
+
+
+LIBRARY_FAISS_KEY = "public_library"
+
+
+async def _build_library_rag_context(
+    question: str,
+    library_file_id: str,
+    db,
+    ai: AIService,
+    k: int = 15,
+) -> str:
+    """Return the most relevant chunk texts from a public library file.
+
+    Searches the shared public_library FAISS index, then filters results
+    to only chunks belonging to the specified file.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    faiss_svc = FAISSService(settings.STORAGE_ROOT)
+    file_uuid = uuid.UUID(library_file_id)
+
+    # FAISS path — search with a larger k since we'll filter by file_id
+    query_embedding = await ai.generate_query_embedding(question)
+    has_index = faiss_svc.user_has_index(LIBRARY_FAISS_KEY)
+    log.info("Library RAG: file=%s, has_index=%s, has_embedding=%s", library_file_id, has_index, bool(query_embedding))
+
+    if query_embedding and has_index:
+        ranked_ids = faiss_svc.search(
+            user_id=LIBRARY_FAISS_KEY,
+            query_embedding=query_embedding,
+            k=k * 3,  # over-fetch since we filter to one file
+        )
+        log.info("Library RAG: FAISS returned %d results", len(ranked_ids) if ranked_ids else 0)
+        if ranked_ids:
+            chunk_uuids = [uuid.UUID(cid) for cid in ranked_ids]
+            result = await db.execute(
+                select(PublicFileChunk)
+                .where(
+                    PublicFileChunk.id.in_(chunk_uuids),
+                    PublicFileChunk.file_id == file_uuid,
+                )
+            )
+            by_id = {str(c.id): c for c in result.scalars().all()}
+            log.info("Library RAG: %d chunks matched file_id after filter", len(by_id))
+            # Maintain FAISS ranking order, limited to k results
+            chunks = [by_id[cid] for cid in ranked_ids if cid in by_id][:k]
+            if chunks:
+                text = "\n\n".join(c.chunk_text for c in chunks)
+                log.info("Library RAG: returning %d chars from %d FAISS chunks", len(text), len(chunks))
+                return text
+
+    # Fallback: ordered DB fetch
+    result = await db.execute(
+        select(PublicFileChunk)
+        .where(PublicFileChunk.file_id == file_uuid)
+        .order_by(PublicFileChunk.chunk_order)
+        .limit(20)
+    )
+    chunks = result.scalars().all()
+    log.info("Library RAG: fallback DB fetch returned %d chunks for file %s", len(chunks), library_file_id)
+    return "\n\n".join(c.chunk_text for c in chunks)
+
+
+def _inject_library_rag(messages: list[dict], question: str, rag_text: str, book_title: str) -> list[dict]:
+    """Replace the last user message with library-book-RAG-enriched version."""
+    enriched_question = (
+        f"The user is studying from the book '{book_title}' in the public library.\n"
+        "Use the following excerpts from this book to answer accurately.\n"
+        "If the answer is not in the excerpts, say so and answer from general knowledge.\n\n"
+        f"--- BOOK EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
+        f"Question: {question}"
+    )
+    updated = list(messages)
+    if updated and updated[-1]["role"] == "user":
+        updated[-1] = {"role": "user", "content": enriched_question}
+    else:
+        updated.append({"role": "user", "content": enriched_question})
     return updated
 
 
@@ -353,13 +434,30 @@ async def send_message_stream(
         if rag_text:
             messages = _inject_rag(messages, payload.message, rag_text)
 
+    # Library RAG: use public library book embeddings
+    library_file_id: str | None = (payload.context or {}).get("library_file_id")
+    if library_file_id:
+        # Fetch book title for prompt context
+        lib_file = await db.get(PublicFile, uuid.UUID(library_file_id))
+        lib_rag_text = await _build_library_rag_context(
+            question=payload.message,
+            library_file_id=library_file_id,
+            db=db,
+            ai=ai,
+        )
+        if lib_rag_text:
+            messages = _inject_library_rag(
+                messages, payload.message, lib_rag_text,
+                book_title=lib_file.title if lib_file else "Unknown Book",
+            )
+
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
     if inline_docs:
         messages = _inject_inline_docs(messages, payload.message, inline_docs)
 
-    # Detect if files are involved (vault selection or inline upload)
-    has_files = bool(selected_files) or bool(inline_docs)
+    # Detect if files are involved (vault selection, inline upload, or library book)
+    has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id)
 
     async def event_stream():
         full_response = ""
@@ -480,13 +578,29 @@ async def send_message(
         if rag_text:
             messages = _inject_rag(messages, payload.message, rag_text)
 
+    # Library RAG: use public library book embeddings
+    library_file_id_sync: str | None = (payload.context or {}).get("library_file_id")
+    if library_file_id_sync:
+        lib_file_sync = await db.get(PublicFile, uuid.UUID(library_file_id_sync))
+        lib_rag_text_sync = await _build_library_rag_context(
+            question=payload.message,
+            library_file_id=library_file_id_sync,
+            db=db,
+            ai=ai,
+        )
+        if lib_rag_text_sync:
+            messages = _inject_library_rag(
+                messages, payload.message, lib_rag_text_sync,
+                book_title=lib_file_sync.title if lib_file_sync else "Unknown Book",
+            )
+
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
     if inline_docs:
         messages = _inject_inline_docs(messages, payload.message, inline_docs)
 
-    # Detect if files are involved (vault selection or inline upload)
-    has_files = bool(selected_files) or bool(inline_docs)
+    # Detect if files are involved (vault selection, inline upload, or library book)
+    has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id_sync)
 
     response_text = await ai.chat(messages=messages, context=payload.context, has_files=has_files)
 
@@ -784,6 +898,32 @@ async def generate_practice_assessment_preview(
                 resolved_source_text = " ".join(c.chunk_text for c in chunks)
         except Exception:
             pass  # fall back to topic-based generation if fetch fails
+
+    # Resolve library file content via FAISS RAG (takes priority when library_file_ids are provided)
+    import logging
+    _log = logging.getLogger(__name__)
+    if payload.library_file_ids:
+        _log.info("Assessment RAG: library_file_ids=%s", payload.library_file_ids)
+        ai_for_rag = AIService()
+        topic_query = payload.topic or payload.subject or "general content"
+        _log.info("Assessment RAG: topic_query=%r", topic_query)
+        rag_parts: list[str] = []
+        for lib_fid in payload.library_file_ids:
+            part = await _build_library_rag_context(
+                question=topic_query,
+                library_file_id=lib_fid,
+                db=db,
+                ai=ai_for_rag,
+                k=20,
+            )
+            _log.info("Assessment RAG: file=%s returned %d chars", lib_fid, len(part) if part else 0)
+            if part:
+                rag_parts.append(part)
+        if rag_parts:
+            resolved_source_text = "\n\n---\n\n".join(rag_parts)
+            _log.info("Assessment RAG: total resolved_source_text=%d chars", len(resolved_source_text))
+        else:
+            _log.warning("Assessment RAG: NO content resolved from library files")
 
     ai = AIService()
     raw = await ai.generate_practice_assessment(

@@ -3,7 +3,8 @@ Public Library — no authentication required.
 
 Two-level folder structure: Board → Grade.
 Files (one per subject) are uploaded into grade folders with a subject tag.
-Text extraction, semantic chunking, and FAISS embedding happen on upload.
+Text extraction, semantic chunking, and FAISS embedding are processed in the
+background via Celery.
 
 All FAISS vectors are stored under a single shared index key: "public_library".
 """
@@ -21,6 +22,7 @@ from app.services.storage_service import StorageService
 from app.services.ai_service import AIService
 from app.services.faiss_service import FAISSService
 from app.config import settings
+from app.tasks.library_tasks import process_library_file_embeddings
 
 router = APIRouter()
 
@@ -33,7 +35,7 @@ def _faiss() -> FAISSService:
 
 # ── Folders (Board → Grade) ─────────────────────────────────────────────────
 
-@router.post("/folders/", status_code=status.HTTP_201_CREATED)
+@router.post("/folders", status_code=status.HTTP_201_CREATED)
 async def create_folder(
     name: str = Query(..., description="Folder name (e.g. 'CBSE', 'Grade 10')"),
     parent_id: Optional[str] = Query(None, description="Parent folder ID. Omit for board (root), provide board ID for grade."),
@@ -83,7 +85,7 @@ async def create_folder(
     }
 
 
-@router.get("/folders/")
+@router.get("/folders")
 async def list_folders(
     parent_id: Optional[str] = Query(None, description="Parent folder ID. Omit to list all boards."),
     db: AsyncSession = Depends(get_db),
@@ -107,7 +109,7 @@ async def list_folders(
     ]
 
 
-@router.get("/folders/{folder_id}/")
+@router.get("/folders/{folder_id}")
 async def get_folder(
     folder_id: str,
     db: AsyncSession = Depends(get_db),
@@ -156,14 +158,15 @@ async def get_folder(
                 "file_size_mb": f.file_size_mb,
                 "storage_path": f.storage_path,
                 "is_processed": f.is_processed,
+                "chunks_embedded": f.chunks_embedded,
                 "created_at": f.created_at.isoformat() if f.created_at else None,
             }
-            for f in folder.files
+            for f in folder.files if f.is_processed
         ],
     }
 
 
-@router.delete("/folders/{folder_id}/", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/folders/{folder_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_folder(
     folder_id: str,
     db: AsyncSession = Depends(get_db),
@@ -209,7 +212,7 @@ async def _collect_chunk_ids_recursive(db: AsyncSession, folder_id: uuid.UUID) -
 
 # ── Files (one per subject inside a grade folder) ───────────────────────────
 
-@router.post("/files/", status_code=status.HTTP_201_CREATED)
+@router.post("/files", status_code=status.HTTP_201_CREATED)
 async def upload_file(
     file: UploadFile = File(...),
     folder_id: str = Form(..., description="Grade folder ID to upload into"),
@@ -217,7 +220,7 @@ async def upload_file(
     title: Optional[str] = Form(None, description="Display title (defaults to filename)"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload a subject book into a grade folder. Extracts text, chunks it, and stores embeddings in FAISS."""
+    """Upload a subject book into a grade folder. Saves the file immediately and dispatches embedding processing to Celery."""
     fid = uuid.UUID(folder_id)
     folder = await db.get(PublicFolder, fid)
     if not folder:
@@ -241,45 +244,11 @@ async def upload_file(
         is_processed=False,
     )
     db.add(pub_file)
-    await db.flush()
-
-    # Text extraction → semantic chunking → FAISS embedding
-    ai = AIService()
-    chunk_count = 0
-    try:
-        extracted_text = await ai.extract_text_from_file(file_info["path"])
-        if extracted_text:
-            chunks = ai.semantic_chunk_text(extracted_text)
-            chunk_ids: list[str] = []
-            embeddings: list[list[float]] = []
-
-            for i, chunk_text in enumerate(chunks):
-                doc_chunk = PublicFileChunk(
-                    file_id=pub_file.id,
-                    chunk_text=chunk_text,
-                    chunk_order=i,
-                )
-                db.add(doc_chunk)
-                await db.flush()
-
-                embedding = await ai.generate_embedding(chunk_text)
-                if embedding:
-                    chunk_ids.append(str(doc_chunk.id))
-                    embeddings.append(embedding)
-
-            if chunk_ids:
-                _faiss().add_batch(
-                    user_id=FAISS_KEY,
-                    chunk_ids=chunk_ids,
-                    embeddings=embeddings,
-                )
-            chunk_count = len(chunk_ids)
-            pub_file.is_processed = True
-    except Exception as e:
-        print(f"[PublicLibrary] Text extraction failed for {pub_file.title}: {e}")
-
     await db.commit()
     await db.refresh(pub_file)
+
+    # Dispatch embedding processing to Celery background worker
+    task = process_library_file_embeddings.delay(str(pub_file.id))
 
     return {
         "id": str(pub_file.id),
@@ -288,13 +257,13 @@ async def upload_file(
         "subject": pub_file.subject,
         "file_type": pub_file.file_type,
         "file_size_mb": pub_file.file_size_mb,
-        "is_processed": pub_file.is_processed,
-        "chunks_embedded": chunk_count,
+        "is_processed": False,
+        "task_id": task.id,
         "created_at": pub_file.created_at.isoformat() if pub_file.created_at else None,
     }
 
 
-@router.get("/files/{file_id}/")
+@router.get("/files/{file_id}")
 async def get_file(
     file_id: str,
     db: AsyncSession = Depends(get_db),
@@ -308,6 +277,8 @@ async def get_file(
     pub_file = result.scalar_one_or_none()
     if not pub_file:
         raise HTTPException(status_code=404, detail="File not found")
+    if not pub_file.is_processed:
+        raise HTTPException(status_code=202, detail="File is still being processed")
 
     return {
         "id": str(pub_file.id),
@@ -317,6 +288,7 @@ async def get_file(
         "file_type": pub_file.file_type,
         "file_size_mb": pub_file.file_size_mb,
         "is_processed": pub_file.is_processed,
+        "chunks_embedded": pub_file.chunks_embedded,
         "created_at": pub_file.created_at.isoformat() if pub_file.created_at else None,
         "chunks": [
             {"id": str(c.id), "chunk_order": c.chunk_order, "chunk_text": c.chunk_text[:200]}
@@ -325,7 +297,7 @@ async def get_file(
     }
 
 
-@router.delete("/files/{file_id}/", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_file(
     file_id: str,
     db: AsyncSession = Depends(get_db),
@@ -350,7 +322,7 @@ async def delete_file(
 
 # ── Search ───────────────────────────────────────────────────────────────────
 
-@router.get("/search/")
+@router.get("/search")
 async def search_public_library(
     q: str = Query(..., min_length=2, description="Search query"),
     k: int = Query(10, ge=1, le=50, description="Number of results"),
@@ -400,9 +372,43 @@ async def search_public_library(
     return {"results": results}
 
 
+# ── Task Status ───────────────────────────────────────────────────────────────
+
+@router.get("/task-status/{task_id}")
+async def get_task_status(task_id: str):
+    """Check the status of a Celery embedding task."""
+    from app.celery_app import celery as celery_app
+
+    result = celery_app.AsyncResult(task_id)
+    response = {
+        "task_id": task_id,
+        "status": result.status,  # PENDING, STARTED, SUCCESS, FAILURE, RETRY
+    }
+    if result.ready():
+        response["result"] = result.result if result.successful() else str(result.result)
+    return response
+
+
+@router.get("/files/{file_id}/status")
+async def get_file_processing_status(
+    file_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Check whether a file's embeddings have been processed."""
+    pub_file = await db.get(PublicFile, uuid.UUID(file_id))
+    if not pub_file:
+        raise HTTPException(status_code=404, detail="File not found")
+    return {
+        "id": str(pub_file.id),
+        "title": pub_file.title,
+        "is_processed": pub_file.is_processed,
+        "chunks_embedded": pub_file.chunks_embedded,
+    }
+
+
 # ── Signed URL (no auth) ────────────────────────────────────────────────────
 
-@router.get("/signed-url/")
+@router.get("/signed-url")
 async def get_signed_url(
     path: str = Query(..., description="Absolute storage path of the file"),
 ):

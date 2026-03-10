@@ -49,6 +49,7 @@ class PublicFile(Base):
     storage_path: Mapped[str | None] = mapped_column(String(1000))
     file_size_mb: Mapped[float | None] = mapped_column(Float)
     is_processed: Mapped[bool] = mapped_column(default=False)
+    chunks_embedded: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     folder: Mapped["PublicFolder"] = relationship(back_populates="files")

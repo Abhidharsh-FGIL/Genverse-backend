@@ -209,6 +209,8 @@ class GeneratePracticeAssessmentRequest(BaseModel):
     source_text: Optional[str] = None
     source_type: Optional[str] = None
     source_ref_id: Optional[str] = None  # Vault file ID — content fetched server-side
+    source_ref_ids: Optional[List[str]] = None
+    library_file_ids: Optional[List[str]] = None  # Public library file IDs for RAG
     type_weightage: Optional[dict] = None
     topic_weightage: Optional[dict] = None
     chapter_weightage: Optional[dict] = None
