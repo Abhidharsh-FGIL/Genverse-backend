@@ -52,14 +52,18 @@ app.add_middleware(
 @app.middleware("http")
 async def normalize_path(request: Request, call_next):
     """Normalize request paths: strip trailing slashes and fix double /api prefix."""
-    path = request.scope.get("path", "")
+    path: str = request.scope.get("path", "")
+    changed = False
     # Fix double /api prefix (e.g. /api/api/v1/... → /api/v1/...)
-    if path.startswith("/api/api/"):
+    while "/api/api/" in path:
         path = path.replace("/api/api/", "/api/", 1)
-    # Strip trailing slashes
-    if path != "/" and path.endswith("/"):
+        changed = True
+    # Strip trailing slashes (but not the root path)
+    if len(path) > 1 and path.endswith("/"):
         path = path.rstrip("/")
-    request.scope["path"] = path
+        changed = True
+    if changed:
+        request.scope["path"] = path
     return await call_next(request)
 
 if os.path.exists(settings.STORAGE_ROOT):
