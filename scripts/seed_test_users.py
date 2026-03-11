@@ -63,10 +63,15 @@ ORG_ADMIN_USERS = [
         "name": "Org Basic Admin",
         "org_name": "Basic Test School",
         "plan": "org_basic",
+        "product_type": "genverse",
+        "has_genverse": True,
+        "has_evaluation": False,
         "points_balance": 5000,
         "points_monthly_quota": 5000,
         "storage_limit_mb": 5120,
         "max_seats": 50,
+        "add_teacher_student": True,
+        "slug": "basic",
     },
     {
         "email": "orgpro@genverse.dev",
@@ -74,10 +79,47 @@ ORG_ADMIN_USERS = [
         "name": "Org Pro Admin",
         "org_name": "Pro Test Academy",
         "plan": "org_pro",
+        "product_type": "genverse",
+        "has_genverse": True,
+        "has_evaluation": False,
         "points_balance": 20000,
         "points_monthly_quota": 20000,
         "storage_limit_mb": 51200,
         "max_seats": 1000,
+        "add_teacher_student": True,
+        "slug": "pro",
+    },
+    {
+        "email": "orgbasiceval@genverse.dev",
+        "password": "Test@123",
+        "name": "Org Basic+Eval Admin",
+        "org_name": "Basic+Eval Test School",
+        "plan": "org_basic",
+        "product_type": "genverse_evaluation",
+        "has_genverse": True,
+        "has_evaluation": True,
+        "points_balance": 5000,
+        "points_monthly_quota": 5000,
+        "storage_limit_mb": 5120,
+        "max_seats": 50,
+        "add_teacher_student": True,
+        "slug": "basiceval",
+    },
+    {
+        "email": "orgproeval@genverse.dev",
+        "password": "Test@123",
+        "name": "Org Pro+Eval Admin",
+        "org_name": "Pro+Eval Test Academy",
+        "plan": "org_pro",
+        "product_type": "genverse_evaluation",
+        "has_genverse": True,
+        "has_evaluation": True,
+        "points_balance": 20000,
+        "points_monthly_quota": 20000,
+        "storage_limit_mb": 51200,
+        "max_seats": 1000,
+        "add_teacher_student": True,
+        "slug": "proeval",
     },
     {
         "email": "orgeval@genverse.dev",
@@ -85,10 +127,15 @@ ORG_ADMIN_USERS = [
         "name": "Org Eval Admin",
         "org_name": "Evaluation Test Institute",
         "plan": "org_evaluation",
+        "product_type": "evaluation",
+        "has_genverse": False,
+        "has_evaluation": True,
         "points_balance": 3000,
         "points_monthly_quota": 3000,
         "storage_limit_mb": 2048,
         "max_seats": 100,
+        "add_teacher_student": False,
+        "slug": "eval",
     },
 ]
 
@@ -161,8 +208,71 @@ async def _seed_individual_user(db, data, now, period_end):
     print(f"  [insert] user + subscription: {data['email']} ({data['plan']})")
 
 
+async def _create_user(db, email, password, name, now, period_end):
+    """Create a user with a free personal subscription. Returns user_id."""
+    user_id = uuid.uuid4()
+    db.add(User(
+        id=user_id,
+        email=email,
+        hashed_password=hash_password(password),
+        name=name,
+        language="en",
+        is_active=True,
+    ))
+    await db.flush()
+
+    db.add(UserRole(id=uuid.uuid4(), user_id=user_id, role="normal_user"))
+
+    # Personal workspace free subscription
+    db.add(Subscription(
+        id=uuid.uuid4(),
+        user_id=user_id,
+        org_id=None,
+        plan="free",
+        status="active",
+        workspace_type="individual",
+        points_balance=100,
+        points_monthly_quota=100,
+        storage_limit_mb=100,
+        max_seats=None,
+        current_period_start=now,
+        current_period_end=period_end,
+    ))
+    print(f"  [insert] user: {email} ({name})")
+    return user_id
+
+
+async def _ensure_org_member(db, org_id, email, password, name, role, now, period_end):
+    """Create a user (if needed) and add as org member."""
+    existing = await db.scalar(select(User).where(User.email == email))
+    if existing:
+        user_id = existing.id
+        print(f"  [skip] user already exists: {email}")
+    else:
+        user_id = await _create_user(db, email, password, name, now, period_end)
+
+    # Add to org if not already a member
+    existing_member = await db.scalar(
+        select(OrgMember).where(
+            OrgMember.org_id == org_id,
+            OrgMember.user_id == user_id,
+        )
+    )
+    if existing_member:
+        print(f"  [skip] already org member: {email}")
+    else:
+        db.add(OrgMember(
+            id=uuid.uuid4(),
+            org_id=org_id,
+            user_id=user_id,
+            role=role,
+            status="active",
+        ))
+        print(f"  [insert] org member: {email} -> {role}")
+
+
 async def _seed_org_admin(db, data, now, period_end):
-    """Create or update an org admin user + organization + org subscription."""
+    """Create or update an org admin user + organization + org subscription + teacher/student."""
     existing = await db.scalar(
         select(User).where(User.email == data["email"])
     )
@@ -180,6 +290,17 @@ async def _seed_org_admin(db, data, now, period_end):
         )
         if member:
             org_id = member.org_id
+
+            # Update org product_type flags
+            org = await db.scalar(
+                select(Organization).where(Organization.id == org_id)
+            )
+            if org:
+                org.product_type = data["product_type"]
+                org.has_genverse = data["has_genverse"]
+                org.has_evaluation = data["has_evaluation"]
+                print(f"  [update] org flags -> product_type={data['product_type']}, genverse={data['has_genverse']}, eval={data['has_evaluation']}")
+
             # Update org subscription
             sub = await db.scalar(
                 select(Subscription).where(
@@ -211,49 +332,35 @@ async def _seed_org_admin(db, data, now, period_end):
                     current_period_end=period_end,
                 ))
                 print(f"  [insert] org subscription -> {data['plan']}")
+
+            # Add teacher/student if needed
+            if data["add_teacher_student"]:
+                slug = data["slug"]
+                await _ensure_org_member(
+                    db, org_id,
+                    f"teacher-{slug}@genverse.dev", data["password"],
+                    f"Teacher ({data['org_name']})", "teacher", now, period_end,
+                )
+                await _ensure_org_member(
+                    db, org_id,
+                    f"student-{slug}@genverse.dev", data["password"],
+                    f"Student ({data['org_name']})", "student", now, period_end,
+                )
             return
 
         # User exists but no org — create org + membership below
     else:
         # Create user
-        user_id = uuid.uuid4()
-        db.add(User(
-            id=user_id,
-            email=data["email"],
-            hashed_password=hash_password(data["password"]),
-            name=data["name"],
-            language="en",
-            is_active=True,
-        ))
-        await db.flush()
-
-        db.add(UserRole(id=uuid.uuid4(), user_id=user_id, role="normal_user"))
-
-        # Also give individual free subscription (personal workspace)
-        db.add(Subscription(
-            id=uuid.uuid4(),
-            user_id=user_id,
-            org_id=None,
-            plan="free",
-            status="active",
-            workspace_type="individual",
-            points_balance=100,
-            points_monthly_quota=100,
-            storage_limit_mb=100,
-            max_seats=None,
-            current_period_start=now,
-            current_period_end=period_end,
-        ))
-        print(f"  [insert] user: {data['email']}")
+        user_id = await _create_user(db, data["email"], data["password"], data["name"], now, period_end)
 
     # Create organization
     org_id = uuid.uuid4()
     db.add(Organization(
         id=org_id,
         name=data["org_name"],
-        product_type="genverse",
-        has_genverse=True,
-        has_evaluation=False,
+        product_type=data["product_type"],
+        has_genverse=data["has_genverse"],
+        has_evaluation=data["has_evaluation"],
     ))
     await db.flush()
 
@@ -283,6 +390,20 @@ async def _seed_org_admin(db, data, now, period_end):
     ))
     print(f"  [insert] org '{data['org_name']}' + admin + subscription: {data['email']} ({data['plan']})")
 
+    # Add teacher/student members if needed
+    if data["add_teacher_student"]:
+        slug = data["slug"]
+        await _ensure_org_member(
+            db, org_id,
+            f"teacher-{slug}@genverse.dev", data["password"],
+            f"Teacher ({data['org_name']})", "teacher", now, period_end,
+        )
+        await _ensure_org_member(
+            db, org_id,
+            f"student-{slug}@genverse.dev", data["password"],
+            f"Student ({data['org_name']})", "student", now, period_end,
+        )
+
 
 async def seed():
     async with AsyncSessionLocal() as db:
@@ -300,12 +421,28 @@ async def seed():
         await db.commit()
 
         print("\nDone. Test users ready:")
-        print("  freeuser@genverse.dev   / Test@123  (Free plan, 100 pts)")
-        print("  plususer@genverse.dev   / Test@123  (Plus plan, 800 pts)")
-        print("  prouser@genverse.dev    / Test@123  (Pro plan, 2000 pts)")
-        print("  orgbasic@genverse.dev   / Test@123  (Org Basic admin, 5000 pts)")
-        print("  orgpro@genverse.dev     / Test@123  (Org Pro admin, 20000 pts)")
-        print("  orgeval@genverse.dev    / Test@123  (Org Eval admin, 3000 pts)")
+        print("\n── Personal workspace ──")
+        print("  freeuser@genverse.dev          / Test@123  (Free plan, 100 pts)")
+        print("  plususer@genverse.dev          / Test@123  (Plus plan, 800 pts)")
+        print("  prouser@genverse.dev           / Test@123  (Pro plan, 2000 pts)")
+        print("\n── Org Basic (GenVerse only) ──")
+        print("  orgbasic@genverse.dev          / Test@123  (Admin, 5000 pts)")
+        print("  teacher-basic@genverse.dev     / Test@123  (Teacher)")
+        print("  student-basic@genverse.dev     / Test@123  (Student)")
+        print("\n── Org Pro (GenVerse only) ──")
+        print("  orgpro@genverse.dev            / Test@123  (Admin, 20000 pts)")
+        print("  teacher-pro@genverse.dev       / Test@123  (Teacher)")
+        print("  student-pro@genverse.dev       / Test@123  (Student)")
+        print("\n── Org Basic + Evaluation Hub ──")
+        print("  orgbasiceval@genverse.dev      / Test@123  (Admin, 5000 pts)")
+        print("  teacher-basiceval@genverse.dev / Test@123  (Teacher)")
+        print("  student-basiceval@genverse.dev / Test@123  (Student)")
+        print("\n── Org Pro + Evaluation Hub ──")
+        print("  orgproeval@genverse.dev        / Test@123  (Admin, 20000 pts)")
+        print("  teacher-proeval@genverse.dev   / Test@123  (Teacher)")
+        print("  student-proeval@genverse.dev   / Test@123  (Student)")
+        print("\n── Evaluation Hub Only (no teacher/student) ──")
+        print("  orgeval@genverse.dev           / Test@123  (Admin, 3000 pts)")
 
 
 if __name__ == "__main__":
