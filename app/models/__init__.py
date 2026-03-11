@@ -53,6 +53,8 @@ from app.models.gamification import Badge, StudentBadge, Title, StudentTitle
 from app.models.insights import UserInsight, InsightArticle, CareerGuidanceSession, Recommendation
 from app.models.notification import Notification, NotificationType
 from app.models.communication import GroupChat, GroupChatMessage, ChatReadReceipt
+from app.models.feedback import Feedback
+from app.models.promo import PromoCode, PromoUsage
 from app.models.ai import (
     AiChat,
     AiChatMessage,
@@ -82,4 +84,6 @@ __all__ = [
     "AiChat", "AiChatMessage", "AiChatSetting", "AiContextSession",
     "AiInteractionHistory", "IntelligenceCache",
     "PublicFolder", "PublicFile", "PublicFileChunk",
+    "Feedback",
+    "PromoCode", "PromoUsage",
 ]

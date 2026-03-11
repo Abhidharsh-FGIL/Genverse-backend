@@ -33,6 +33,7 @@ from sqlalchemy import select, and_
 from app.config import settings
 from app.dependencies import DBSession, CurrentUser
 from app.models.subscription import Subscription, PlanDefinition, SubscriptionAddon, PointTransaction
+from app.models.promo import PromoCode, PromoUsage
 from app.models.user import User
 from app.services.email_service import send_purchase_invoice_email
 
@@ -53,8 +54,24 @@ class CheckoutRequest(BaseModel):
     item_id: str
     amount_inr: int
     org_id: Optional[str] = None
+    promo_code: Optional[str] = None
     success_url: str = "http://localhost:4200/u/plans?payment=success"
     cancel_url: str = "http://localhost:4200/u/plans?payment=cancelled"
+
+
+class PromoValidateRequest(BaseModel):
+    code: str
+    item_type: str  # "plan_upgrade" or "point_pack"
+    item_id: str
+    amount_inr: int
+
+
+class PromoValidateResponse(BaseModel):
+    valid: bool
+    message: str
+    discount_amount: int = 0
+    final_amount: int = 0
+    discount_label: str = ""
 
 
 class CheckoutResponse(BaseModel):
@@ -340,6 +357,8 @@ async def _fulfil_purchase(
     stripe_subscription_id: str | None = None,
     phonepe_subscription_id: str | None = None,
     is_renewal: bool = False,
+    promo_code: str | None = None,
+    promo_discount: int = 0,
 ):
     """Apply the purchased plan/addon to the user's subscription.
     Idempotent — skips if the same order was already fulfilled."""
@@ -425,12 +444,19 @@ async def _fulfil_purchase(
 
             # Record the plan upgrade/renewal as a point transaction (credit)
             action_label = f"renewal_{item_id}" if is_renewal else f"plan_upgrade_{item_id}"
+            txn_meta = {"gateway": gateway or "N/A"}
+            if promo_code and promo_discount:
+                txn_meta["promo_code"] = promo_code
+                txn_meta["promo_discount"] = promo_discount
+                txn_meta["original_amount"] = PLAN_PRICES.get(item_id, 0)
+                txn_meta["final_amount"] = PLAN_PRICES.get(item_id, 0) - promo_discount
             txn = PointTransaction(
                 subscription_id=sub.id,
                 user_id=user_id,
                 action=action_label,
                 points_used=-plan_def.monthly_points,  # negative = credit
                 balance_after=sub.points_balance,
+                metadata_json=txn_meta,
             )
             db.add(txn)
 
@@ -456,12 +482,19 @@ async def _fulfil_purchase(
             )
             db.add(addon)
             # Record transaction
+            addon_meta = {"gateway": gateway or "N/A"}
+            if promo_code and promo_discount:
+                addon_meta["promo_code"] = promo_code
+                addon_meta["promo_discount"] = promo_discount
+                addon_meta["original_amount"] = addon_info.get("price", 0)
+                addon_meta["final_amount"] = addon_info.get("price", 0) - promo_discount
             txn = PointTransaction(
                 subscription_id=sub.id,
                 user_id=user_id,
                 action=f"purchased_{canonical_type}",
                 points_used=-points_to_add,  # negative = credit
                 balance_after=sub.points_balance,
+                metadata_json=addon_meta,
             )
             db.add(txn)
 
@@ -484,6 +517,7 @@ async def _fulfil_purchase(
                 pd = plan_def_result.scalar_one_or_none()
                 label = pd.display_name if pd else item_id.replace("_", " ").title()
                 price = PLAN_PRICES.get(item_id, 0)
+                final_price = price - promo_discount if promo_discount else price
                 period_start = sub.current_period_start.strftime("%b %d, %Y") if sub.current_period_start else None
                 period_end = sub.current_period_end.strftime("%b %d, %Y") if sub.current_period_end else None
 
@@ -495,17 +529,21 @@ async def _fulfil_purchase(
                     item_label=label,
                     item_type="Plan Auto-Renewal" if is_renewal else "Plan Subscription",
                     plan_name=label,
-                    amount_inr=price,
+                    amount_inr=final_price,
                     payment_gateway=gateway or sub.payment_gateway or "N/A",
                     is_renewal=is_renewal,
                     billing_period_start=period_start,
                     billing_period_end=period_end,
+                    promo_code=promo_code,
+                    promo_discount=promo_discount,
+                    original_amount=price if promo_discount else None,
                 )
             elif item_type == "point_pack":
                 addon_info = ADDON_POINT_MAP.get(item_id, {})
                 price = addon_info.get("price", 0)
                 pts = addon_info.get("points", 0)
                 label = f"{pts} AI Points Pack"
+                final_price = price - promo_discount if promo_discount else price
 
                 send_purchase_invoice_email(
                     to_email=user_obj.email,
@@ -515,9 +553,12 @@ async def _fulfil_purchase(
                     item_label=label,
                     item_type="Add-on Points Pack",
                     plan_name=sub.plan.replace("_", " ").title() if sub.plan else "Free",
-                    amount_inr=price,
+                    amount_inr=final_price,
                     payment_gateway=gateway or sub.payment_gateway or "N/A",
                     is_renewal=False,
+                    promo_code=promo_code,
+                    promo_discount=promo_discount,
+                    original_amount=price if promo_discount else None,
                 )
     except Exception as e:
         # Email failure should never block the purchase flow
@@ -530,6 +571,89 @@ async def _fulfil_purchase(
 # Endpoints
 # ---------------------------------------------------------------------------
 
+async def _validate_promo(
+    code: str, item_type: str, item_id: str, amount_inr: int,
+    user_id: uuid.UUID, db,
+) -> dict:
+    """Validate a promo code and return discount details.
+    Returns dict with keys: valid, message, discount_amount, final_amount, discount_label, promo (model).
+    """
+    code_upper = code.strip().upper()
+    result = await db.execute(
+        select(PromoCode).where(PromoCode.code == code_upper, PromoCode.is_active == True)
+    )
+    promo = result.scalar_one_or_none()
+
+    if not promo:
+        return {"valid": False, "message": "Invalid promo code", "discount_amount": 0, "final_amount": amount_inr, "discount_label": "", "promo": None}
+
+    now = datetime.now(timezone.utc)
+    if promo.valid_from and now < promo.valid_from:
+        return {"valid": False, "message": "Promo code is not yet active", "discount_amount": 0, "final_amount": amount_inr, "discount_label": "", "promo": None}
+    if promo.valid_until and now > promo.valid_until:
+        return {"valid": False, "message": "Promo code has expired", "discount_amount": 0, "final_amount": amount_inr, "discount_label": "", "promo": None}
+
+    # Check applies_to: "plan" for plan_upgrade, "addon" for point_pack
+    expected = "plan" if item_type == "plan_upgrade" else "addon"
+    if promo.applies_to != expected:
+        return {"valid": False, "message": f"This promo is for {'plans' if promo.applies_to == 'plan' else 'add-ons'} only", "discount_amount": 0, "final_amount": amount_inr, "discount_label": "", "promo": None}
+
+    # Check applicable items restriction
+    if promo.applicable_items:
+        allowed = [x.strip() for x in promo.applicable_items.split(",")]
+        if item_id not in allowed:
+            return {"valid": False, "message": "This promo code is not valid for this item", "discount_amount": 0, "final_amount": amount_inr, "discount_label": "", "promo": None}
+
+    # Global usage limit
+    if promo.used_count >= promo.max_uses:
+        return {"valid": False, "message": "Promo code usage limit reached", "discount_amount": 0, "final_amount": amount_inr, "discount_label": "", "promo": None}
+
+    # Per-user limit
+    usage_result = await db.execute(
+        select(PromoUsage).where(
+            PromoUsage.promo_id == promo.id,
+            PromoUsage.user_id == user_id,
+        )
+    )
+    user_uses = len(usage_result.scalars().all())
+    if user_uses >= promo.per_user_limit:
+        return {"valid": False, "message": "You have already used this promo code", "discount_amount": 0, "final_amount": amount_inr, "discount_label": "", "promo": None}
+
+    # Calculate discount
+    if promo.discount_type == "percentage":
+        discount = int(amount_inr * promo.discount_value / 100)
+        label = f"{int(promo.discount_value)}% off"
+    else:
+        discount = int(min(promo.discount_value, amount_inr))
+        label = f"₹{int(promo.discount_value)} off"
+
+    final = max(amount_inr - discount, 0)
+    return {
+        "valid": True,
+        "message": f"Promo applied! {label}",
+        "discount_amount": discount,
+        "final_amount": final,
+        "discount_label": label,
+        "promo": promo,
+    }
+
+
+@router.post("/validate-promo", response_model=PromoValidateResponse)
+async def validate_promo(payload: PromoValidateRequest, current_user: CurrentUser, db: DBSession):
+    """Validate a promo code and return the discount details."""
+    result = await _validate_promo(
+        payload.code, payload.item_type, payload.item_id,
+        payload.amount_inr, current_user.id, db,
+    )
+    return PromoValidateResponse(
+        valid=result["valid"],
+        message=result["message"],
+        discount_amount=result["discount_amount"],
+        final_amount=result["final_amount"],
+        discount_label=result["discount_label"],
+    )
+
+
 @router.post("/checkout", response_model=CheckoutResponse)
 async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, db: DBSession):
     """Create a checkout session for PhonePe or Stripe."""
@@ -537,6 +661,29 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
     short_uid = str(current_user.id).replace("-", "")[:16]
     ts = int(datetime.now(timezone.utc).timestamp())
     merchant_order_id = f"{short_uid}_{payload.item_id}_{ts}"
+
+    # ── Validate & apply promo code if provided ──
+    actual_amount = payload.amount_inr
+    promo_code_str = ""
+    promo_discount = 0
+    promo_label = ""
+    if payload.promo_code:
+        promo_result = await _validate_promo(
+            payload.promo_code, payload.item_type, payload.item_id,
+            payload.amount_inr, current_user.id, db,
+        )
+        if not promo_result["valid"]:
+            raise HTTPException(status_code=400, detail=promo_result["message"])
+        actual_amount = promo_result["final_amount"]
+        promo_code_str = payload.promo_code.strip().upper()
+        promo_discount = promo_result["discount_amount"]
+        promo_label = promo_result["discount_label"]
+
+        # Record promo usage + increment global count
+        promo_obj = promo_result["promo"]
+        promo_obj.used_count += 1
+        db.add(PromoUsage(promo_id=promo_obj.id, user_id=current_user.id))
+        await db.flush()
 
     if payload.gateway == "phonepe":
         if not settings.PHONEPE_CLIENT_ID:
@@ -549,6 +696,8 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
             f"&item_type={payload.item_type}"
             f"&item_id={payload.item_id}"
             f"&org_id={payload.org_id or ''}"
+            f"&promo_code={promo_code_str}"
+            f"&promo_discount={promo_discount}"
         )
 
         checkout_url = ""
@@ -556,9 +705,10 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
         phonepe_sub_id = None  # Track subscription ID for recurring mandate
 
         # For plan upgrades, try PhonePe recurring subscription (UPI AutoPay) first
+        # Note: Recurring mandate uses original price (promo is first-month only)
         if payload.item_type == "plan_upgrade":
             sub_result = await _create_phonepe_subscription(
-                amount_inr=payload.amount_inr,
+                amount_inr=PLAN_PRICES.get(payload.item_id, payload.amount_inr),
                 merchant_subscription_id=merchant_order_id,
                 merchant_user_id=str(current_user.id),
                 redirect_url=redirect_url,
@@ -575,7 +725,7 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
         # Fallback to one-time payment if recurring not available or for point packs
         if not checkout_url:
             order = await _create_phonepe_order(
-                amount_inr=payload.amount_inr,
+                amount_inr=actual_amount,
                 merchant_order_id=merchant_order_id,
                 redirect_url=redirect_url,
             )
@@ -615,53 +765,78 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
                 await _cancel_existing_stripe_subscription(existing_sub)
 
         if payload.item_type == "plan_upgrade":
-            # Use subscription mode for plan upgrades (auto-renewal)
-            session = stripe.checkout.Session.create(
-                customer=customer_id,
-                payment_method_types=["card"],
-                line_items=[{
-                    "price_data": {
-                        "currency": "inr",
-                        "product_data": {"name": payload.item_id.replace("_", " ").title()},
-                        "unit_amount": payload.amount_inr * 100,  # paise
-                        "recurring": {"interval": "month"},
-                    },
-                    "quantity": 1,
-                }],
-                mode="subscription",
-                success_url=f"{payload.success_url}&session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=payload.cancel_url,
-                client_reference_id=str(current_user.id),
-                metadata={
-                    "item_type": payload.item_type,
-                    "item_id": payload.item_id,
-                    "org_id": payload.org_id or "",
-                    "user_id": str(current_user.id),
-                },
-                subscription_data={
-                    "metadata": {
-                        "item_type": payload.item_type,
-                        "item_id": payload.item_id,
-                        "org_id": payload.org_id or "",
-                        "user_id": str(current_user.id),
-                    },
-                },
-            )
+            # For plans with promo: use one-time payment mode (promo applies first month only,
+            # next month renews at full price via webhook). Without promo: use subscription mode.
+            plan_product_name = payload.item_id.replace("_", " ").title()
+            stripe_metadata = {
+                "item_type": payload.item_type,
+                "item_id": payload.item_id,
+                "org_id": payload.org_id or "",
+                "user_id": str(current_user.id),
+                "promo_code": promo_code_str,
+                "promo_discount": str(promo_discount),
+                "original_amount": str(payload.amount_inr),
+            }
+
+            if promo_code_str:
+                # Promo applied: first month is discounted (one-time), then create
+                # a regular subscription at full price starting next month
+                session = stripe.checkout.Session.create(
+                    customer=customer_id,
+                    payment_method_types=["card"],
+                    line_items=[{
+                        "price_data": {
+                            "currency": "inr",
+                            "product_data": {"name": f"{plan_product_name} (First Month — {promo_label})"},
+                            "unit_amount": actual_amount * 100,
+                        },
+                        "quantity": 1,
+                    }],
+                    mode="payment",
+                    success_url=f"{payload.success_url}&session_id={{CHECKOUT_SESSION_ID}}&promo_code={promo_code_str}&promo_discount={promo_discount}",
+                    cancel_url=payload.cancel_url,
+                    client_reference_id=str(current_user.id),
+                    metadata=stripe_metadata,
+                )
+            else:
+                # No promo: use subscription mode for auto-renewal at full price
+                session = stripe.checkout.Session.create(
+                    customer=customer_id,
+                    payment_method_types=["card"],
+                    line_items=[{
+                        "price_data": {
+                            "currency": "inr",
+                            "product_data": {"name": plan_product_name},
+                            "unit_amount": payload.amount_inr * 100,
+                            "recurring": {"interval": "month"},
+                        },
+                        "quantity": 1,
+                    }],
+                    mode="subscription",
+                    success_url=f"{payload.success_url}&session_id={{CHECKOUT_SESSION_ID}}",
+                    cancel_url=payload.cancel_url,
+                    client_reference_id=str(current_user.id),
+                    metadata=stripe_metadata,
+                    subscription_data={"metadata": stripe_metadata},
+                )
         else:
-            # One-time payment for point packs
+            # One-time payment for point packs (promo or not)
+            pack_name = payload.item_id.replace("_", " ").title()
+            if promo_code_str:
+                pack_name = f"{pack_name} ({promo_label})"
             session = stripe.checkout.Session.create(
                 customer=customer_id,
                 payment_method_types=["card"],
                 line_items=[{
                     "price_data": {
                         "currency": "inr",
-                        "product_data": {"name": payload.item_id.replace("_", " ").title()},
-                        "unit_amount": payload.amount_inr * 100,
+                        "product_data": {"name": pack_name},
+                        "unit_amount": actual_amount * 100,
                     },
                     "quantity": 1,
                 }],
                 mode="payment",
-                success_url=f"{payload.success_url}&session_id={{CHECKOUT_SESSION_ID}}",
+                success_url=f"{payload.success_url}&session_id={{CHECKOUT_SESSION_ID}}&promo_code={promo_code_str}&promo_discount={promo_discount}",
                 cancel_url=payload.cancel_url,
                 client_reference_id=str(current_user.id),
                 metadata={
@@ -669,6 +844,9 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
                     "item_id": payload.item_id,
                     "org_id": payload.org_id or "",
                     "user_id": str(current_user.id),
+                    "promo_code": promo_code_str,
+                    "promo_discount": str(promo_discount),
+                    "original_amount": str(payload.amount_inr),
                 },
             )
 
@@ -688,6 +866,8 @@ async def check_phonepe_status(
     item_type: str,
     item_id: str,
     org_id: str = "",
+    promo_code: str = "",
+    promo_discount: int = 0,
     current_user: CurrentUser = None,
     db: DBSession = None,
 ):
@@ -706,6 +886,8 @@ async def check_phonepe_status(
             merchant_order_id=merchant_order_id,
             gateway="phonepe",
             phonepe_subscription_id=merchant_order_id if item_type == "plan_upgrade" else None,
+            promo_code=promo_code if promo_code else None,
+            promo_discount=promo_discount,
         )
 
         if item_type == "plan_upgrade":
@@ -754,12 +936,18 @@ async def get_payment_status(session_id: str, current_user: CurrentUser, db: DBS
         stripe_sub_id = getattr(session, "subscription", None)
         customer_id = getattr(session, "customer", None)
 
+        # Promo info from metadata
+        s_promo_code = meta.get("promo_code", "") or ""
+        s_promo_discount = int(meta.get("promo_discount", "0") or "0")
+
         sub = await _fulfil_purchase(
             item_type, item_id, current_user.id, org_id, db,
             merchant_order_id=session_id,
             gateway="stripe",
             stripe_customer_id=customer_id,
             stripe_subscription_id=stripe_sub_id,
+            promo_code=s_promo_code if s_promo_code else None,
+            promo_discount=s_promo_discount,
         )
 
         if item_type == "plan_upgrade":

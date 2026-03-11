@@ -31,6 +31,7 @@ from app.routers import (
     payments,
     public_library,
     notifications,
+    feedback,
 )
 
 _API = "/api/v1"
@@ -67,6 +68,7 @@ _ROUTES = [
     (payments.router,        "/payments",         ["Payments"]),
     (public_library.router,  "/public-library",   ["Public Library"]),
     (notifications.router,   "/notifications",    ["Notifications"]),
+    (feedback.router,        "/feedback",         ["Feedback"]),
 ]
 
 

@@ -1,8 +1,10 @@
 import smtplib
-from datetime import datetime
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from app.config import settings
+
+SUPPORT_EMAIL = "genverse.ai@fgilservices.com"
 
 
 def send_verification_otp(to_email: str, otp: str) -> bool:
@@ -344,6 +346,9 @@ def send_purchase_invoice_email(
     is_renewal: bool = False,
     billing_period_start: str | None = None,
     billing_period_end: str | None = None,
+    promo_code: str | None = None,
+    promo_discount: int = 0,
+    original_amount: int | None = None,
 ) -> bool:
     """Send a purchase/renewal invoice email with inline HTML invoice."""
     action_word = "Auto-Renewal" if is_renewal else "Purchase"
@@ -363,6 +368,24 @@ def send_purchase_invoice_email(
         <tr>
             <td style="padding:8px 12px;color:#666;font-size:13px;">Billing Period</td>
             <td style="padding:8px 12px;text-align:right;font-size:13px;">{billing_period_start} — {billing_period_end}</td>
+        </tr>'''
+
+    promo_row = ""
+    if promo_code and promo_discount > 0:
+        original_str = f"₹{original_amount:,}" if original_amount else ""
+        promo_row = f'''
+        <tr style="background:#fef3c7;">
+            <td style="padding:8px 12px;color:#92400e;font-size:13px;">🎉 Promo Code</td>
+            <td style="padding:8px 12px;text-align:right;font-size:13px;font-weight:600;color:#92400e;">
+                {promo_code} &mdash; ₹{promo_discount:,} off{f" (was {original_str})" if original_str else ""}
+            </td>
+        </tr>'''
+        if item_type == "Plan Subscription":
+            promo_row += '''
+        <tr>
+            <td colspan="2" style="padding:6px 12px;color:#b45309;font-size:11px;font-style:italic;">
+                Note: Promo discount applies to the first month only. Subsequent renewals will be at the regular price.
+            </td>
         </tr>'''
 
     html_body = f'''
@@ -429,7 +452,7 @@ def send_purchase_invoice_email(
                         <tr style="background:#f9fafb;">
                             <td style="padding:8px 12px;color:#666;font-size:13px;">Payment Method</td>
                             <td style="padding:8px 12px;text-align:right;font-size:13px;">{gateway_label}</td>
-                        </tr>{billing_row}
+                        </tr>{billing_row}{promo_row}
                     </table>
 
                     <!-- Total -->
@@ -483,5 +506,109 @@ def send_purchase_invoice_email(
     except Exception as e:
         import traceback
         print(f"[EmailService] INVOICE EMAIL FAILED for {to_email}: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        return False
+
+
+def send_feedback_notification_email(
+    user_name: str,
+    user_email: str,
+    rating: int,
+    comment: str,
+    page: str,
+) -> bool:
+    """Send a feedback notification email to the support team."""
+    print(f"[EmailService] send_feedback_notification_email from {user_email}", flush=True)
+
+    if not settings.MAIL_USERNAME or not settings.MAIL_PASSWORD:
+        print(f"[EmailService] SKIPPED: SMTP credentials not configured!", flush=True)
+        return False
+
+    stars_html = "".join(
+        f'<span style="color:#f59e0b;font-size:24px;">{"&#9733;" if i < rating else "&#9734;"}</span>'
+        for i in range(5)
+    )
+    rating_label = ["", "Poor", "Fair", "Good", "Great", "Excellent"][rating]
+    now_str = datetime.now(timezone.utc).strftime("%B %d, %Y %I:%M %p UTC")
+    comment_html = (
+        f'<div style="background:#f9fafb;border-radius:8px;padding:16px;margin:16px 0;border-left:4px solid #6366f1;">'
+        f'<p style="color:#333;font-size:14px;line-height:1.6;margin:0;white-space:pre-wrap;">{comment}</p>'
+        f'</div>'
+        if comment
+        else '<p style="color:#999;font-size:13px;font-style:italic;">No comment provided.</p>'
+    )
+
+    html_body = f'''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>New Feedback</title>
+    </head>
+    <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f5;">
+        <div style="max-width:520px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+            <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:28px 32px;text-align:center;">
+                <h1 style="color:white;margin:0;font-size:22px;">{settings.MAIL_FROM_NAME}</h1>
+                <p style="color:rgba(255,255,255,0.85);margin:6px 0 0;font-size:13px;">New User Feedback Received</p>
+            </div>
+            <div style="padding:28px 32px;">
+                <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;">
+                    <tr>
+                        <td style="color:#666;font-size:13px;padding:6px 0;">From</td>
+                        <td style="font-size:13px;font-weight:600;padding:6px 0;">{user_name} ({user_email})</td>
+                    </tr>
+                    <tr>
+                        <td style="color:#666;font-size:13px;padding:6px 0;">Date</td>
+                        <td style="font-size:13px;padding:6px 0;">{now_str}</td>
+                    </tr>
+                    <tr>
+                        <td style="color:#666;font-size:13px;padding:6px 0;">Page</td>
+                        <td style="font-size:13px;padding:6px 0;">{page or 'N/A'}</td>
+                    </tr>
+                </table>
+
+                <div style="text-align:center;margin:20px 0;">
+                    <div>{stars_html}</div>
+                    <p style="margin:4px 0 0;font-size:14px;font-weight:600;color:#333;">{rating_label} ({rating}/5)</p>
+                </div>
+
+                <p style="color:#555;font-size:13px;font-weight:600;margin:16px 0 4px;">Comment:</p>
+                {comment_html}
+
+                <div style="text-align:center;margin-top:24px;">
+                    <a href="mailto:{user_email}?subject=Re:%20Your%20GenVerse%20Feedback"
+                       style="display:inline-block;background:#6366f1;color:white;padding:10px 24px;
+                              text-decoration:none;border-radius:8px;font-weight:600;font-size:13px;">
+                        Reply to User
+                    </a>
+                </div>
+            </div>
+            <div style="background:#f9fafb;padding:14px;text-align:center;border-top:1px solid #e5e7eb;">
+                <p style="color:#999;font-size:11px;margin:0;">&copy; {settings.MAIL_FROM_NAME} — Feedback Notification</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
+    try:
+        smtp = smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT)
+        smtp.starttls()
+        smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
+
+        msg = MIMEMultipart()
+        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['To'] = SUPPORT_EMAIL
+        msg['Subject'] = f"[Feedback] {rating_label} ({rating}/5) from {user_name}"
+        msg.attach(MIMEText(html_body, 'html'))
+
+        smtp.sendmail(settings.MAIL_FROM, SUPPORT_EMAIL, msg.as_string())
+        smtp.quit()
+        print(f"[EmailService] Feedback notification sent to {SUPPORT_EMAIL}", flush=True)
+        return True
+    except Exception as e:
+        import traceback
+        print(f"[EmailService] FEEDBACK EMAIL FAILED: {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
         return False

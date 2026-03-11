@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Boolean, Integer, Float, DateTime, Text, func, ForeignKey, Enum as SAEnum
+from sqlalchemy import String, Boolean, Integer, Float, DateTime, Text, func, ForeignKey, Enum as SAEnum, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -80,6 +80,7 @@ class PointTransaction(Base):
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     points_used: Mapped[int] = mapped_column(Integer, nullable=False)
     balance_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     subscription: Mapped["Subscription"] = relationship(back_populates="transactions")

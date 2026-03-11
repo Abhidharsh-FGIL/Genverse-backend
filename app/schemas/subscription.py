@@ -61,6 +61,7 @@ class PointTransactionResponse(BaseModel):
     action: str
     points_used: int
     balance_after: int
+    metadata_json: dict | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
