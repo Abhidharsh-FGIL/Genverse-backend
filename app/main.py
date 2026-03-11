@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -47,6 +47,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def normalize_path(request: Request, call_next):
+    """Fix double /api prefix from proxy setup (e.g. /api/api/v1/... → /api/v1/...)."""
+    path: str = request.scope.get("path", "")
+    if "/api/api/" in path:
+        request.scope["path"] = path.replace("/api/api/", "/api/", 1)
+    return await call_next(request)
 
 if os.path.exists(settings.STORAGE_ROOT):
     app.mount("/uploads", StaticFiles(directory=settings.STORAGE_ROOT), name="uploads")

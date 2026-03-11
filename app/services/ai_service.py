@@ -3786,6 +3786,17 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
         ext = path.suffix.lower()
         try:
             if ext == ".pdf":
+                # Try PyMuPDF first (handles complex/large PDFs better)
+                try:
+                    import fitz  # PyMuPDF
+                    doc = fitz.open(file_path)
+                    text = "\n".join(page.get_text() or "" for page in doc)
+                    doc.close()
+                    if text.strip():
+                        return text
+                except Exception as e:
+                    print(f"[OCR] PyMuPDF failed, falling back to PyPDF2: {e}")
+                # Fallback to PyPDF2
                 import PyPDF2
                 with open(file_path, "rb") as f:
                     reader = PyPDF2.PdfReader(f)
