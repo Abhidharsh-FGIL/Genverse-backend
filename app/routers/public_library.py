@@ -408,7 +408,7 @@ async def get_file_processing_status(
 
 # ── Signed URL (no auth) ────────────────────────────────────────────────────
 
-@router.get("/signed-url", include_in_schema=True)
+# @router.get("/signed-url", include_in_schema=True)
 @router.get("/signed-url/", include_in_schema=False)
 async def get_signed_url(
     path: str = Query(..., description="Absolute storage path of the file"),
