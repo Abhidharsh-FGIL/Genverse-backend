@@ -1,8 +1,9 @@
 import uuid
+import secrets
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, status, Query, UploadFile, File, HTTPException
-from sqlalchemy import select, distinct, union_all
+from sqlalchemy import select, delete, distinct, union_all, func
 from sqlalchemy.orm import selectinload
 
 from app.dependencies import DBSession, CurrentUser
@@ -15,6 +16,7 @@ from app.models.evaluation import (
     EvaluationInvitation,
     EvaluationAttempt,
 )
+from app.models.organization import Organization
 from app.schemas.evaluation import (
     EvalPaperCreate,
     EvalPaperResponse,
@@ -32,12 +34,50 @@ from app.schemas.evaluation import (
     DistributeAssessmentRequest,
     EvalAttemptSubmit,
     EvalAttemptResponse,
+    PublicAssessmentInfoResponse,
+    PublicStartAttemptRequest,
+    PublicAttemptResponse,
+    PublicAutosaveRequest,
+    PublicSubmitRequest,
+    PublicSubmitResponse,
 )
 from app.core.exceptions import NotFoundException, ForbiddenException
 from app.services.ai_service import AIService
 
 router = APIRouter()
 
+
+def _score_attempt(attempt, questions, responses, assessment):
+    """Score an attempt's responses against correct answers. Mutates attempt in-place."""
+    score = 0
+    max_score = sum(q.marks for q in questions)
+    for q in questions:
+        student_answer = responses.get(str(q.id))
+        if student_answer and str(student_answer).strip().lower() == str(q.correct_answer or "").strip().lower():
+            score += q.marks
+        elif student_answer and assessment.negative_marking:
+            score -= q.negative_marks
+    attempt.responses = responses
+    attempt.score = max(0, score)
+    attempt.max_score = max_score
+    attempt.percentage = (attempt.score / max_score * 100) if max_score else 0
+
+
+async def _fetch_assessment_questions(assessment, db):
+    """Fetch questions for an assessment by question_ids or paper_id."""
+    if assessment.question_ids:
+        result = await db.execute(
+            select(EvaluationQuestion).where(EvaluationQuestion.id.in_(
+                [uuid.UUID(qid) if isinstance(qid, str) else qid for qid in assessment.question_ids]
+            ))
+        )
+    elif assessment.paper_id:
+        result = await db.execute(
+            select(EvaluationQuestion).where(EvaluationQuestion.paper_id == assessment.paper_id)
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Assessment has no questions configured")
+    return result.scalars().all()
 
 
 # ---- Question Papers ----
@@ -63,18 +103,27 @@ async def generate_paper(
         }
         subjects_for_ai.append(subj)
 
-    questions, answer_key = await ai.generate_evaluation_paper(
-        subjects=subjects_for_ai,
-        question_types=payload.question_types,
-        difficulty=payload.difficulty,
-        blooms_level=payload.blooms_level,
-        question_count=payload.question_count,
-        grade=payload.grade,
-        board=payload.board,
-        mcq_subtypes=payload.mcq_subtypes,
-        type_weightage=payload.type_weightage,
-        negative_marking=payload.negative_marking,
-    )
+    try:
+        questions, answer_key = await ai.generate_evaluation_paper(
+            subjects=subjects_for_ai,
+            question_types=payload.question_types,
+            difficulty=payload.difficulty,
+            blooms_level=payload.blooms_level,
+            question_count=payload.question_count,
+            grade=payload.grade,
+            board=payload.board,
+            mcq_subtypes=payload.mcq_subtypes,
+            type_weightage=payload.type_weightage,
+            negative_marking=payload.negative_marking,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+
+    if not questions:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="AI returned no questions. Please try again.",
+        )
 
     return GenerateEvalPaperResponse(question_json=questions, answer_key_json=answer_key)
 
@@ -567,7 +616,8 @@ async def create_assessment(
         question_ids=[str(qid) for qid in payload.question_ids] if payload.question_ids else None,
         scheduled_at=payload.scheduled_at,
         ends_at=payload.ends_at,
-        status="draft",
+        max_attempts=payload.max_attempts,
+        status="active",
     )
     db.add(assessment)
     await db.commit()
@@ -589,15 +639,52 @@ async def list_assessments(
     return result.scalars().all()
 
 
-@router.get("/assessments/{assessment_id}", response_model=EvalAssessmentResponse)
+@router.get("/assessments/{assessment_id}")
 async def get_assessment(assessment_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
     result = await db.execute(
-        select(EvaluationAssessment).where(EvaluationAssessment.id == assessment_id)
+        select(EvaluationAssessment)
+        .where(EvaluationAssessment.id == assessment_id)
+        .options(
+            selectinload(EvaluationAssessment.invitations),
+            selectinload(EvaluationAssessment.attempts),
+        )
     )
     assessment = result.scalar_one_or_none()
     if not assessment:
         raise NotFoundException("Assessment not found")
-    return assessment
+
+    # Build response with invitations and attempts data
+    resp = EvalAssessmentResponse.model_validate(assessment)
+    resp_dict = resp.model_dump(mode="json")
+    resp_dict["invitations"] = [
+        {
+            "id": str(inv.id),
+            "email": inv.email,
+            "name": inv.name,
+            "status": inv.status,
+            "student_id": str(inv.student_id) if inv.student_id else None,
+            "token": inv.token,
+            "created_at": inv.created_at.isoformat() if inv.created_at else None,
+            "reinvited_at": inv.reinvited_at.isoformat() if inv.reinvited_at else None,
+        }
+        for inv in assessment.invitations
+    ]
+    resp_dict["attempts"] = [
+        {
+            "id": str(a.id),
+            "student_id": str(a.student_id) if a.student_id else None,
+            "invitation_id": str(a.invitation_id) if a.invitation_id else None,
+            "score": a.score,
+            "max_score": a.max_score,
+            "percentage": a.percentage,
+            "started_at": a.started_at.isoformat() if a.started_at else None,
+            "submitted_at": a.submitted_at.isoformat() if a.submitted_at else None,
+            "status": a.status,
+            "attempt_metadata": a.attempt_metadata,
+        }
+        for a in assessment.attempts
+    ]
+    return resp_dict
 
 
 @router.patch("/assessments/{assessment_id}/status", response_model=EvalAssessmentResponse)
@@ -614,7 +701,7 @@ async def update_assessment_status(
     if not assessment:
         raise NotFoundException("Assessment not found")
     new_status = payload.get("status")
-    if new_status and new_status in ("draft", "active", "completed"):
+    if new_status and new_status in ("active", "completed"):
         assessment.status = new_status
     await db.commit()
     await db.refresh(assessment)
@@ -637,19 +724,14 @@ async def delete_assessment(assessment_id: uuid.UUID, current_user: CurrentUser,
 async def distribute_assessment(
     assessment_id: uuid.UUID, payload: DistributeAssessmentRequest, current_user: CurrentUser, db: DBSession
 ):
-    """Distribute an assessment to students by email and send invitation emails."""
+    """Distribute an assessment: create per-email token invitations and send personalized links."""
     import traceback
     from app.models.classes import ClassStudent
     from app.models.user import User
     from app.services.email_service import send_assessment_invitation
 
     print(f"\n{'='*60}", flush=True)
-    print(f"[Distribute] START", flush=True)
-    print(f"[Distribute] assessment_id={assessment_id}")
-    print(f"[Distribute] payload.emails={payload.emails}")
-    print(f"[Distribute] payload.class_id={payload.class_id}")
-    print(f"[Distribute] payload.class_ids={payload.class_ids}")
-    print(f"[Distribute] payload.student_ids={payload.student_ids}")
+    print(f"[Distribute] START assessment_id={assessment_id}", flush=True)
 
     # Fetch the assessment
     assessment_result = await db.execute(
@@ -657,126 +739,199 @@ async def distribute_assessment(
     )
     assessment = assessment_result.scalar_one_or_none()
     if not assessment:
-        print(f"[Distribute] ERROR: Assessment not found!")
         raise HTTPException(status_code=404, detail="Assessment not found")
-    print(f"[Distribute] Assessment found: title={assessment.title}")
 
-    invited_student_ids: set[uuid.UUID] = set()
-    all_recipient_emails: set[str] = set()  # All emails to send invitations to
     class_id_for_inv = uuid.UUID(payload.class_id) if payload.class_id else None
 
-    # Collect all valid emails from payload (for sending emails later)
+    # Collect all target emails
+    all_emails: set[str] = set()
+
     if payload.emails:
-        valid_emails = [e.strip().lower() for e in payload.emails if e and e.strip()]
-        print(f"[Distribute] valid_emails={valid_emails} (from {len(payload.emails)} raw)")
-        all_recipient_emails.update(valid_emails)
+        for e in payload.emails:
+            if e and e.strip():
+                all_emails.add(e.strip().lower())
 
-        # Resolve registered users to create invitation records
-        if valid_emails:
-            users_result = await db.execute(
-                select(User).where(User.email.in_(valid_emails))
-            )
-            users = users_result.scalars().all()
-            print(f"[Distribute] Resolved {len(users)} registered users: {[(u.id, u.email) for u in users]}")
-            registered_emails = set()
-            for user in users:
-                invited_student_ids.add(user.id)
-                registered_emails.add(user.email.lower())
-            unregistered = set(valid_emails) - registered_emails
-            if unregistered:
-                print(f"[Distribute] Unregistered emails (will still receive email): {unregistered}")
-    else:
-        print(f"[Distribute] payload.emails is empty/None")
-
-    # Legacy: class_ids support
-    if payload.class_ids:
-        for cid in payload.class_ids:
+    # Resolve class members to emails
+    if payload.class_id or payload.class_ids:
+        class_id_list = []
+        if payload.class_id:
+            class_id_list.append(payload.class_id)
+        if payload.class_ids:
+            class_id_list.extend(payload.class_ids)
+        for cid in class_id_list:
             students_result = await db.execute(
                 select(ClassStudent).where(ClassStudent.class_id == uuid.UUID(cid))
             )
-            for student in students_result.scalars().all():
-                invited_student_ids.add(student.student_id)
+            student_ids = [s.student_id for s in students_result.scalars().all()]
+            if student_ids:
+                email_result = await db.execute(
+                    select(User.email).where(User.id.in_(student_ids))
+                )
+                for email in email_result.scalars().all():
+                    if email:
+                        all_emails.add(email.strip().lower())
 
-    # Legacy: student_ids support
+    # Resolve student_ids to emails (legacy)
     if payload.student_ids:
-        for sid in payload.student_ids:
-            invited_student_ids.add(uuid.UUID(sid))
+        sid_uuids = [uuid.UUID(sid) for sid in payload.student_ids]
+        email_result = await db.execute(
+            select(User.email).where(User.id.in_(sid_uuids))
+        )
+        for email in email_result.scalars().all():
+            if email:
+                all_emails.add(email.strip().lower())
 
-    print(f"[Distribute] Total invited_student_ids={len(invited_student_ids)}: {invited_student_ids}")
+    print(f"[Distribute] Total unique emails: {len(all_emails)}", flush=True)
 
-    # Check existing invitations to avoid duplicates
+    # Check existing invitations by email
     existing_result = await db.execute(
-        select(EvaluationInvitation.student_id).where(
+        select(EvaluationInvitation).where(
             EvaluationInvitation.assessment_id == assessment_id
         )
     )
-    existing_ids = set(existing_result.scalars().all())
-    new_ids = invited_student_ids - existing_ids
-    print(f"[Distribute] existing_invitations={len(existing_ids)}, new_to_invite={len(new_ids)}")
+    existing_invitations = {inv.email.lower(): inv for inv in existing_result.scalars().all()}
+    new_emails = all_emails - set(existing_invitations.keys())
+    reinvite_emails = all_emails & set(existing_invitations.keys())
+    print(f"[Distribute] existing={len(existing_invitations)}, new={len(new_emails)}, reinvite={len(reinvite_emails)}", flush=True)
 
-    # Create invitation records for registered users
-    for student_id in new_ids:
-        db.add(EvaluationInvitation(
-            assessment_id=assessment_id,
-            student_id=student_id,
-            class_id=class_id_for_inv,
-        ))
-
-    # Also fetch emails of newly invited registered users
-    if new_ids:
-        email_result = await db.execute(
-            select(User.email).where(User.id.in_(new_ids))
+    # Resolve registered users for student_id linking
+    registered_map: dict[str, uuid.UUID] = {}  # email -> user_id
+    all_lookup = new_emails | reinvite_emails
+    if all_lookup:
+        users_result = await db.execute(
+            select(User).where(User.email.in_(list(all_lookup)))
         )
-        for e in email_result.scalars().all():
-            if e:
-                all_recipient_emails.add(e.lower())
+        for user in users_result.scalars().all():
+            registered_map[user.email.lower()] = user.id
 
-    # Update assessment status
-    if assessment.status != "distributed":
-        assessment.status = "distributed"
+    # Create one invitation per new email with unique token
+    email_token_pairs: list[tuple[str, str]] = []
+    for email in sorted(new_emails):
+        token = secrets.token_urlsafe(32)
+        inv = EvaluationInvitation(
+            assessment_id=assessment_id,
+            student_id=registered_map.get(email),
+            email=email,
+            token=token,
+            class_id=class_id_for_inv,
+        )
+        db.add(inv)
+        email_token_pairs.append((email, token))
+
+    # Re-invite existing emails: regenerate token, set reinvited_at (preserves old attempts)
+    now = datetime.now(timezone.utc)
+    for email in sorted(reinvite_emails):
+        inv = existing_invitations[email]
+        inv.token = secrets.token_urlsafe(32)
+        inv.status = "pending"
+        inv.reinvited_at = now
+        email_token_pairs.append((email, inv.token))
+
+    # Ensure assessment is active
+    if assessment.status not in ("active", "completed"):
+        assessment.status = "active"
 
     await db.commit()
-    print(f"[Distribute] DB committed. Now sending emails...")
+    print(f"[Distribute] DB committed. {len(email_token_pairs)} new invitations created.", flush=True)
 
-    # Send invitation emails to ALL collected emails (registered + unregistered)
+    # Send emails with per-recipient token links
     emails_sent = 0
-    recipient_list = sorted(all_recipient_emails)
-    print(f"[Distribute] All recipient emails: {recipient_list}")
-
-    if recipient_list:
+    if email_token_pairs:
         teacher_name = current_user.name or "Your Teacher"
         due_str = assessment.due_date.strftime("%d %b %Y, %I:%M %p") if assessment.due_date else None
         time_limit = assessment.time_limit if assessment.time_limit else None
-        print(f"[Distribute] Calling send_assessment_invitation...")
-        print(f"[Distribute]   to={recipient_list}")
-        print(f"[Distribute]   title={assessment.title}")
-        print(f"[Distribute]   teacher={teacher_name}")
 
         try:
             await send_assessment_invitation(
-                to_emails=recipient_list,
+                email_token_pairs=email_token_pairs,
                 assessment_title=assessment.title,
-                assessment_id=str(assessment_id),
                 teacher_name=teacher_name,
                 due_date=due_str,
                 time_limit=time_limit,
             )
-            emails_sent = len(recipient_list)
-            print(f"[Distribute] SUCCESS: Emails sent to {emails_sent} recipients!")
+            emails_sent = len(email_token_pairs)
+            print(f"[Distribute] SUCCESS: {emails_sent} emails sent!", flush=True)
         except Exception as e:
-            print(f"[Distribute] FAILED to send email: {type(e).__name__}: {e}")
+            print(f"[Distribute] FAILED to send emails: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc()
-    else:
-        print(f"[Distribute] No recipient emails to send")
 
-    print(f"[Distribute] DONE: distributed_to={len(new_ids)}, emails_sent={emails_sent}")
-    print(f"{'='*60}\n")
+    print(f"[Distribute] DONE\n{'='*60}\n", flush=True)
 
     return {
-        "distributed_to": len(new_ids),
-        "already_invited": len(existing_ids & invited_student_ids),
+        "distributed_to": len(new_emails),
+        "reinvited": len(reinvite_emails),
         "emails_sent": emails_sent,
         "message": "Assessment distributed",
+    }
+
+
+@router.post("/assessments/{assessment_id}/reinvite")
+async def reinvite_assessment(
+    assessment_id: uuid.UUID,
+    payload: dict,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Re-invite specific or all students: regenerate tokens and resend emails."""
+    import traceback
+    from app.services.email_service import send_assessment_invitation
+
+    assessment_result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == assessment_id)
+    )
+    assessment = assessment_result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    # Get target invitations
+    target_emails = payload.get("emails")  # list of emails, or None for all
+    query = select(EvaluationInvitation).where(
+        EvaluationInvitation.assessment_id == assessment_id
+    )
+    if target_emails:
+        query = query.where(EvaluationInvitation.email.in_([e.lower() for e in target_emails]))
+
+    inv_result = await db.execute(query)
+    invitations = inv_result.scalars().all()
+
+    if not invitations:
+        raise HTTPException(status_code=404, detail="No invitations found")
+
+    # Regenerate tokens, set reinvited_at (preserves old attempts history)
+    email_token_pairs: list[tuple[str, str]] = []
+    now = datetime.now(timezone.utc)
+
+    for inv in invitations:
+        inv.token = secrets.token_urlsafe(32)
+        inv.status = "pending"
+        inv.reinvited_at = now
+        email_token_pairs.append((inv.email, inv.token))
+
+    await db.commit()
+
+    # Send emails
+    emails_sent = 0
+    if email_token_pairs:
+        teacher_name = current_user.name or "Your Teacher"
+        due_str = assessment.due_date.strftime("%d %b %Y, %I:%M %p") if assessment.due_date else None
+        time_limit = assessment.time_limit if assessment.time_limit else None
+        try:
+            await send_assessment_invitation(
+                email_token_pairs=email_token_pairs,
+                assessment_title=assessment.title,
+                teacher_name=teacher_name,
+                due_date=due_str,
+                time_limit=time_limit,
+            )
+            emails_sent = len(email_token_pairs)
+        except Exception as e:
+            print(f"[Reinvite] FAILED to send emails: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+
+    return {
+        "reinvited": len(email_token_pairs),
+        "emails_sent": emails_sent,
+        "message": f"Re-invited {len(email_token_pairs)} student(s)",
     }
 
 
@@ -843,34 +998,8 @@ async def submit_eval_attempt(
     )
     assessment = assessment_result.scalar_one_or_none()
 
-    # Fetch questions: prefer question_ids (explicit list), fall back to paper_id
-    if assessment.question_ids:
-        questions_result = await db.execute(
-            select(EvaluationQuestion).where(EvaluationQuestion.id.in_(
-                [uuid.UUID(qid) if isinstance(qid, str) else qid for qid in assessment.question_ids]
-            ))
-        )
-    elif assessment.paper_id:
-        questions_result = await db.execute(
-            select(EvaluationQuestion).where(EvaluationQuestion.paper_id == assessment.paper_id)
-        )
-    else:
-        raise HTTPException(status_code=400, detail="Assessment has no questions configured")
-    questions = questions_result.scalars().all()
-
-    score = 0
-    max_score = sum(q.marks for q in questions)
-    for q in questions:
-        student_answer = payload.responses.get(str(q.id))
-        if student_answer and str(student_answer).strip().lower() == str(q.correct_answer or "").strip().lower():
-            score += q.marks
-        elif student_answer and assessment.negative_marking:
-            score -= q.negative_marks
-
-    attempt.responses = payload.responses
-    attempt.score = max(0, score)
-    attempt.max_score = max_score
-    attempt.percentage = (attempt.score / max_score * 100) if max_score else 0
+    questions = await _fetch_assessment_questions(assessment, db)
+    _score_attempt(attempt, questions, payload.responses, assessment)
     attempt.submitted_at = datetime.now(timezone.utc)
     attempt.status = "submitted"
 
@@ -887,3 +1016,423 @@ async def submit_eval_attempt(
     await db.commit()
     await db.refresh(attempt)
     return attempt
+
+
+# ---- Public Token-Based Endpoints (no auth required) ----
+
+@router.get("/public/assessment/{token}", response_model=PublicAssessmentInfoResponse)
+async def public_assessment_info(token: str, db: DBSession = None):
+    """Get assessment info by invitation token. No auth required."""
+    inv_result = await db.execute(
+        select(EvaluationInvitation).where(EvaluationInvitation.token == token)
+    )
+    invitation = inv_result.scalar_one_or_none()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invalid or expired assessment link")
+
+    assessment_result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == invitation.assessment_id)
+    )
+    assessment = assessment_result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    # Count attempts for this invitation (only after last reinvite)
+    attempt_query = select(func.count(EvaluationAttempt.id)).where(
+        EvaluationAttempt.invitation_id == invitation.id
+    )
+    if invitation.reinvited_at:
+        attempt_query = attempt_query.where(
+            EvaluationAttempt.started_at > invitation.reinvited_at
+        )
+    attempts_count_result = await db.execute(attempt_query)
+    attempts_used = attempts_count_result.scalar() or 0
+
+    # Determine if the user can attempt
+    can_attempt = True
+    if assessment.mode == "exam":
+        can_attempt = attempts_used == 0
+    elif assessment.mode == "practice" and assessment.max_attempts is not None:
+        can_attempt = attempts_used < assessment.max_attempts
+
+    # Check if assessment has expired
+    now = datetime.now(timezone.utc)
+    if assessment.ends_at and now > assessment.ends_at:
+        can_attempt = False
+    if assessment.due_date and now > assessment.due_date:
+        can_attempt = False
+
+    # Fetch organization name
+    org_name = None
+    if assessment.org_id:
+        org_result = await db.execute(
+            select(Organization.name).where(Organization.id == assessment.org_id)
+        )
+        org_name = org_result.scalar_one_or_none()
+
+    return PublicAssessmentInfoResponse(
+        assessment_title=assessment.title,
+        mode=assessment.mode,
+        question_count=assessment.question_count,
+        time_limit=assessment.time_limit,
+        negative_marking=assessment.negative_marking,
+        due_date=assessment.due_date,
+        max_attempts=assessment.max_attempts,
+        attempts_used=attempts_used,
+        can_attempt=can_attempt,
+        invitation_status=invitation.status,
+        email=invitation.email,
+        organization_name=org_name,
+    )
+
+
+@router.post("/public/assessment/{token}/start", response_model=PublicAttemptResponse)
+async def public_start_attempt(token: str, payload: PublicStartAttemptRequest, db: DBSession = None):
+    """Start an assessment attempt via token link. No auth required."""
+    inv_result = await db.execute(
+        select(EvaluationInvitation).where(EvaluationInvitation.token == token)
+    )
+    invitation = inv_result.scalar_one_or_none()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invalid or expired assessment link")
+
+    assessment_result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == invitation.assessment_id)
+    )
+    assessment = assessment_result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    # Validate timing
+    now = datetime.now(timezone.utc)
+    if assessment.ends_at and now > assessment.ends_at:
+        raise HTTPException(status_code=403, detail="This assessment has expired")
+    if assessment.due_date and now > assessment.due_date:
+        raise HTTPException(status_code=403, detail="This assessment is past its due date")
+
+    # Count existing attempts for this invitation (only after last reinvite)
+    attempt_query = select(func.count(EvaluationAttempt.id)).where(
+        EvaluationAttempt.invitation_id == invitation.id
+    )
+    if invitation.reinvited_at:
+        attempt_query = attempt_query.where(
+            EvaluationAttempt.started_at > invitation.reinvited_at
+        )
+    attempts_count_result = await db.execute(attempt_query)
+    attempts_used = attempts_count_result.scalar() or 0
+
+    # Enforce attempt limits
+    if assessment.mode == "exam" and attempts_used > 0:
+        raise HTTPException(status_code=403, detail="You have already taken this exam")
+    if assessment.mode == "practice" and assessment.max_attempts is not None and attempts_used >= assessment.max_attempts:
+        raise HTTPException(status_code=403, detail="Maximum attempts reached")
+
+    # Store name on invitation if provided
+    if payload.name and not invitation.name:
+        invitation.name = payload.name
+
+    # Create the attempt
+    attempt = EvaluationAttempt(
+        assessment_id=assessment.id,
+        student_id=invitation.student_id,
+        invitation_id=invitation.id,
+        status="in_progress",
+    )
+    db.add(attempt)
+
+    # Update invitation status
+    invitation.status = "accepted"
+
+    await db.commit()
+    await db.refresh(attempt)
+
+    # Fetch questions WITHOUT correct_answer/explanation
+    if assessment.question_ids:
+        questions_result = await db.execute(
+            select(EvaluationQuestion).where(EvaluationQuestion.id.in_(
+                [uuid.UUID(qid) if isinstance(qid, str) else qid for qid in assessment.question_ids]
+            )).order_by(EvaluationQuestion.order_index)
+        )
+    elif assessment.paper_id:
+        questions_result = await db.execute(
+            select(EvaluationQuestion)
+            .where(EvaluationQuestion.paper_id == assessment.paper_id)
+            .order_by(EvaluationQuestion.order_index)
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Assessment has no questions configured")
+
+    questions = questions_result.scalars().all()
+
+    # Strip correct answers and explanations
+    questions_data = []
+    for q in questions:
+        q_dict = {
+            "id": str(q.id),
+            "question_type": q.question_type,
+            "question_text": q.question_text,
+            "options": q.options,
+            "marks": q.marks,
+            "negative_marks": q.negative_marks,
+            "subject": q.subject,
+            "chapter": q.chapter,
+            "difficulty": q.difficulty,
+            "order_index": q.order_index,
+        }
+        questions_data.append(q_dict)
+
+    return PublicAttemptResponse(
+        attempt_id=attempt.id,
+        assessment_id=assessment.id,
+        questions=questions_data,
+        time_limit=assessment.time_limit,
+        started_at=attempt.started_at,
+    )
+
+
+@router.post("/public/assessment/{token}/attempt/{attempt_id}/submit", response_model=PublicSubmitResponse)
+async def public_submit_attempt(
+    token: str, attempt_id: uuid.UUID, payload: PublicSubmitRequest, db: DBSession = None
+):
+    """Submit answers for a public token-based attempt. No auth required."""
+    # Validate token
+    inv_result = await db.execute(
+        select(EvaluationInvitation).where(EvaluationInvitation.token == token)
+    )
+    invitation = inv_result.scalar_one_or_none()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invalid assessment link")
+
+    # Validate attempt belongs to this invitation
+    attempt_result = await db.execute(
+        select(EvaluationAttempt).where(
+            EvaluationAttempt.id == attempt_id,
+            EvaluationAttempt.invitation_id == invitation.id,
+            EvaluationAttempt.status == "in_progress",
+        )
+    )
+    attempt = attempt_result.scalar_one_or_none()
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Attempt not found or already submitted")
+
+    # Fetch assessment
+    assessment_result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == attempt.assessment_id)
+    )
+    assessment = assessment_result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    now = datetime.now(timezone.utc)
+
+    # Fetch questions, score, and finalize
+    questions = await _fetch_assessment_questions(assessment, db)
+    _score_attempt(attempt, questions, payload.responses, assessment)
+    attempt.submitted_at = now
+    attempt.status = "submitted"
+    if payload.metadata:
+        attempt.attempt_metadata = payload.metadata
+
+    # Update invitation status
+    invitation.status = "completed"
+
+    await db.commit()
+
+    return PublicSubmitResponse(
+        attempt_id=attempt.id,
+        status="submitted",
+        message="Your response has been submitted successfully.",
+    )
+
+
+@router.patch("/public/assessment/{token}/attempt/{attempt_id}/autosave")
+async def public_autosave_attempt(
+    token: str, attempt_id: uuid.UUID, payload: PublicAutosaveRequest, db: DBSession = None
+):
+    """Auto-save responses periodically. No scoring, no status change. Fast."""
+    inv_result = await db.execute(
+        select(EvaluationInvitation).where(EvaluationInvitation.token == token)
+    )
+    invitation = inv_result.scalar_one_or_none()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invalid assessment link")
+
+    attempt_result = await db.execute(
+        select(EvaluationAttempt).where(
+            EvaluationAttempt.id == attempt_id,
+            EvaluationAttempt.invitation_id == invitation.id,
+            EvaluationAttempt.status == "in_progress",
+        )
+    )
+    attempt = attempt_result.scalar_one_or_none()
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Attempt not found or already submitted")
+
+    attempt.responses = payload.responses
+    # Merge autosave timestamp into metadata
+    meta = attempt.attempt_metadata or {}
+    meta["last_autosave_at"] = datetime.now(timezone.utc).isoformat()
+    attempt.attempt_metadata = meta
+
+    await db.commit()
+    return {"status": "saved"}
+
+
+@router.post("/public/assessment/{token}/attempt/{attempt_id}/beacon-submit")
+async def public_beacon_submit(
+    token: str, attempt_id: uuid.UUID, payload: PublicSubmitRequest, db: DBSession = None
+):
+    """Beacon-based submit on browser close. Idempotent — silently succeeds if already submitted."""
+    inv_result = await db.execute(
+        select(EvaluationInvitation).where(EvaluationInvitation.token == token)
+    )
+    invitation = inv_result.scalar_one_or_none()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invalid assessment link")
+
+    attempt_result = await db.execute(
+        select(EvaluationAttempt).where(
+            EvaluationAttempt.id == attempt_id,
+            EvaluationAttempt.invitation_id == invitation.id,
+        )
+    )
+    attempt = attempt_result.scalar_one_or_none()
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+
+    # Idempotent: if already submitted, return success
+    if attempt.status == "submitted":
+        return {"status": "already_submitted"}
+
+    # Fetch assessment
+    assessment_result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == attempt.assessment_id)
+    )
+    assessment = assessment_result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    # Score and submit
+    questions = await _fetch_assessment_questions(assessment, db)
+    _score_attempt(attempt, questions, payload.responses, assessment)
+    attempt.submitted_at = datetime.now(timezone.utc)
+    attempt.status = "submitted"
+
+    # Merge metadata
+    meta = payload.metadata or {}
+    meta["auto_submitted"] = True
+    meta["submit_reason"] = meta.get("submit_reason", "browser_close")
+    attempt.attempt_metadata = meta
+
+    invitation.status = "completed"
+    await db.commit()
+
+    return {"status": "submitted"}
+
+
+@router.get("/assessments/{assessment_id}/attempts/{attempt_id}/detail")
+async def get_attempt_detail(
+    assessment_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Get detailed attempt data including questions, student responses, and correct answers."""
+    # Verify assessment exists and user has access
+    assessment_result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == assessment_id)
+    )
+    assessment = assessment_result.scalar_one_or_none()
+    if not assessment:
+        raise NotFoundException("Assessment not found")
+
+    # Get the attempt
+    attempt_result = await db.execute(
+        select(EvaluationAttempt).where(
+            EvaluationAttempt.id == attempt_id,
+            EvaluationAttempt.assessment_id == assessment_id,
+        )
+    )
+    attempt = attempt_result.scalar_one_or_none()
+    if not attempt:
+        raise NotFoundException("Attempt not found")
+
+    # Get invitation info
+    invitation = None
+    if attempt.invitation_id:
+        inv_result = await db.execute(
+            select(EvaluationInvitation).where(EvaluationInvitation.id == attempt.invitation_id)
+        )
+        invitation = inv_result.scalar_one_or_none()
+
+    # Fetch all questions for this assessment
+    if assessment.question_ids:
+        questions_result = await db.execute(
+            select(EvaluationQuestion).where(EvaluationQuestion.id.in_(
+                [uuid.UUID(qid) if isinstance(qid, str) else qid for qid in assessment.question_ids]
+            )).order_by(EvaluationQuestion.order_index)
+        )
+    elif assessment.paper_id:
+        questions_result = await db.execute(
+            select(EvaluationQuestion)
+            .where(EvaluationQuestion.paper_id == assessment.paper_id)
+            .order_by(EvaluationQuestion.order_index)
+        )
+    else:
+        questions_result = None
+
+    questions = questions_result.scalars().all() if questions_result else []
+    student_responses = attempt.responses or {}
+
+    # Build question-by-question detail
+    questions_detail = []
+    for q in questions:
+        student_answer = student_responses.get(str(q.id))
+        correct_answer = q.correct_answer
+        is_correct = (
+            student_answer is not None
+            and str(student_answer).strip().lower() == str(correct_answer or "").strip().lower()
+        )
+        marks_earned = 0
+        if student_answer and is_correct:
+            marks_earned = q.marks
+        elif student_answer and not is_correct and assessment.negative_marking:
+            marks_earned = -q.negative_marks
+
+        questions_detail.append({
+            "id": str(q.id),
+            "question_type": q.question_type,
+            "question_text": q.question_text,
+            "options": q.options,
+            "correct_answer": correct_answer,
+            "student_answer": student_answer,
+            "is_correct": is_correct,
+            "marks": q.marks,
+            "negative_marks": q.negative_marks,
+            "marks_earned": marks_earned,
+            "subject": q.subject,
+            "chapter": q.chapter,
+            "difficulty": q.difficulty,
+            "explanation": q.explanation,
+            "order_index": q.order_index,
+        })
+
+    return {
+        "attempt_id": str(attempt.id),
+        "assessment_id": str(assessment.id),
+        "assessment_title": assessment.title,
+        "student_email": invitation.email if invitation else None,
+        "student_name": invitation.name if invitation else None,
+        "score": attempt.score,
+        "max_score": attempt.max_score,
+        "percentage": attempt.percentage,
+        "status": attempt.status,
+        "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
+        "submitted_at": attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+        "attempt_metadata": attempt.attempt_metadata,
+        "questions": questions_detail,
+        "total_questions": len(questions),
+        "correct_count": sum(1 for q in questions_detail if q["is_correct"]),
+        "wrong_count": sum(1 for q in questions_detail if q["student_answer"] and not q["is_correct"]),
+        "unanswered_count": sum(1 for q in questions_detail if not q["student_answer"]),
+    }

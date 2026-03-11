@@ -217,16 +217,14 @@ def send_renewal_reminder(to_email: str, plan_name: str, expiry_date: str, renew
 
 
 async def send_assessment_invitation(
-    to_emails: list[str],
+    email_token_pairs: list[tuple[str, str]],
     assessment_title: str,
-    assessment_id: str,
     teacher_name: str = "Your Teacher",
     due_date: str | None = None,
     time_limit: int | None = None,
 ):
-    """Send assessment invitation emails to students."""
-    print(f"[EmailService] send_assessment_invitation called", flush=True)
-    print(f"[EmailService]   to_emails={to_emails}", flush=True)
+    """Send assessment invitation emails with per-recipient unique token links."""
+    print(f"[EmailService] send_assessment_invitation called for {len(email_token_pairs)} recipients", flush=True)
 
     if not settings.ENABLE_EMAIL_NOTIFICATIONS:
         print(f"[EmailService] SKIPPED: Email notifications disabled!", flush=True)
@@ -236,75 +234,16 @@ async def send_assessment_invitation(
         print(f"[EmailService] SKIPPED: SMTP credentials not configured!", flush=True)
         return
 
-    assessment_link = f"{settings.FRONTEND_URL}/assessment/{assessment_id}"
-
     details_html = ""
     if due_date:
         details_html += f'<p style="margin:4px 0;color:#555;">Due: <strong>{due_date}</strong></p>'
     if time_limit:
-        details_html += f'<p style="margin:4px 0;color:#555;">Time Limit: <strong>{time_limit} minutes</strong></p>'
-
-    html_body = f'''
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Assessment Invitation</title>
-        <style>
-            body, html {{
-                margin: 0;
-                padding: 0;
-                font-family: Arial, sans-serif;
-            }}
-            .container {{
-                max-width: 600px;
-                margin: 0 auto;
-                padding: 20px;
-            }}
-            .body-content {{
-                padding: 20px;
-                background-color: #f9f9f9;
-                border-radius: 5px;
-            }}
-            .footer {{
-                text-align: center;
-                margin-top: 20px;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="body-content">
-                <p>Hi there,</p>
-                <p><strong>{teacher_name}</strong> has assigned you a new assessment:</p>
-                <div style="background:white;border-radius:8px;padding:16px;border:1px solid #e5e7eb;margin:16px 0;">
-                    <h3 style="margin:0 0 8px;color:#1a1a1a;">{assessment_title}</h3>
-                    {details_html}
-                </div>
-                <p>Please click on the button below to start your assessment.</p>
-                <a href="{assessment_link}"
-                   style="display:inline-block;background-color:#4f46e5;color:white;
-                          padding:15px 20px;text-align:center;text-decoration:none;
-                          border-radius:5px;font-weight:600;">
-                    Start Assessment
-                </a>
-                <p style="color:#999;font-size:12px;margin-top:16px;">
-                    Or copy this link: {assessment_link}
-                </p>
-            </div>
-            <div class="footer">
-                <p>Best Regards,<br>The {settings.MAIL_FROM_NAME} Team</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    '''
+        time_minutes = round(time_limit / 60) if time_limit > 60 else time_limit
+        details_html += f'<p style="margin:4px 0;color:#555;">Time Limit: <strong>{time_minutes} minutes</strong></p>'
 
     subject = f"Assessment: {assessment_title}"
 
-    # Open ONE SMTP connection and send all emails through it
-    # (runs synchronously — same as GenVerse OTP pattern)
+    # Open ONE SMTP connection and send personalized email per recipient
     try:
         print(f"[EmailService] Connecting to {settings.MAIL_SERVER}:{settings.MAIL_PORT}...", flush=True)
         smtp = smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT)
@@ -312,10 +251,60 @@ async def send_assessment_invitation(
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
         print(f"[EmailService] SMTP login OK", flush=True)
 
-        for email in to_emails:
+        for email, token in email_token_pairs:
             try:
+                assessment_link = f"{settings.FRONTEND_URL}/genverse/take-assessment?token={token}"
+
+                html_body = f'''
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Assessment Invitation</title>
+                </head>
+                <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f5;">
+                    <div style="max-width:520px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+                        <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:32px;text-align:center;">
+                            <h1 style="color:white;margin:0;font-size:24px;">{settings.MAIL_FROM_NAME}</h1>
+                            <p style="color:rgba(255,255,255,0.85);margin:8px 0 0;font-size:14px;">Assessment Invitation</p>
+                        </div>
+                        <div style="padding:32px;">
+                            <p style="color:#333;font-size:15px;margin:0 0 8px;">Hi there,</p>
+                            <p style="color:#555;font-size:14px;line-height:1.6;">
+                                <strong>{teacher_name}</strong> has assigned you a new assessment:
+                            </p>
+                            <div style="background:#f9fafb;border-radius:8px;padding:16px;border:1px solid #e5e7eb;margin:16px 0;">
+                                <h3 style="margin:0 0 8px;color:#1a1a1a;">{assessment_title}</h3>
+                                {details_html}
+                            </div>
+                            <p style="color:#555;font-size:14px;">Click the button below to start your assessment. No login required.</p>
+                            <div style="text-align:center;margin:24px 0;">
+                                <a href="{assessment_link}"
+                                   style="display:inline-block;background:#6366f1;color:white;
+                                          padding:14px 32px;text-decoration:none;border-radius:8px;
+                                          font-weight:600;font-size:15px;">
+                                    Start Assessment
+                                </a>
+                            </div>
+                            <p style="color:#999;font-size:12px;text-align:center;">
+                                Or copy this link:<br>
+                                <a href="{assessment_link}" style="color:#6366f1;word-break:break-all;">{assessment_link}</a>
+                            </p>
+                            <p style="color:#999;font-size:11px;text-align:center;margin-top:16px;">
+                                This link is unique to you. Please do not share it with others.
+                            </p>
+                        </div>
+                        <div style="background:#f9fafb;padding:16px;text-align:center;border-top:1px solid #e5e7eb;">
+                            <p style="color:#999;font-size:11px;margin:0;">&copy; {settings.MAIL_FROM_NAME} &mdash; AI-powered learning platform</p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                '''
+
                 msg = MIMEMultipart()
-                msg['From'] = settings.MAIL_FROM
+                msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
                 msg['To'] = email
                 msg['Subject'] = subject
                 msg.attach(MIMEText(html_body, 'html'))

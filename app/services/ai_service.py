@@ -3265,13 +3265,39 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
+
+            # Try to extract JSON from markdown code fences
             if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-            questions = json.loads(cleaned)
+                parts = cleaned.split("```")
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith("json"):
+                        part = part[4:].strip()
+                    if part.startswith("["):
+                        cleaned = part
+                        break
+
+            # Fallback: find JSON array anywhere in the response via regex
+            if not cleaned.startswith("["):
+                match = re.search(r'\[[\s\S]*\]', cleaned)
+                if match:
+                    cleaned = match.group(0)
+
+            # Fix invalid JSON backslash escapes from AI-generated LaTeX.
+            # AI puts LaTeX like \text, \frac, \times, \alpha inside JSON strings.
+            # JSON parser interprets \t as tab, \f as form feed, \n as newline, etc.
+            # Fix: any \ followed by 2+ letters is a LaTeX command, not a JSON escape.
+            # Valid JSON escapes (\n, \t, \r, \b, \f) are always a single char after \.
+            def _fix_latex_escapes(s: str) -> str:
+                return re.sub(r'\\(?=[a-zA-Z]{2})', r'\\\\', s)
+
+            try:
+                questions = json.loads(cleaned)
+            except json.JSONDecodeError:
+                cleaned = _fix_latex_escapes(cleaned)
+                questions = json.loads(cleaned)
             if not isinstance(questions, list):
-                return [], []
+                raise ValueError(f"Expected JSON array, got {type(questions).__name__}")
 
             # Build separate answer key
             answer_key = []
@@ -3285,8 +3311,10 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 q["points"] = q.get("marks", 1)
 
             return questions, answer_key
-        except Exception:
-            return [], []
+        except Exception as e:
+            print(f"[AIService] Evaluation paper generation failed. Error: {e}", flush=True)
+            print(f"[AIService] Raw AI response (first 500 chars): {response[:500]}", flush=True)
+            raise ValueError(f"Failed to generate evaluation paper: {e}")
 
     async def generate_follow_up_questions(
         self, user_message: str, ai_response: str, count: int = 4

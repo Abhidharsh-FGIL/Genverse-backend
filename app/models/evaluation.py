@@ -1,4 +1,5 @@
 import uuid
+import secrets
 from datetime import datetime
 from sqlalchemy import String, Boolean, Integer, Float, DateTime, Text, func, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -105,6 +106,7 @@ class EvaluationAssessment(Base):
     question_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    max_attempts: Mapped[int | None] = mapped_column(Integer, nullable=True)  # for practice mode; None = unlimited
     status: Mapped[str] = mapped_column(String(20), default="draft")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -119,12 +121,17 @@ class EvaluationInvitation(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     assessment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("evaluation_assessments.id", ondelete="CASCADE"), nullable=False, index=True)
-    student_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False, index=True)
+    student_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=True, index=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True, default=lambda: secrets.token_urlsafe(32))
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     class_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("classes.id"))
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | accepted | completed
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    reinvited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # last re-invite timestamp
 
     assessment: Mapped["EvaluationAssessment"] = relationship(back_populates="invitations")
+    attempts: Mapped[list["EvaluationAttempt"]] = relationship(back_populates="invitation")
 
 
 class EvaluationAttempt(Base):
@@ -132,7 +139,8 @@ class EvaluationAttempt(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     assessment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("evaluation_assessments.id", ondelete="CASCADE"), nullable=False, index=True)
-    student_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False, index=True)
+    student_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=True, index=True)
+    invitation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("evaluation_invitations.id", ondelete="SET NULL"), nullable=True, index=True)
     responses: Mapped[dict | None] = mapped_column(JSONB)  # {questionId: answer}
     score: Mapped[float | None] = mapped_column(Float)
     max_score: Mapped[float | None] = mapped_column(Float)
@@ -140,5 +148,7 @@ class EvaluationAttempt(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), default="in_progress")
+    attempt_metadata: Mapped[dict | None] = mapped_column(JSONB)  # {tab_violations, auto_submitted, submit_reason}
 
     assessment: Mapped["EvaluationAssessment"] = relationship(back_populates="attempts")
+    invitation: Mapped["EvaluationInvitation | None"] = relationship(back_populates="attempts")

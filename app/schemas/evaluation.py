@@ -158,6 +158,7 @@ class EvalAssessmentCreate(BaseModel):
     negative_mark_value: Optional[float] = None
     scheduled_at: Optional[datetime] = None
     ends_at: Optional[datetime] = None
+    max_attempts: Optional[int] = None  # for practice mode; None = unlimited
 
 
 class EvalAssessmentResponse(BaseModel):
@@ -177,6 +178,7 @@ class EvalAssessmentResponse(BaseModel):
     due_date: Optional[datetime] = None
     scheduled_at: Optional[datetime] = None
     ends_at: Optional[datetime] = None
+    max_attempts: Optional[int] = None
     status: str
     created_at: datetime
 
@@ -199,7 +201,8 @@ class EvalAttemptSubmit(BaseModel):
 class EvalAttemptResponse(BaseModel):
     id: uuid.UUID
     assessment_id: uuid.UUID
-    student_id: uuid.UUID
+    student_id: Optional[uuid.UUID] = None
+    invitation_id: Optional[uuid.UUID] = None
     score: Optional[float] = None
     max_score: Optional[float] = None
     percentage: Optional[float] = None
@@ -208,3 +211,61 @@ class EvalAttemptResponse(BaseModel):
     status: str
 
     model_config = {"from_attributes": True}
+
+
+# ---- Invitation response (for report enrichment) ----
+
+class EvalInvitationResponse(BaseModel):
+    id: uuid.UUID
+    assessment_id: uuid.UUID
+    student_id: Optional[uuid.UUID] = None
+    email: str
+    name: Optional[str] = None
+    status: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ---- Public assessment endpoints (no auth required) ----
+
+class PublicAssessmentInfoResponse(BaseModel):
+    assessment_title: str
+    mode: str
+    question_count: Optional[int] = None
+    time_limit: Optional[int] = None
+    negative_marking: bool = False
+    due_date: Optional[datetime] = None
+    max_attempts: Optional[int] = None
+    attempts_used: int = 0
+    can_attempt: bool = True
+    invitation_status: str = "pending"
+    email: str = ""
+    organization_name: Optional[str] = None
+
+
+class PublicStartAttemptRequest(BaseModel):
+    name: Optional[str] = None
+
+
+class PublicAttemptResponse(BaseModel):
+    attempt_id: uuid.UUID
+    assessment_id: uuid.UUID
+    questions: List[dict]  # NO correct_answer included
+    time_limit: Optional[int] = None
+    started_at: datetime
+
+
+class PublicAutosaveRequest(BaseModel):
+    responses: dict  # {questionId: answer}
+
+
+class PublicSubmitRequest(BaseModel):
+    responses: dict  # {questionId: answer}
+    metadata: Optional[dict] = None  # {tab_violations, auto_submitted, submit_reason}
+
+
+class PublicSubmitResponse(BaseModel):
+    attempt_id: uuid.UUID
+    status: str
+    message: str
