@@ -1,8 +1,11 @@
+import asyncio
+import json
 import urllib.parse
 import uuid
+from typing import AsyncGenerator
 
-from fastapi import APIRouter, status, Query
-from fastapi.responses import Response
+from fastapi import APIRouter, status, Query, Request
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
 
@@ -130,6 +133,202 @@ async def generate_ebook(payload: EbookGenerateRequest, current_user: CurrentUse
     )
 
     return EbookGeneratedContent(ebook_json=ebook_json, page_count=resolved_page_count, points_used=cost)
+
+
+@router.post("/generate-stream")
+@router.post("/generate-stream/", include_in_schema=False)
+async def generate_ebook_stream(
+    payload: EbookGenerateRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+    request: Request,
+):
+    """Generate eBook content via SSE — streams real progress events to avoid gateway timeouts."""
+    resolved_size = payload.book_size or "short"
+    chapter_range = BOOK_SIZE_CHAPTER_RANGES.get(resolved_size, (3, 5))
+
+    PAGES_PER_CHAPTER = {"short": 3, "medium": 3, "large": 3}
+    num_chapters = len(payload.chapters) if payload.chapters else chapter_range[0]
+    resolved_page_count = payload.page_count
+    if resolved_page_count is None:
+        resolved_page_count = num_chapters * PAGES_PER_CHAPTER.get(resolved_size, 3)
+
+    # ── Do ALL database work BEFORE streaming ──────────────────────────────
+    # (FastAPI closes the DB session once we return the StreamingResponse)
+    points_service = PointsService()
+    if resolved_size == "large":
+        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_large", db=db)
+    elif resolved_size == "medium":
+        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_medium", db=db)
+
+    pc_result = await db.execute(select(PointCost).where(PointCost.action == "generate_ebook"))
+    pc = pc_result.scalars().first()
+    per_page_cost = pc.cost if pc else 1
+    cost = resolved_page_count * per_page_cost
+    await points_service.deduct_custom(user_id=current_user.id, action="generate_ebook", db=db, cost_override=cost)
+
+    # Pre-build outline
+    outline = payload.outline
+    if not outline and payload.chapters:
+        outline = [
+            ch.title + (f": {ch.description}" if ch.description else "")
+            for ch in payload.chapters
+        ]
+
+    # Pre-serialize chapter dicts
+    chapters_dicts = [ch.model_dump() for ch in payload.chapters] if payload.chapters else None
+    assessment_dict = payload.assessment_config.model_dump() if payload.assessment_config else None
+
+    # Capture values needed inside the generator (session/user may be gone once streaming starts)
+    user_id = current_user.id
+    org_id_val = payload.org_id
+
+    # ── Stream the AI generation (no DB needed) ───────────────────────────
+    # Progress: 10 points_done → 15 structure → 20..55 chapters → 60 chapters_done → 65..85 images → 92 finalizing → 100 complete
+    total_ch = num_chapters
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            yield f"data: {json.dumps({'stage': 'points_done', 'progress': 10, 'message': 'Points deducted successfully'})}\n\n"
+
+            yield f"data: {json.dumps({'stage': 'writing', 'progress': 15, 'message': f'Writing {total_ch} chapters in parallel...'})}\n\n"
+
+            # Callback: each chapter completion pushes an SSE event via queue
+            progress_queue: asyncio.Queue = asyncio.Queue()
+
+            async def on_chapter_done(ch_num: int, ch_total: int):
+                # Map chapter progress to 15–55 range
+                pct = 15 + int((ch_num / ch_total) * 40)
+                await progress_queue.put({
+                    "stage": "chapter_done",
+                    "progress": pct,
+                    "message": f"Chapter {ch_num}/{ch_total} written",
+                    "chapter_number": ch_num,
+                    "total_chapters": ch_total,
+                })
+
+            # Run generation in a background task so we can drain the queue
+            ai = AIService()
+            gen_task = asyncio.create_task(ai.generate_ebook_content_only(
+                title=payload.title,
+                author=payload.author or "",
+                subject=payload.topic or payload.subject,
+                grade=payload.grade,
+                language=payload.language,
+                source_type=payload.source_type,
+                outline=outline,
+                page_count=resolved_page_count,
+                chapter_range=chapter_range,
+                tone=payload.tone or "academic",
+                book_size=resolved_size,
+                chapters=chapters_dicts,
+                assessment_config=assessment_dict,
+                on_chapter_done=on_chapter_done,
+            ))
+
+            # Drain progress events while generation is running
+            while not gen_task.done():
+                try:
+                    event = await asyncio.wait_for(progress_queue.get(), timeout=5.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send heartbeat to keep connection alive (prevents proxy timeouts)
+                    yield ": heartbeat\n\n"
+
+            # Drain any remaining events in the queue
+            while not progress_queue.empty():
+                event = progress_queue.get_nowait()
+                yield f"data: {json.dumps(event)}\n\n"
+
+            # Get the result (will re-raise if generation failed)
+            ebook_data = await gen_task
+
+            yield f"data: {json.dumps({'stage': 'chapters_done', 'progress': 58, 'message': 'All chapters written successfully'})}\n\n"
+
+            # Generate images
+            image_density = payload.image_density or "standard"
+            if image_density != "minimal":
+                yield f"data: {json.dumps({'stage': 'images', 'progress': 62, 'message': 'Creating images...'})}\n\n"
+                try:
+                    generated_chapters = ebook_data.get("chapters", [])
+                    images = await ai.generate_ebook_images(
+                        title=payload.title,
+                        chapters=generated_chapters,
+                        image_density=image_density,
+                        image_types=payload.image_types,
+                        subject=payload.topic or payload.subject,
+                        grade=payload.grade,
+                        tone=payload.tone or "academic",
+                    )
+                    ebook_data["images"] = images
+                except Exception as e:
+                    print(f"[EbookImage] Image generation error: {e}")
+
+                yield f"data: {json.dumps({'stage': 'images_done', 'progress': 85, 'message': 'Images created'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'stage': 'images_done', 'progress': 85, 'message': 'Skipping images (minimal density)'})}\n\n"
+
+            yield f"data: {json.dumps({'stage': 'finalizing', 'progress': 92, 'message': 'Saving eBook...'})}\n\n"
+
+            # Save to DB server-side (avoids sending huge base64 images over SSE)
+            from app.database import AsyncSessionLocal
+            saved_id = None
+            try:
+                async with AsyncSessionLocal() as save_db:
+                    ebook_json_with_config = {
+                        **ebook_data,
+                        "config": {
+                            "author": payload.author,
+                            "bookSize": resolved_size,
+                            "tone": payload.tone or "academic",
+                            "imageDensity": payload.image_density or "standard",
+                            "imageTypes": payload.image_types,
+                            "assessmentConfig": assessment_dict,
+                        },
+                    }
+                    ebook = Ebook(
+                        user_id=user_id,
+                        org_id=_parse_org_id(org_id_val),
+                        title=payload.title,
+                        subject=payload.topic or payload.subject,
+                        grade=payload.grade,
+                        language=payload.language,
+                        source_type=payload.source_type or "topic",
+                        ebook_json=ebook_json_with_config,
+                        page_count=resolved_page_count,
+                        points_used=cost,
+                    )
+                    save_db.add(ebook)
+                    await save_db.commit()
+                    await save_db.refresh(ebook)
+                    saved_id = str(ebook.id)
+                    print(f"[Ebook] Saved to DB: {saved_id}", flush=True)
+            except Exception as save_err:
+                print(f"[Ebook] DB save failed: {save_err}", flush=True)
+
+            result = {
+                "stage": "complete",
+                "progress": 100,
+                "message": "eBook generated successfully",
+                "saved_id": saved_id,
+                "page_count": resolved_page_count,
+                "points_used": cost,
+            }
+            yield f"data: {json.dumps(result)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'stage': 'error', 'progress': 0, 'message': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/", response_model=EbookResponse, status_code=status.HTTP_201_CREATED)

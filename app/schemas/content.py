@@ -88,6 +88,7 @@ class EbookGenerateRequest(BaseModel):
     image_density: Optional[Literal["minimal", "standard", "visual_heavy"]] = "standard"
     image_types: Optional[List[str]] = None
     assessment_config: Optional[AssessmentConfig] = None
+    org_id: Optional[str] = None
 
 
 class EbookGeneratedContent(BaseModel):

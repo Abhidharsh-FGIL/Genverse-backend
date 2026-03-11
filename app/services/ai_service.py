@@ -47,6 +47,48 @@ class AIService:
             self._anthropic_client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
         return self._anthropic_client
 
+    async def _ebook_llm_call(self, prompt: str, max_tokens: int = 8192) -> str:
+        """Dedicated LLM call for ebook text generation.
+
+        Uses AI_EBOOK_MODEL (default: gpt-4o) via OpenAI with JSON mode.
+        Falls back to Gemini if OpenAI is unavailable.
+        """
+        model = settings.AI_EBOOK_MODEL or "gpt-4o"
+
+        # Try OpenAI first (primary for ebook text)
+        openai = self._get_openai()
+        if openai:
+            try:
+                response = await openai.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                    temperature=0.7,
+                )
+                text = response.choices[0].message.content
+                if text:
+                    return text
+            except Exception as e:
+                print(f"[Ebook] OpenAI ({model}) failed: {e}", flush=True)
+
+        # Fallback to Gemini with JSON mode
+        gemini = self._get_gemini()
+        if gemini:
+            try:
+                response = gemini.generate_content(
+                    prompt,
+                    generation_config={
+                        "max_output_tokens": max_tokens,
+                        "response_mime_type": "application/json",
+                    },
+                )
+                return response.text
+            except Exception as e:
+                print(f"[Ebook] Gemini fallback failed: {e}", flush=True)
+
+        return ""
+
     def _get_grade_band(self, grade: int | None) -> str:
         """Return a descriptive grade band for calibrating responses."""
         if not grade:
@@ -590,6 +632,8 @@ class AIService:
     async def chat(
         self, messages: List[dict], context: dict | None = None,
         chat_settings: dict | None = None, has_files: bool = False,
+        max_output_tokens: int | None = None,
+        json_mode: bool = False,
     ) -> str:
         """Non-streaming chat with AI.
 
@@ -669,6 +713,14 @@ class AIService:
 
         response_text: str | None = None
 
+        # Build Gemini generation_config when custom options are requested
+        gemini_gen_config = {}
+        if max_output_tokens:
+            gemini_gen_config["max_output_tokens"] = max_output_tokens
+        if json_mode:
+            gemini_gen_config["response_mime_type"] = "application/json"
+        gemini_gen_config = gemini_gen_config or None
+
         if has_files:
             # File-based queries → Anthropic Claude primary, OpenAI fallback, Gemini fallback
             anthropic = self._get_anthropic()
@@ -682,7 +734,7 @@ class AIService:
                         claude_messages.insert(0, {"role": "user", "content": "Hello"})
                     response = await anthropic.messages.create(
                         model=settings.AI_DOCUMENT_MODEL,
-                        max_tokens=4096,
+                        max_tokens=max_output_tokens or 4096,
                         system=system_prompt,
                         messages=claude_messages,
                     )
@@ -692,17 +744,21 @@ class AIService:
             openai = self._get_openai()
             if openai and response_text is None:
                 try:
-                    response = await openai.chat.completions.create(
-                        model=settings.AI_FALLBACK_MODEL,
-                        messages=[{"role": "system", "content": system_prompt}] + messages,
-                    )
+                    openai_kwargs: dict = {
+                        "model": settings.AI_FALLBACK_MODEL,
+                        "messages": [{"role": "system", "content": system_prompt}] + messages,
+                        "max_tokens": max_output_tokens or 4096,
+                    }
+                    if json_mode:
+                        openai_kwargs["response_format"] = {"type": "json_object"}
+                    response = await openai.chat.completions.create(**openai_kwargs)
                     response_text = response.choices[0].message.content
                 except Exception:
                     pass
             gemini = self._get_gemini()
             if gemini and response_text is None:
                 try:
-                    response = gemini.generate_content(full_prompt)
+                    response = gemini.generate_content(full_prompt, generation_config=gemini_gen_config)
                     response_text = response.text
                 except Exception:
                     pass
@@ -711,17 +767,20 @@ class AIService:
             gemini = self._get_gemini()
             if gemini and response_text is None:
                 try:
-                    response = gemini.generate_content(full_prompt)
+                    response = gemini.generate_content(full_prompt, generation_config=gemini_gen_config)
                     response_text = response.text
                 except Exception:
                     pass
             openai = self._get_openai()
             if openai and response_text is None:
                 try:
-                    response = await openai.chat.completions.create(
-                        model=settings.AI_FALLBACK_MODEL,
-                        messages=[{"role": "system", "content": system_prompt}] + messages,
-                    )
+                    openai_kwargs2: dict = {
+                        "model": settings.AI_FALLBACK_MODEL,
+                        "messages": [{"role": "system", "content": system_prompt}] + messages,
+                    }
+                    if json_mode:
+                        openai_kwargs2["response_format"] = {"type": "json_object"}
+                    response = await openai.chat.completions.create(**openai_kwargs2)
                     response_text = response.choices[0].message.content
                 except Exception:
                     pass
@@ -1514,6 +1573,364 @@ Return ONLY valid JSON in this exact structure:
         print(f"[EbookImage] Done. Cover: {bool(result['cover_image'])}, Chapters with images: {len(result['chapter_images'])}")
         return result
 
+    # ── Shared helpers for ebook generation ────────────────────────────────
+
+    _TONE_INSTRUCTIONS = {
+        "academic": (
+            "Write in formal, scholarly language with precise terminology. "
+            "Define key terms when introduced. Use evidence-based arguments, "
+            "structured sub-sections with clear headings, and rigorous explanations. "
+            "Each chapter should read like a well-researched textbook section."
+        ),
+        "simple": (
+            "Write in plain, easy-to-understand language suitable for beginners. "
+            "Avoid jargon; explain technical terms immediately in simple words. "
+            "Use short sentences, bullet points, relatable everyday analogies, "
+            "and friendly examples that a student new to the topic can follow."
+        ),
+        "story_based": (
+            "Open every chapter with a short engaging story, scenario, or character dialogue "
+            "that naturally introduces the topic. Narrate concepts through the story, "
+            "weaving educational content into the narrative. Use vivid descriptions, "
+            "relatable characters, and real-world situations to make learning immersive."
+        ),
+        "exam_oriented": (
+            "Focus strictly on exam-relevant facts, formulas, definitions, and concepts. "
+            "Use callout markers like 'Remember:', 'Key Formula:', and 'Exam Tip:' "
+            "to highlight critical information. End every chapter with 3-5 practice "
+            "questions (with answers) covering the chapter's most testable content."
+        ),
+    }
+
+    _SIZE_CONTENT_GUIDES = {
+        "short": {
+            "total_pages": 15,
+            "content_pages": "pages 5–15 (11 content pages)",
+            "paragraphs": "4-5 substantial paragraphs",
+            "depth": (
+                "Cover the concept with a clear introduction, 2-3 detailed body sections with examples, "
+                "and a concise conclusion. Each chapter must feel complete and informative on its own."
+            ),
+            "key_points": "4-5 key points per chapter",
+            "words_hint": "~1000-1200 words per chapter",
+        },
+        "medium": {
+            "total_pages": 30,
+            "content_pages": "pages 5–30 (26 content pages)",
+            "paragraphs": "6-8 detailed paragraphs",
+            "depth": (
+                "Cover the topic with solid depth. Include an introduction, 3-5 well-developed sections "
+                "with examples and explanations, connections to related ideas, and a conclusion paragraph."
+            ),
+            "key_points": "5-7 key points per chapter",
+            "words_hint": "~1200-1500 words per chapter",
+        },
+        "large": {
+            "total_pages": 60,
+            "content_pages": "pages 5–60 (56 content pages)",
+            "paragraphs": "9-12 comprehensive paragraphs with internal sub-headings",
+            "depth": (
+                "Cover the topic exhaustively. Use sub-headings to structure major ideas. Include an introduction, "
+                "multiple in-depth sections with worked examples or case studies, real-world applications, "
+                "and a thorough conclusion."
+            ),
+            "key_points": "6-8 key points per chapter",
+            "words_hint": "~1400-1800 words per chapter",
+        },
+    }
+
+    _LANGUAGE_NAMES = {
+        "en": "English", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
+        "fr": "French", "de": "German", "es": "Spanish", "zh": "Chinese",
+        "ar": "Arabic", "pt": "Portuguese",
+    }
+
+    _HTML_FORMAT_RULES = (
+        "FORMATTING: Use ONLY these HTML tags for formatting — no markdown syntax at all (no **, no #, no *, no _):\n"
+        "  - Sub-headings: <h3>Sub-heading Text</h3> on its own line\n"
+        "  - Bold/emphasis: <b>important term</b>\n"
+        "  - Italic: <i>emphasized text</i>\n"
+        "  - Paragraphs: separate paragraphs with blank lines (double newline)\n"
+        "  - Lists: <ul><li>item</li></ul> or <ol><li>item</li></ol>\n"
+        "  - Code blocks: <pre><code class=\"language-python\">code here</code></pre> (use the correct language class).\n"
+        "    IMPORTANT: Preserve proper indentation and newlines inside code blocks.\n"
+        "  - Inline code: <code>variable_name</code>\n"
+        "  - Math/equations: Use LaTeX notation — inline: $E = mc^2$ , block: $$\\int_0^\\infty e^{-x} dx = 1$$\n"
+        "  - Do NOT wrap paragraphs in <p> tags — just use blank lines between them.\n"
+        "  - NEVER use markdown: no **bold**, no *italic*, no # headings, no - bullet lists, no ```code fences```."
+    )
+
+    @staticmethod
+    def _parse_json_response(response: str) -> dict | None:
+        """Try to parse a JSON response, stripping markdown fences if present."""
+        cleaned = response.strip()
+        # Strip markdown code fences: ```json ... ``` or ``` ... ```
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", cleaned, re.DOTALL)
+        if fence_match:
+            cleaned = fence_match.group(1).strip()
+        # If still not valid JSON, try to extract the first { ... } block
+        if not cleaned.startswith("{"):
+            brace_start = cleaned.find("{")
+            if brace_start != -1:
+                cleaned = cleaned[brace_start:]
+        # Trim anything after the last }
+        if cleaned:
+            brace_end = cleaned.rfind("}")
+            if brace_end != -1:
+                cleaned = cleaned[: brace_end + 1]
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _convert_markdown_fences_to_html(text: str) -> str:
+        """Convert markdown code fences (```lang ... ```) to HTML <pre><code> blocks."""
+        def _replace_fence(m: re.Match) -> str:
+            lang = m.group(1) or ""
+            code = m.group(2)
+            # HTML-escape the code content
+            code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            if lang:
+                return f'<pre><code class="language-{lang}">{code}</code></pre>'
+            return f"<pre><code>{code}</code></pre>"
+        # Match ```lang\ncode``` or ```\ncode```
+        text = re.sub(r"```(\w+)?\s*\n(.*?)```", _replace_fence, text, flags=re.DOTALL)
+        # Also convert inline backticks: `code` → <code>code</code>
+        text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+        return text
+
+    # ── Step 1: Generate book metadata (title page, summary, TOC, thank you) ─
+
+    async def _generate_ebook_metadata(
+        self,
+        title: str,
+        author: str,
+        subject: str | None,
+        grade: int | None,
+        language: str,
+        book_size: str,
+        tone: str,
+        chapter_list: list[dict],
+    ) -> dict:
+        """Generate book metadata: title_page, book_summary, table_of_contents, thank_you_message."""
+        language_name = self._LANGUAGE_NAMES.get(language, language.upper())
+        toc_list = "\n".join(f"  {i+1}. {ch.get('title', f'Chapter {i+1}')}" for i, ch in enumerate(chapter_list))
+
+        prompt = f"""Generate the metadata for an educational eBook. Return ONLY valid JSON (no markdown fences).
+
+Book details:
+- Title: {title}
+- Author: {author}
+- Subject: {subject or "General"}
+- Grade: {grade or "General"}
+- Language: {language_name}
+- Book Size: {book_size}
+- Tone: {tone.replace("_", " ").title()}
+
+Chapters in this book:
+{toc_list}
+
+LANGUAGE REQUIREMENT: Write ALL content in {language_name}.
+
+Return this exact JSON structure:
+{{
+  "title_page": {{
+    "title": "{title}",
+    "author": "{author}",
+    "subtitle": "A compelling subtitle for the book",
+    "description": "2-3 sentence overview of the entire book"
+  }},
+  "book_summary": "4-10 sentences giving a comprehensive overview of the ENTIRE book — its scope, key themes, and what the reader will learn.",
+  "table_of_contents": [
+    {", ".join(f'{{"chapter_number": {i+1}, "title": "{ch.get("title", f"Chapter {i+1}")}"}}' for i, ch in enumerate(chapter_list))}
+  ],
+  "thank_you_message": "2-3 warm, encouraging sentences wishing the reader well after completing the book."
+}}"""
+        print(f"[Ebook] Generating metadata for '{title}'...", flush=True)
+        response = await self._ebook_llm_call(prompt, max_tokens=2048)
+        parsed = self._parse_json_response(response)
+        if parsed:
+            return parsed
+        # Fallback
+        return {
+            "title_page": {"title": title, "author": author, "subtitle": "", "description": ""},
+            "book_summary": "",
+            "table_of_contents": [
+                {"chapter_number": i + 1, "title": ch.get("title", f"Chapter {i + 1}")}
+                for i, ch in enumerate(chapter_list)
+            ],
+            "thank_you_message": f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you.",
+        }
+
+    # ── Step 2: Generate a single chapter (called in parallel) ───────────
+
+    async def _generate_single_chapter(
+        self,
+        chapter_number: int,
+        chapter_title: str,
+        chapter_description: str,
+        title: str,
+        subject: str | None,
+        grade: int | None,
+        language: str,
+        book_size: str,
+        tone: str,
+        total_chapters: int,
+        all_chapter_titles: list[str],
+    ) -> dict:
+        """Generate content for a single chapter via its own LLM call."""
+        language_name = self._LANGUAGE_NAMES.get(language, language.upper())
+        size_guide = self._SIZE_CONTENT_GUIDES.get(book_size, self._SIZE_CONTENT_GUIDES["short"])
+        tone_guide = self._TONE_INSTRUCTIONS.get(tone, self._TONE_INSTRUCTIONS["academic"])
+
+        # Give context about the full book so chapters feel cohesive
+        other_chapters = "\n".join(
+            f"  {i+1}. {t}" for i, t in enumerate(all_chapter_titles)
+        )
+
+        prompt = f"""You are writing Chapter {chapter_number} of a {total_chapters}-chapter educational eBook.
+
+Book: "{title}"
+Subject: {subject or "General"}
+Grade: {grade or "General"}
+Language: {language_name}
+
+Full book outline (for context — you are writing ONLY chapter {chapter_number}):
+{other_chapters}
+
+CHAPTER TO WRITE:
+- Chapter Number: {chapter_number}
+- Title: {chapter_title}
+{f'- Description/Scope: {chapter_description}' if chapter_description else ''}
+
+TONE: {tone.replace("_", " ").title()}
+{tone_guide}
+
+CONTENT REQUIREMENTS:
+- Length: {size_guide["paragraphs"]} — {size_guide["words_hint"]}
+- Structure: {size_guide["depth"]}
+- The content must be the FULL chapter body — not a placeholder, stub, or summary.
+- Do NOT include the chapter title in the content — it will be added separately.
+
+{self._HTML_FORMAT_RULES}
+
+LANGUAGE: Write ALL content in {language_name}. Do NOT use any other language.
+
+Return ONLY valid JSON (no markdown fences):
+{{
+  "chapter_number": {chapter_number},
+  "title": "{chapter_title}",
+  "content": "Full chapter content here with HTML formatting...",
+  "key_points": ["point 1", "point 2", "..."],
+  "summary": "1-2 sentence recap of this chapter"
+}}"""
+        # Retry up to 2 times for reliable JSON output
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            response = await self._ebook_llm_call(prompt, max_tokens=12000)
+            parsed = self._parse_json_response(response)
+            if parsed:
+                parsed["chapter_number"] = chapter_number
+                # Post-process: convert any markdown code fences to HTML
+                if "content" in parsed and isinstance(parsed["content"], str):
+                    parsed["content"] = self._convert_markdown_fences_to_html(parsed["content"])
+                print(f"[Ebook] Chapter {chapter_number}/{total_chapters} generated: {chapter_title}", flush=True)
+                return parsed
+            if attempt < max_retries:
+                print(f"[Ebook] Chapter {chapter_number} attempt {attempt+1} failed, retrying...", flush=True)
+            else:
+                print(f"[Ebook] Chapter {chapter_number} all attempts failed. First 300 chars: {response[:300]}", flush=True)
+
+        # Final fallback — try to extract just the content field from the raw response
+        fallback_content = response
+        try:
+            # Attempt partial extraction: find "content" field value in the raw JSON string
+            content_match = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', response, re.DOTALL)
+            if content_match:
+                fallback_content = content_match.group(1).encode().decode('unicode_escape')
+        except Exception:
+            pass  # keep the raw response if extraction fails
+        # Convert any remaining markdown code fences to HTML
+        fallback_content = self._convert_markdown_fences_to_html(fallback_content)
+        return {
+            "chapter_number": chapter_number,
+            "title": chapter_title,
+            "content": fallback_content,
+            "key_points": [],
+            "summary": "",
+        }
+
+    # ── Step 3: Generate assessments (separate call) ─────────────────────
+
+    async def _generate_ebook_assessment(
+        self,
+        title: str,
+        language: str,
+        chapters_data: list[dict],
+        assessment_config: dict,
+    ) -> dict | None:
+        """Generate final_assessment section across all chapters."""
+        language_name = self._LANGUAGE_NAMES.get(language, language.upper())
+        difficulty = assessment_config.get("difficulty", "medium")
+        q_types = assessment_config.get("questionTypes", ["MCQ"])
+        blooms = assessment_config.get("bloomsLevel", "understand")
+        q_types_str = ", ".join(q_types)
+
+        type_instructions = []
+        json_fields = []
+        if "MCQ" in q_types:
+            type_instructions.append('- For MCQ: include in "mcq_questions" with "chapter_number", "question", "options" (4 choices), "answer" (correct option text).')
+            json_fields.append('    "mcq_questions": [{ "chapter_number": 1, "question": "...", "options": ["A", "B", "C", "D"], "answer": "..." }]')
+        if "Fill in Blank" in q_types:
+            type_instructions.append('- For Fill in Blank: include in "fill_in_blank_questions" with "chapter_number", "question" (with ___), "answer".')
+            json_fields.append('    "fill_in_blank_questions": [{ "chapter_number": 1, "question": "The ___ process...", "answer": "..." }]')
+        if "Short Answer" in q_types:
+            type_instructions.append('- For Short Answer: include in "short_answer_questions" with "chapter_number", "question", "answer" (2-3 sentences).')
+            json_fields.append('    "short_answer_questions": [{ "chapter_number": 1, "question": "...", "answer": "..." }]')
+        if "Long Answer" in q_types:
+            type_instructions.append('- For Long Answer: include in "long_answer_questions" with "chapter_number", "question", "answer" (detailed).')
+            json_fields.append('    "long_answer_questions": [{ "chapter_number": 1, "question": "...", "answer": "..." }]')
+
+        # Build chapter summaries for context
+        chapter_context = "\n".join(
+            f"Chapter {ch['chapter_number']}: {ch['title']}\n  Summary: {ch.get('summary', 'N/A')}\n  Key Points: {', '.join(ch.get('key_points', []))}"
+            for ch in chapters_data
+        )
+
+        prompt = f"""Generate assessment questions for an educational eBook titled "{title}".
+
+LANGUAGE: Write ALL questions and answers in {language_name}.
+
+Chapter summaries:
+{chapter_context}
+
+REQUIREMENTS:
+- Generate 3-5 questions PER CHAPTER, distributed across ALL {len(chapters_data)} chapters.
+- Question types: {q_types_str}
+- Difficulty: {difficulty}
+- Bloom's Taxonomy level: {blooms}
+{chr(10).join(type_instructions)}
+- Only include JSON keys for the selected question types above — omit others.
+
+Return ONLY valid JSON (no markdown fences):
+{{
+{("," + chr(10)).join(json_fields)}
+}}"""
+        print(f"[Ebook] Generating assessments for {len(chapters_data)} chapters...", flush=True)
+        for attempt in range(3):
+            response = await self._ebook_llm_call(prompt, max_tokens=12000)
+            parsed = self._parse_json_response(response)
+            if parsed:
+                print(f"[Ebook] Assessments generated successfully", flush=True)
+                return parsed
+            if attempt < 2:
+                print(f"[Ebook] Assessment attempt {attempt+1} failed, retrying...", flush=True)
+        print(f"[Ebook] Assessment all attempts failed", flush=True)
+        return None
+
+    # ── Main entry point: parallel ebook generation ──────────────────────
+
     async def generate_ebook(
         self,
         title: str,
@@ -1531,248 +1948,123 @@ Return ONLY valid JSON in this exact structure:
         image_types: List[str] | None = None,
         author: str = "",
         assessment_config: dict | None = None,
+        on_chapter_done: Any = None,
     ) -> dict:
-        """Generate structured eBook content as JSON, then generate images."""
-        if chapters:
-            outline_str = "\n".join(
-                f"- {ch.get('title', '')}" + (f": {ch.get('description', '')}" if ch.get('description') else "")
-                for ch in chapters
-            )
-        else:
-            outline_str = "\n".join(f"- {item}" for item in (outline or []))
-        min_ch, max_ch = chapter_range
+        """Generate structured eBook content using parallel LLM calls per chapter, then images.
 
-        tone_instructions = {
-            "academic": (
-                "Write in formal, scholarly language with precise terminology. "
-                "Define key terms when introduced. Use evidence-based arguments, "
-                "structured sub-sections with clear headings, and rigorous explanations. "
-                "Each chapter should read like a well-researched textbook section."
-            ),
-            "simple": (
-                "Write in plain, easy-to-understand language suitable for beginners. "
-                "Avoid jargon; explain technical terms immediately in simple words. "
-                "Use short sentences, bullet points, relatable everyday analogies, "
-                "and friendly examples that a student new to the topic can follow."
-            ),
-            "story_based": (
-                "Open every chapter with a short engaging story, scenario, or character dialogue "
-                "that naturally introduces the topic. Narrate concepts through the story, "
-                "weaving educational content into the narrative. Use vivid descriptions, "
-                "relatable characters, and real-world situations to make learning immersive."
-            ),
-            "exam_oriented": (
-                "Focus strictly on exam-relevant facts, formulas, definitions, and concepts. "
-                "Use callout markers like 'Remember:', 'Key Formula:', and 'Exam Tip:' "
-                "to highlight critical information. End every chapter with 3-5 practice "
-                "questions (with answers) covering the chapter's most testable content."
-            ),
-        }
-
-        size_content_guides = {
-            "short": {
-                "total_pages": 15,
-                "content_pages": "pages 5–15 (11 content pages)",
-                "paragraphs": "4-5 substantial paragraphs",
-                "depth": (
-                    "Cover the concept with a clear introduction, 2-3 detailed body sections with examples, "
-                    "and a concise conclusion. Each chapter must feel complete and informative on its own."
-                ),
-                "key_points": "4-5 key points per chapter",
-                "words_hint": "~1000-1200 words per chapter",
-            },
-            "medium": {
-                "total_pages": 30,
-                "content_pages": "pages 5–30 (26 content pages)",
-                "paragraphs": "6-8 detailed paragraphs",
-                "depth": (
-                    "Cover the topic with solid depth. Include an introduction, 3-5 well-developed sections "
-                    "with examples and explanations, connections to related ideas, and a conclusion paragraph."
-                ),
-                "key_points": "5-7 key points per chapter",
-                "words_hint": "~1200-1500 words per chapter",
-            },
-            "large": {
-                "total_pages": 60,
-                "content_pages": "pages 5–60 (56 content pages)",
-                "paragraphs": "9-12 comprehensive paragraphs with internal sub-headings",
-                "depth": (
-                    "Cover the topic exhaustively. Use sub-headings to structure major ideas. Include an introduction, "
-                    "multiple in-depth sections with worked examples or case studies, real-world applications, "
-                    "and a thorough conclusion."
-                ),
-                "key_points": "6-8 key points per chapter",
-                "words_hint": "~1400-1800 words per chapter",
-            },
-        }
-
-        tone_guide = tone_instructions.get(tone, tone_instructions["academic"])
-        size_guide = size_content_guides.get(book_size, size_content_guides["short"])
-
-        language_names = {
-            "en": "English", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
-            "fr": "French", "de": "German", "es": "Spanish", "zh": "Chinese",
-            "ar": "Arabic", "pt": "Portuguese",
-        }
-        language_name = language_names.get(language, language.upper())
-
-        chapters_provided = bool(chapters and len(chapters) > 0)
-        chapter_count_instruction = (
-            f"Use EXACTLY the {len(chapters)} chapters listed in the outline below — do not add, remove, or reorder them."
-            if chapters_provided
-            else f"Generate between {min_ch} and {max_ch} chapters — choose the exact count that best covers the topic."
-        )
-
-        assessment_section = ""
-        final_assessment_json = '"final_assessment": null'
+        Args:
+            on_chapter_done: Optional async callback(chapter_number, total) called when each chapter finishes.
+        """
+        author = author or "Anonymous"
         assessment_enabled = bool(assessment_config and assessment_config.get("enabled"))
+
+        # Build the chapter list from provided chapters or outline
+        if chapters and len(chapters) > 0:
+            chapter_list = [
+                {"title": ch.get("title", f"Chapter {i+1}"), "description": ch.get("description", "")}
+                for i, ch in enumerate(chapters)
+            ]
+        elif outline:
+            chapter_list = [{"title": item, "description": ""} for item in outline]
+        else:
+            # No chapters provided — generate outline first
+            min_ch, max_ch = chapter_range
+            outline_data = await self.generate_ebook_outline(
+                title=title, topic=subject, subject=subject,
+                language=language, chapter_range=chapter_range, tone=tone,
+            )
+            chapter_list = [{"title": ch["title"], "description": ch.get("description", "")} for ch in outline_data]
+
+        total_chapters = len(chapter_list)
+        all_chapter_titles = [ch["title"] for ch in chapter_list]
+        print(f"[Ebook] Starting parallel generation: {total_chapters} {book_size} chapters", flush=True)
+
+        # ── Step 1 + Step 2 in parallel: metadata + all chapters concurrently ──
+        async def _gen_chapter(idx: int, ch: dict) -> dict:
+            result = await self._generate_single_chapter(
+                chapter_number=idx + 1,
+                chapter_title=ch["title"],
+                chapter_description=ch.get("description", ""),
+                title=title,
+                subject=subject,
+                grade=grade,
+                language=language,
+                book_size=book_size,
+                tone=tone,
+                total_chapters=total_chapters,
+                all_chapter_titles=all_chapter_titles,
+            )
+            if on_chapter_done:
+                await on_chapter_done(idx + 1, total_chapters)
+            return result
+
+        # Fire metadata + all chapters concurrently
+        tasks = [self._generate_ebook_metadata(
+            title=title, author=author, subject=subject, grade=grade,
+            language=language, book_size=book_size, tone=tone, chapter_list=chapter_list,
+        )]
+        for idx, ch in enumerate(chapter_list):
+            tasks.append(_gen_chapter(idx, ch))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Unpack results
+        metadata = results[0] if not isinstance(results[0], Exception) else {}
+        if isinstance(metadata, Exception):
+            print(f"[Ebook] Metadata generation failed: {metadata}", flush=True)
+            metadata = {}
+
+        generated_chapters = []
+        for i, result in enumerate(results[1:], start=1):
+            if isinstance(result, Exception):
+                print(f"[Ebook] Chapter {i} failed: {result}", flush=True)
+                generated_chapters.append({
+                    "chapter_number": i,
+                    "title": chapter_list[i - 1]["title"],
+                    "content": f"<i>Content generation failed for this chapter. Error: {result}</i>",
+                    "key_points": [],
+                    "summary": "",
+                })
+            else:
+                generated_chapters.append(result)
+
+        # Sort by chapter_number to maintain order
+        generated_chapters.sort(key=lambda c: c.get("chapter_number", 0))
+
+        # ── Step 3: Assessments (after chapters are done, needs their content) ──
+        final_assessment = None
         if assessment_enabled:
-            difficulty = assessment_config.get("difficulty", "medium")
-            q_types = assessment_config.get("questionTypes", ["MCQ"])
-            blooms = assessment_config.get("bloomsLevel", "understand")
-            q_types_str = ", ".join(q_types)
+            try:
+                final_assessment = await self._generate_ebook_assessment(
+                    title=title, language=language,
+                    chapters_data=generated_chapters, assessment_config=assessment_config,
+                )
+            except Exception as e:
+                print(f"[Ebook] Assessment generation failed: {e}", flush=True)
 
-            type_instructions = []
-            json_fields = []
-            if "MCQ" in q_types:
-                type_instructions.append('- For MCQ: include in "mcq_questions" with "chapter_number", "question", "options" (4 choices), "answer" (correct option text).')
-                json_fields.append('    "mcq_questions": [\n      { "chapter_number": 1, "question": "...", "options": ["...", "...", "...", "..."], "answer": "..." }\n    ]')
-            if "Fill in Blank" in q_types:
-                type_instructions.append('- For Fill in Blank: include in "fill_in_blank_questions" with "chapter_number", "question" (sentence with ___ for the blank), "answer" (word/phrase that fills the blank).')
-                json_fields.append('    "fill_in_blank_questions": [\n      { "chapter_number": 1, "question": "The ___ process converts sunlight into energy.", "answer": "photosynthesis" }\n    ]')
-            if "Short Answer" in q_types:
-                type_instructions.append('- For Short Answer: include in "short_answer_questions" with "chapter_number", "question", "answer" (2-3 sentence model answer).')
-                json_fields.append('    "short_answer_questions": [\n      { "chapter_number": 1, "question": "...", "answer": "..." }\n    ]')
-            if "Long Answer" in q_types:
-                type_instructions.append('- For Long Answer: include in "long_answer_questions" with "chapter_number", "question", "answer" (detailed model answer).')
-                json_fields.append('    "long_answer_questions": [\n      { "chapter_number": 1, "question": "...", "answer": "..." }\n    ]')
+        # ── Assemble final ebook_data ──
+        ebook_data = {
+            "title": title,
+            "author": author,
+            "language": language,
+            "book_size": book_size,
+            "tone": tone,
+            "title_page": metadata.get("title_page", {"title": title, "author": author, "subtitle": "", "description": ""}),
+            "book_summary": metadata.get("book_summary", ""),
+            "table_of_contents": metadata.get("table_of_contents", [
+                {"chapter_number": i + 1, "title": ch["title"]} for i, ch in enumerate(chapter_list)
+            ]),
+            "chapters": generated_chapters,
+            "final_assessment": final_assessment,
+            "thank_you_message": metadata.get("thank_you_message",
+                f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you."),
+        }
 
-            instructions_str = "\n".join(type_instructions)
-            assessment_section = f"""
-ASSESSMENT REQUIREMENTS:
-- Place ALL assessment questions in the root-level "final_assessment" section — NOT inside individual chapters.
-- Generate 3-5 questions per chapter, distributed across all chapters of the book.
-- Question types to include: {q_types_str}
-- Difficulty: {difficulty}
-- Bloom's Taxonomy level: {blooms}
-{instructions_str}
-- Only include JSON keys for the selected question types above — omit others entirely.
-- Group questions by type in order — this is the final section of the book.
-"""
-            fields_str = ",\n".join(json_fields)
-            final_assessment_json = f'"final_assessment": {{\n{fields_str}\n  }}'
+        print(f"[Ebook] All {total_chapters} chapters assembled successfully", flush=True)
 
-        assessment_layout_line = (
-            '  • End Pages — Assessment Section: all MCQs grouped together, then Short Answers, then Long Answers'
-            if assessment_enabled else ""
-        )
-        no_assessment_note = (
-            "" if assessment_enabled
-            else '- Do NOT include any assessment questions. Set "final_assessment" to null.'
-        )
-
-        prompt = f"""Create a complete structured educational eBook with the following specifications.
-
-LANGUAGE REQUIREMENT: Write ALL content — titles, descriptions, chapter bodies, key points, summaries, questions — in {language_name}. Do NOT use any other language.
-
-Title: {title}
-Author: {author or "Anonymous"}
-Subject: {subject or "General"}
-Grade: {grade or "General"}
-Book Size: {book_size.capitalize()} — TARGET: {size_guide["total_pages"]} pages total
-Writing Tone: {tone.replace("_", " ").title()}
-
-BOOK PAGE LAYOUT (strictly follow this structure):
-  • Page 1   — Cover Page: full-page book cover (image generated separately)
-  • Page 2   — Title Page: book title centered large, "by {{author}}" centered below it
-  • Page 3   — Book Summary: 4-10 sentences giving a comprehensive overview of the entire book
-  • Page 4   — Table of Contents: numbered chapter list
-  • {size_guide["content_pages"]} — Chapters numbered "1. Title", "2. Title", etc. (one chapter per page range)
-{assessment_layout_line}
-  • Final Page — Thank you / hope message for the reader
-
-TONE INSTRUCTIONS (apply to every chapter):
-{tone_guide}
-
-CONTENT DEPTH PER CHAPTER (calibrated to fill {size_guide["total_pages"]} pages total):
-- Length: {size_guide["paragraphs"]} — {size_guide["words_hint"]}
-- Structure: {size_guide["depth"]}
-- Key points: {size_guide["key_points"]}
-{assessment_section}
-{f'Chapter Outline:{chr(10)}{outline_str}' if outline_str else ''}
-
-REQUIREMENTS:
-1. {chapter_count_instruction}
-2. Every chapter MUST meet the word count target ({size_guide["words_hint"]}). Short chapters that do not fill their page budget are NOT acceptable.
-3. Apply both the tone style and depth level consistently across ALL chapters.
-4. The "content" field must be the FULL chapter body — not a placeholder, stub, or summary.
-5. The "key_points" array must list the most important facts/concepts from the chapter.
-6. The "summary" must be 1-2 sentences recapping the chapter.
-7. Do NOT reuse identical phrasing across chapters — each chapter must feel distinct.
-8. If a chapter description is given in the outline, use it to guide the content scope.
-9. The "title_page.description" must be a compelling 2-3 sentence overview of the entire book.
-10. All text must be written in {language_name}.
-11. The "book_summary" field must be 4-10 sentences giving a comprehensive overview of the ENTIRE book — its scope, key themes, and what the reader will learn.
-12. The "thank_you_message" must be 2-3 warm, encouraging sentences wishing the reader well after completing the book.
-13. FORMATTING: Do NOT use markdown headings (# ## ###) inside the "content" field. Use plain text paragraphs only. If you need sub-sections, use **bold text** for sub-headings on their own line — never use # or ## or ### symbols.
-{no_assessment_note}
-
-Return ONLY valid JSON in this exact structure (no markdown fences, no extra keys):
-{{
-  "title": "{title}",
-  "author": "{author or 'Anonymous'}",
-  "language": "{language}",
-  "book_size": "{book_size}",
-  "tone": "{tone}",
-  "title_page": {{
-    "title": "...",
-    "author": "...",
-    "subtitle": "...",
-    "description": "..."
-  }},
-  "book_summary": "...",
-  "table_of_contents": [
-    {{ "chapter_number": 1, "title": "..." }}
-  ],
-  "chapters": [
-    {{
-      "chapter_number": 1,
-      "title": "...",
-      "content": "...",
-      "key_points": ["...", "..."],
-      "summary": "..."
-    }}
-  ],
-  {final_assessment_json},
-  "thank_you_message": "..."
-}}"""
-        response = await self.chat([{"role": "user", "content": prompt}])
-        try:
-            cleaned = response.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-            ebook_data = json.loads(cleaned)
-        except Exception:
-            ebook_data = {
-                "title": title,
-                "author": author or "Anonymous",
-                "language": language,
-                "book_size": book_size,
-                "tone": tone,
-                "title_page": {"title": title, "author": author or "Anonymous", "subtitle": "", "description": ""},
-                "book_summary": "",
-                "table_of_contents": [{"chapter_number": 1, "title": "Chapter 1"}],
-                "chapters": [{"chapter_number": 1, "title": "Chapter 1", "content": response, "key_points": [], "summary": ""}],
-                "final_assessment": None,
-                "thank_you_message": f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you.",
-            }
-
-        # Generate infographic images using Gemini
+        # ── Generate images ──
         if image_density != "minimal":
             try:
-                generated_chapters = ebook_data.get("chapters", [])
                 images = await self.generate_ebook_images(
                     title=title,
                     chapters=generated_chapters,
@@ -1785,9 +2077,46 @@ Return ONLY valid JSON in this exact structure (no markdown fences, no extra key
                 ebook_data["images"] = images
             except Exception as e:
                 print(f"[EbookImage] Image generation error: {e}")
-                pass  # Image generation is non-blocking — proceed without images
 
         return ebook_data
+
+    async def generate_ebook_content_only(
+        self,
+        title: str,
+        subject: str | None,
+        grade: int | None,
+        language: str,
+        source_type: str,
+        outline: list[str] | None,
+        page_count: int,
+        chapter_range: tuple = (3, 5),
+        tone: str = "academic",
+        book_size: str = "short",
+        chapters: list[dict] | None = None,
+        author: str = "",
+        assessment_config: dict | None = None,
+        on_chapter_done: Any = None,
+    ) -> dict:
+        """Generate structured eBook content as JSON — NO image generation.
+        Used by the SSE endpoint which handles images as a separate step."""
+        return await self.generate_ebook(
+            title=title,
+            subject=subject,
+            grade=grade,
+            language=language,
+            source_type=source_type,
+            outline=outline,
+            page_count=page_count,
+            chapter_range=chapter_range,
+            tone=tone,
+            book_size=book_size,
+            chapters=chapters,
+            author=author,
+            image_density="minimal",
+            image_types=None,
+            assessment_config=assessment_config,
+            on_chapter_done=on_chapter_done,
+        )
 
     async def generate_mindmap(
         self,
