@@ -89,6 +89,58 @@ async def _process_pending_enrollments(db: AsyncSession, user: User) -> None:
         await db.delete(pending)
 
 
+async def _process_pending_org_invitations(db: AsyncSession, user: User) -> None:
+    """After signup, auto-accept any pending org invitations for this email.
+
+    Creates OrgMember records and grants the invited role (e.g. teacher)
+    so the user gets both personal workspace and org access immediately.
+    """
+    from app.models.organization import OrgInvitation, OrgMember as OrgMemberModel
+
+    result = await db.execute(
+        select(OrgInvitation).where(
+            OrgInvitation.email == user.email,
+            OrgInvitation.status == "pending",
+        )
+    )
+    pending_invitations = result.scalars().all()
+
+    now = datetime.now(timezone.utc)
+    for inv in pending_invitations:
+        # Skip expired invitations
+        if inv.expires_at and inv.expires_at < now:
+            inv.status = "expired"
+            continue
+
+        # Add as org member if not already
+        existing = await db.execute(
+            select(OrgMemberModel).where(
+                OrgMemberModel.org_id == inv.org_id,
+                OrgMemberModel.user_id == user.id,
+            )
+        )
+        member = existing.scalar_one_or_none()
+        if member:
+            member.role = inv.role
+            member.status = "active"
+        else:
+            db.add(OrgMemberModel(
+                org_id=inv.org_id,
+                user_id=user.id,
+                role=inv.role,
+                status="active",
+            ))
+
+        # Grant the role (e.g. "teacher") if user doesn't already have it
+        role_exists = await db.execute(
+            select(UserRole).where(UserRole.user_id == user.id, UserRole.role == inv.role)
+        )
+        if not role_exists.scalar_one_or_none():
+            db.add(UserRole(user_id=user.id, role=inv.role))
+
+        inv.status = "accepted"
+
+
 async def _create_free_subscription(
     db: AsyncSession, user_id: uuid.UUID = None, org_id: uuid.UUID = None, workspace_type: str = "individual"
 ) -> Subscription:
@@ -243,6 +295,12 @@ async def signup(payload: SignupRequest, db: DBSession):
     # Wrapped in try/except so a missing table or any unexpected error never breaks signup.
     try:
         await _process_pending_enrollments(db, user)
+    except Exception:
+        pass
+
+    # Auto-accept any pending org invitations for this email
+    try:
+        await _process_pending_org_invitations(db, user)
     except Exception:
         pass
 
@@ -445,6 +503,12 @@ async def google_auth(payload: GoogleLoginRequest, db: DBSession):
 
         try:
             await _process_pending_enrollments(db, user)
+        except Exception:
+            pass
+
+        # Auto-accept any pending org invitations for this email
+        try:
+            await _process_pending_org_invitations(db, user)
         except Exception:
             pass
 

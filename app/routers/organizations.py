@@ -1,9 +1,9 @@
 import uuid
 import secrets
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, HTTPException, status, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Query
 from pydantic import BaseModel
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import DBSession, CurrentUser
@@ -23,7 +23,9 @@ from app.schemas.organization import (
     ModuleOverrideResponse,
     DirectAddMemberRequest,
 )
+from app.config import settings
 from app.core.exceptions import NotFoundException, ForbiddenException
+from app.services.email_service import send_organization_invitation_email
 
 router = APIRouter()
 
@@ -180,6 +182,7 @@ async def add_member_by_user_id(
     payload: DirectAddMemberRequest,
     current_user: CurrentUser,
     db: DBSession,
+    background_tasks: BackgroundTasks,
 ):
     """Add a user to the org directly by user_id (used when user already exists in the system)."""
     await _require_org_admin(current_user.id, org_id, db)
@@ -190,6 +193,11 @@ async def add_member_by_user_id(
     if not user:
         raise NotFoundException("User not found")
 
+    # Fetch org for email context
+    org_result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = org_result.scalar_one_or_none()
+    admin_name = current_user.name or current_user.email
+
     existing = await db.execute(
         select(OrgMember).where(OrgMember.org_id == org_id, OrgMember.user_id == user_id)
     )
@@ -197,30 +205,79 @@ async def add_member_by_user_id(
     if existing_member:
         existing_member.role = payload.role
         existing_member.status = "active"
-        await db.commit()
-        await db.refresh(existing_member)
-        return OrgMemberResponse(
-            id=existing_member.id, org_id=existing_member.org_id, user_id=existing_member.user_id,
-            role=existing_member.role, status=existing_member.status, joined_at=existing_member.joined_at,
-            user_name=user.name, user_email=user.email,
+    else:
+        existing_member = OrgMember(org_id=org_id, user_id=user_id, role=payload.role, status="active")
+        db.add(existing_member)
+
+    # Ensure user has the corresponding UserRole (e.g. "teacher")
+    from app.models.user import UserRole
+    role_result = await db.execute(
+        select(UserRole).where(UserRole.user_id == user_id, UserRole.role == payload.role)
+    )
+    if not role_result.scalar_one_or_none():
+        db.add(UserRole(user_id=user_id, role=payload.role))
+
+    await db.commit()
+    await db.refresh(existing_member)
+
+    # Send notification email in background
+    if org:
+        background_tasks.add_task(
+            send_organization_invitation_email,
+            to_email=user.email,
+            admin_name=admin_name,
+            organization_name=org.name,
+            role=payload.role,
+            accept_url="",
+            is_existing_user=True,
         )
 
-    member = OrgMember(org_id=org_id, user_id=user_id, role=payload.role, status="active")
-    db.add(member)
-    await db.commit()
-    await db.refresh(member)
     return OrgMemberResponse(
-        id=member.id, org_id=member.org_id, user_id=member.user_id,
-        role=member.role, status=member.status, joined_at=member.joined_at,
+        id=existing_member.id, org_id=existing_member.org_id, user_id=existing_member.user_id,
+        role=existing_member.role, status=existing_member.status, joined_at=existing_member.joined_at,
         user_name=user.name, user_email=user.email,
     )
 
 
 @router.post("/{org_id}/members/invite", response_model=OrgInvitationResponse)
 async def invite_member(
-    org_id: uuid.UUID, payload: InviteMemberRequest, current_user: CurrentUser, db: DBSession
+    org_id: uuid.UUID, payload: InviteMemberRequest, current_user: CurrentUser, db: DBSession,
+    background_tasks: BackgroundTasks,
 ):
     await _require_org_admin(current_user.id, org_id, db)
+
+    # Fetch org name and admin name for the email
+    org_result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = org_result.scalar_one_or_none()
+    if not org:
+        raise NotFoundException("Organization not found")
+    admin_name = current_user.name or current_user.email
+
+    # Check if user already exists in the system
+    user_result = await db.execute(select(User).where(User.email == payload.email))
+    existing_user = user_result.scalar_one_or_none()
+
+    if existing_user:
+        # User exists — add them directly as a member
+        existing_member = await db.execute(
+            select(OrgMember).where(OrgMember.org_id == org_id, OrgMember.user_id == existing_user.id)
+        )
+        member = existing_member.scalar_one_or_none()
+        if member:
+            member.role = payload.role
+            member.status = "active"
+        else:
+            db.add(OrgMember(org_id=org_id, user_id=existing_user.id, role=payload.role, status="active"))
+
+        # Ensure user has the corresponding UserRole (e.g. "teacher")
+        from app.models.user import UserRole
+        role_result = await db.execute(
+            select(UserRole).where(UserRole.user_id == existing_user.id, UserRole.role == payload.role)
+        )
+        if not role_result.scalar_one_or_none():
+            db.add(UserRole(user_id=existing_user.id, role=payload.role))
+
+    # Always create the invitation record for audit trail
     token = secrets.token_urlsafe(32)
     invitation = OrgInvitation(
         org_id=org_id,
@@ -229,21 +286,64 @@ async def invite_member(
         invited_by=current_user.id,
         token=token,
         expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+        status="accepted" if existing_user else "pending",
     )
     db.add(invitation)
     await db.commit()
     await db.refresh(invitation)
-    # TODO: Send invitation email
+
+    # Send email in background (non-blocking)
+    accept_url = f"{settings.FRONTEND_URL}/genverse/accept-invite?token={token}"
+    background_tasks.add_task(
+        send_organization_invitation_email,
+        to_email=payload.email,
+        admin_name=admin_name,
+        organization_name=org.name,
+        role=payload.role,
+        accept_url=accept_url,
+        is_existing_user=bool(existing_user),
+    )
+
     return invitation
 
 
 @router.post("/{org_id}/members/invite/bulk")
 async def bulk_invite(
-    org_id: uuid.UUID, payload: BulkInviteRequest, current_user: CurrentUser, db: DBSession
+    org_id: uuid.UUID, payload: BulkInviteRequest, current_user: CurrentUser, db: DBSession,
+    background_tasks: BackgroundTasks,
 ):
     await _require_org_admin(current_user.id, org_id, db)
+
+    org_result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = org_result.scalar_one_or_none()
+    if not org:
+        raise NotFoundException("Organization not found")
+    admin_name = current_user.name or current_user.email
+
     invitations = []
     for item in payload.members:
+        # Check if user already exists
+        user_result = await db.execute(select(User).where(User.email == item.email))
+        existing_user = user_result.scalar_one_or_none()
+
+        if existing_user:
+            existing_member = await db.execute(
+                select(OrgMember).where(OrgMember.org_id == org_id, OrgMember.user_id == existing_user.id)
+            )
+            member = existing_member.scalar_one_or_none()
+            if member:
+                member.role = item.role
+                member.status = "active"
+            else:
+                db.add(OrgMember(org_id=org_id, user_id=existing_user.id, role=item.role, status="active"))
+
+            from app.models.user import UserRole
+            role_result = await db.execute(
+                select(UserRole).where(UserRole.user_id == existing_user.id, UserRole.role == item.role)
+            )
+            if not role_result.scalar_one_or_none():
+                db.add(UserRole(user_id=existing_user.id, role=item.role))
+
         token = secrets.token_urlsafe(32)
         inv = OrgInvitation(
             org_id=org_id,
@@ -252,8 +352,21 @@ async def bulk_invite(
             invited_by=current_user.id,
             token=token,
             expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+            status="accepted" if existing_user else "pending",
         )
         db.add(inv)
+
+        accept_url = f"{settings.FRONTEND_URL}/genverse/accept-invite?token={token}"
+        background_tasks.add_task(
+            send_organization_invitation_email,
+            to_email=item.email,
+            admin_name=admin_name,
+            organization_name=org.name,
+            role=item.role,
+            accept_url=accept_url,
+            is_existing_user=bool(existing_user),
+        )
+
         invitations.append({"email": item.email, "role": item.role})
     await db.commit()
     return {"invited": len(invitations), "members": invitations}
