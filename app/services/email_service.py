@@ -1,10 +1,31 @@
+import os
 import smtplib
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 from app.config import settings
 
 SUPPORT_EMAIL = "genverse.ai@fgilservices.com"
+
+# Path to the GenVerse logo PNG for CID embedding in emails
+_LOGO_PATH = os.path.join(os.path.dirname(__file__), '..', 'static', 'logo-email.png')
+
+# Reusable inline logo HTML — references CID-embedded image (works in Gmail, Outlook, etc.)
+LOGO_HTML = '''<img src="cid:genverse_logo" alt="G" width="48" height="48" style="display:block;margin:0 auto 10px;border-radius:12px;" />'''
+
+
+def _attach_logo(msg: MIMEMultipart) -> None:
+    """Attach the GenVerse logo as a CID-embedded image to an email message."""
+    try:
+        with open(_LOGO_PATH, 'rb') as f:
+            logo_data = f.read()
+        logo_img = MIMEImage(logo_data, _subtype='png')
+        logo_img.add_header('Content-ID', '<genverse_logo>')
+        logo_img.add_header('Content-Disposition', 'inline', filename='logo.png')
+        msg.attach(logo_img)
+    except FileNotFoundError:
+        pass  # Gracefully skip if logo file is missing
 
 
 def send_verification_otp(to_email: str, otp: str) -> bool:
@@ -26,6 +47,7 @@ def send_verification_otp(to_email: str, otp: str) -> bool:
     <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f5;">
         <div style="max-width:480px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
             <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:32px;text-align:center;">
+                {LOGO_HTML}
                 <h1 style="color:white;margin:0;font-size:24px;">{settings.MAIL_FROM_NAME}</h1>
                 <p style="color:rgba(255,255,255,0.85);margin:8px 0 0;font-size:14px;">Email Verification</p>
             </div>
@@ -57,11 +79,12 @@ def send_verification_otp(to_email: str, otp: str) -> bool:
         smtp.starttls()
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
-        msg = MIMEMultipart()
+        msg = MIMEMultipart('related')
         msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
         msg['To'] = to_email
         msg['Subject'] = f"Your verification code: {otp}"
         msg.attach(MIMEText(html_body, 'html'))
+        _attach_logo(msg)
 
         smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string())
         smtp.quit()
@@ -93,6 +116,7 @@ def send_password_reset_email(to_email: str, reset_link: str) -> bool:
     <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f5;">
         <div style="max-width:480px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
             <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:32px;text-align:center;">
+                {LOGO_HTML}
                 <h1 style="color:white;margin:0;font-size:24px;">{settings.MAIL_FROM_NAME}</h1>
                 <p style="color:rgba(255,255,255,0.85);margin:8px 0 0;font-size:14px;">Password Reset</p>
             </div>
@@ -130,11 +154,12 @@ def send_password_reset_email(to_email: str, reset_link: str) -> bool:
         smtp.starttls()
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
-        msg = MIMEMultipart()
+        msg = MIMEMultipart('related')
         msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
         msg['To'] = to_email
         msg['Subject'] = "Reset your password"
         msg.attach(MIMEText(html_body, 'html'))
+        _attach_logo(msg)
 
         smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string())
         smtp.quit()
@@ -166,6 +191,7 @@ def send_renewal_reminder(to_email: str, plan_name: str, expiry_date: str, renew
     <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f5;">
         <div style="max-width:480px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
             <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:32px;text-align:center;">
+                {LOGO_HTML}
                 <h1 style="color:white;margin:0;font-size:24px;">{settings.MAIL_FROM_NAME}</h1>
                 <p style="color:rgba(255,255,255,0.85);margin:8px 0 0;font-size:14px;">Subscription Reminder</p>
             </div>
@@ -199,11 +225,12 @@ def send_renewal_reminder(to_email: str, plan_name: str, expiry_date: str, renew
         smtp.starttls()
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
-        msg = MIMEMultipart()
+        msg = MIMEMultipart('related')
         msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
         msg['To'] = to_email
         msg['Subject'] = f"Your {plan_name} plan expires soon — renew now"
         msg.attach(MIMEText(html_body, 'html'))
+        _attach_logo(msg)
 
         smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string())
         smtp.quit()
@@ -266,6 +293,7 @@ async def send_assessment_invitation(
                 <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f5;">
                     <div style="max-width:520px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
                         <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:32px;text-align:center;">
+                            {LOGO_HTML}
                             <h1 style="color:white;margin:0;font-size:24px;">{settings.MAIL_FROM_NAME}</h1>
                             <p style="color:rgba(255,255,255,0.85);margin:8px 0 0;font-size:14px;">Assessment Invitation</p>
                         </div>
@@ -303,11 +331,12 @@ async def send_assessment_invitation(
                 </html>
                 '''
 
-                msg = MIMEMultipart()
+                msg = MIMEMultipart('related')
                 msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
                 msg['To'] = email
                 msg['Subject'] = subject
                 msg.attach(MIMEText(html_body, 'html'))
+                _attach_logo(msg)
 
                 smtp.sendmail(settings.MAIL_FROM, email, msg.as_string())
                 print(f"[EmailService] SENT to {email}", flush=True)
@@ -389,6 +418,7 @@ def send_purchase_invoice_email(
         <div style="max-width:560px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
             <!-- Header -->
             <div style="background:linear-gradient(135deg,#327f6d,#2a9d8f);padding:28px 32px;text-align:center;">
+                {LOGO_HTML}
                 <h1 style="color:white;margin:0;font-size:22px;">{settings.MAIL_FROM_NAME}</h1>
                 <p style="color:rgba(255,255,255,0.85);margin:6px 0 0;font-size:13px;">Payment {action_word} Confirmation</p>
             </div>
@@ -482,11 +512,12 @@ def send_purchase_invoice_email(
         smtp.starttls()
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
-        msg = MIMEMultipart()
+        msg = MIMEMultipart('related')
         msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
         msg['To'] = to_email
         msg['Subject'] = subject
         msg.attach(MIMEText(html_body, 'html'))
+        _attach_logo(msg)
 
         smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string())
         smtp.quit()
@@ -538,6 +569,7 @@ def send_feedback_notification_email(
     <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f5;">
         <div style="max-width:520px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
             <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:28px 32px;text-align:center;">
+                {LOGO_HTML}
                 <h1 style="color:white;margin:0;font-size:22px;">{settings.MAIL_FROM_NAME}</h1>
                 <p style="color:rgba(255,255,255,0.85);margin:6px 0 0;font-size:13px;">New User Feedback Received</p>
             </div>
@@ -586,11 +618,12 @@ def send_feedback_notification_email(
         smtp.starttls()
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
-        msg = MIMEMultipart()
+        msg = MIMEMultipart('related')
         msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
         msg['To'] = SUPPORT_EMAIL
         msg['Subject'] = f"[Feedback] {rating_label} ({rating}/5) from {user_name}"
         msg.attach(MIMEText(html_body, 'html'))
+        _attach_logo(msg)
 
         smtp.sendmail(settings.MAIL_FROM, SUPPORT_EMAIL, msg.as_string())
         smtp.quit()

@@ -3612,19 +3612,60 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 if match:
                     cleaned = match.group(0)
 
-            # Fix invalid JSON backslash escapes from AI-generated LaTeX.
-            # AI puts LaTeX like \text, \frac, \times, \alpha inside JSON strings.
-            # JSON parser interprets \t as tab, \f as form feed, \n as newline, etc.
-            # Fix: any \ followed by 2+ letters is a LaTeX command, not a JSON escape.
-            # Valid JSON escapes (\n, \t, \r, \b, \f) are always a single char after \.
-            def _fix_latex_escapes(s: str) -> str:
-                return re.sub(r'\\(?=[a-zA-Z]{2})', r'\\\\', s)
+            # Fix invalid JSON backslash escapes from AI-generated content.
+            # AI generates LaTeX like \text, \frac, \alpha, \epsilon inside JSON strings.
+            # JSON only allows: \" \\ \/ \b \f \n \r \t \uXXXX
+            # Tricky: \text starts with \t (tab), \frac with \f (form-feed), \beta with \b, etc.
+            # A character-by-character scanner handles all edge cases correctly.
+            def _fix_json_escapes(s: str) -> str:
+                out = []
+                i = 0
+                n = len(s)
+                while i < n:
+                    ch = s[i]
+                    if ch == '\\' and i + 1 < n:
+                        nxt = s[i + 1]
+                        if nxt == '\\':
+                            # Already escaped \\, keep as-is
+                            out.append('\\\\')
+                            i += 2
+                        elif nxt == 'u':
+                            # \uXXXX is valid only if followed by exactly 4 hex digits
+                            if i + 5 < n and all(c in '0123456789abcdefABCDEF' for c in s[i+2:i+6]):
+                                out.append(s[i:i+6])
+                                i += 6
+                            else:
+                                # \union, \underline etc — LaTeX, double-escape
+                                out.append('\\\\')
+                                i += 1
+                        elif nxt in ('"', '/'):
+                            # \" \/ — always valid JSON escapes
+                            out.append(s[i:i+2])
+                            i += 2
+                        elif nxt in ('t', 'b', 'f', 'n', 'r'):
+                            # Could be valid JSON escape (\t \b \f \n \r) OR
+                            # LaTeX command (\text \beta \frac \nu \rho)
+                            # If followed by another letter → LaTeX → double-escape
+                            if i + 2 < n and s[i + 2].isalpha():
+                                out.append('\\\\')
+                                i += 1
+                            else:
+                                out.append(s[i:i+2])
+                                i += 2
+                        else:
+                            # Any other \X — not valid JSON, double-escape
+                            out.append('\\\\')
+                            i += 1
+                    else:
+                        out.append(ch)
+                        i += 1
+                return ''.join(out)
 
             try:
-                questions = json.loads(cleaned)
+                questions = json.loads(cleaned, strict=False)
             except json.JSONDecodeError:
-                cleaned = _fix_latex_escapes(cleaned)
-                questions = json.loads(cleaned)
+                cleaned = _fix_json_escapes(cleaned)
+                questions = json.loads(cleaned, strict=False)
             if not isinstance(questions, list):
                 raise ValueError(f"Expected JSON array, got {type(questions).__name__}")
 

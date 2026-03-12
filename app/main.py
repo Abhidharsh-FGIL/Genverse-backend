@@ -11,6 +11,7 @@ from app.database import close_db, run_migrations
 from app.routers import register_routers
 from app.services.renewal_scheduler import run_renewal_scheduler
 from app.services.notification_scheduler import run_notification_scheduler
+from app.services.stale_attempt_scheduler import run_stale_attempt_scheduler
 
 
 @asynccontextmanager
@@ -20,9 +21,11 @@ async def lifespan(app: FastAPI):
     # Start background schedulers
     renewal_task = asyncio.create_task(run_renewal_scheduler())
     notification_task = asyncio.create_task(run_notification_scheduler())
+    stale_attempt_task = asyncio.create_task(run_stale_attempt_scheduler())
     yield
     renewal_task.cancel()
     notification_task.cancel()
+    stale_attempt_task.cancel()
     await close_db()
 
 

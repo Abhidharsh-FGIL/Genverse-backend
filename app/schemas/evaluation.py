@@ -254,6 +254,7 @@ class PublicAttemptResponse(BaseModel):
     questions: List[dict]  # NO correct_answer included
     time_limit: Optional[int] = None
     started_at: datetime
+    responses: Optional[dict] = None  # Included on resume so student sees their saved answers
 
 
 class PublicAutosaveRequest(BaseModel):
@@ -269,3 +270,24 @@ class PublicSubmitResponse(BaseModel):
     attempt_id: uuid.UUID
     status: str
     message: str
+
+
+# ---- Student's own evaluation results (org-scoped) ----
+
+class MyEvalResultResponse(BaseModel):
+    attempt_id: uuid.UUID
+    assessment_id: uuid.UUID
+    assessment_title: str
+    mode: str
+    score: Optional[float] = None
+    max_score: Optional[float] = None
+    percentage: Optional[float] = None
+    status: str
+    started_at: datetime
+    submitted_at: Optional[datetime] = None
+    org_id: uuid.UUID
+    org_name: str
+    difficulty: Optional[str] = None
+    question_count: Optional[int] = None
+    grade: Optional[int] = None
+    board: Optional[str] = None

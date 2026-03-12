@@ -1,6 +1,9 @@
 import uuid
+import copy
 import secrets
+import random
 import tempfile
+import logging
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, status, Query, UploadFile, File, HTTPException
 from sqlalchemy import select, delete, distinct, union_all, func
@@ -16,7 +19,7 @@ from app.models.evaluation import (
     EvaluationInvitation,
     EvaluationAttempt,
 )
-from app.models.organization import Organization
+from app.models.organization import Organization, OrgMember
 from app.schemas.evaluation import (
     EvalPaperCreate,
     EvalPaperResponse,
@@ -40,6 +43,7 @@ from app.schemas.evaluation import (
     PublicAutosaveRequest,
     PublicSubmitRequest,
     PublicSubmitResponse,
+    MyEvalResultResponse,
 )
 from app.core.exceptions import NotFoundException, ForbiddenException
 from app.services.ai_service import AIService
@@ -49,10 +53,17 @@ router = APIRouter()
 
 def _score_attempt(attempt, questions, responses, assessment):
     """Score an attempt's responses against correct answers. Mutates attempt in-place."""
+    # Get shuffle option_maps for reverse-mapping MCQ answers
+    option_maps = (attempt.attempt_metadata or {}).get("shuffle_map", {}).get("option_maps", {})
+
     score = 0
     max_score = sum(q.marks for q in questions)
     for q in questions:
         student_answer = responses.get(str(q.id))
+        # Reverse-map shuffled MCQ answer back to original key
+        q_map = option_maps.get(str(q.id))
+        if q_map and q.question_type == "mcq" and student_answer:
+            student_answer = q_map.get(student_answer, student_answer)
         if student_answer and str(student_answer).strip().lower() == str(q.correct_answer or "").strip().lower():
             score += q.marks
         elif student_answer and assessment.negative_marking:
@@ -78,6 +89,80 @@ async def _fetch_assessment_questions(assessment, db):
     else:
         raise HTTPException(status_code=400, detail="Assessment has no questions configured")
     return result.scalars().all()
+
+
+logger = logging.getLogger(__name__)
+
+
+def _shuffle_questions_and_options(questions_data: list[dict]) -> dict:
+    """Shuffle question order and MCQ option keys. Returns shuffle_map to store in attempt_metadata."""
+    # Deep copy options dicts to avoid mutating cached SQLAlchemy objects
+    for q in questions_data:
+        if isinstance(q.get("options"), dict):
+            q["options"] = copy.deepcopy(q["options"])
+
+    random.shuffle(questions_data)
+    option_maps = {}
+    for q in questions_data:
+        if q.get("question_type") != "mcq" or not isinstance(q.get("options"), dict):
+            continue
+        orig_keys = sorted(q["options"].keys())  # e.g. ['A', 'B', 'C', 'D']
+        shuffled_keys = orig_keys.copy()
+        random.shuffle(shuffled_keys)
+        new_options = {}
+        new_to_orig = {}
+        for new_idx, orig_key in enumerate(shuffled_keys):
+            new_key = orig_keys[new_idx]  # Assign to A, B, C, D in order
+            new_options[new_key] = q["options"][orig_key]
+            new_to_orig[new_key] = orig_key
+        q["options"] = new_options
+        option_maps[q["id"]] = new_to_orig
+    # Update order_index
+    for idx, q in enumerate(questions_data):
+        q["order_index"] = idx
+
+    result = {
+        "question_order": [q["id"] for q in questions_data],
+        "option_maps": option_maps,
+    }
+    logger.info("Shuffle result - question_order: %s, option_maps keys: %s", result["question_order"][:3], list(option_maps.keys())[:3])
+    return result
+
+
+def _apply_shuffle_to_questions(questions_data: list[dict], shuffle_map: dict) -> list[dict]:
+    """Reapply a stored shuffle_map to questions_data (for resume). Returns reordered list."""
+    question_order = shuffle_map.get("question_order", [])
+    option_maps = shuffle_map.get("option_maps", {})
+    if not question_order:
+        return questions_data
+    # Reorder questions
+    q_by_id = {q["id"]: q for q in questions_data}
+    ordered = [q_by_id[qid] for qid in question_order if qid in q_by_id]
+    # Add any questions not in the map (shouldn't happen, but safety)
+    seen = set(question_order)
+    for q in questions_data:
+        if q["id"] not in seen:
+            ordered.append(q)
+    # Reapply option shuffles
+    for q in ordered:
+        q_map = option_maps.get(q["id"])
+        if not q_map or not isinstance(q.get("options"), dict):
+            continue
+        orig_keys = sorted(q["options"].keys())
+        # q_map is {new_key: orig_key}, so we need to rebuild options
+        # The stored options are in original order, we need to remap
+        orig_options = q["options"].copy()
+        # Reverse: orig_to_new mapping
+        orig_to_new = {v: k for k, v in q_map.items()}
+        new_options = {}
+        for orig_key in orig_keys:
+            new_key = orig_to_new.get(orig_key, orig_key)
+            new_options[new_key] = orig_options[orig_key]
+        q["options"] = new_options
+    # Update order_index
+    for idx, q in enumerate(ordered):
+        q["order_index"] = idx
+    return ordered
 
 
 # ---- Question Papers ----
@@ -684,6 +769,41 @@ async def get_assessment(assessment_id: uuid.UUID, current_user: CurrentUser, db
         }
         for a in assessment.attempts
     ]
+
+    # Fetch and include questions
+    try:
+        questions = await _fetch_assessment_questions(assessment, db)
+        # Maintain order by question_ids if available
+        if assessment.question_ids:
+            id_order = {
+                (uuid.UUID(qid) if isinstance(qid, str) else qid): idx
+                for idx, qid in enumerate(assessment.question_ids)
+            }
+            questions = sorted(questions, key=lambda q: id_order.get(q.id, 9999))
+        else:
+            questions = sorted(questions, key=lambda q: q.order_index or 0)
+
+        resp_dict["questions"] = [
+            {
+                "id": str(q.id),
+                "text": q.question_text,
+                "type": q.question_type,
+                "options": q.options,
+                "correct_answer": q.correct_answer,
+                "points": q.marks,
+                "subject": q.subject,
+                "chapter": q.chapter,
+                "difficulty": q.difficulty,
+                "explanation": q.explanation,
+                "tags": q.tags,
+                "blooms_level": q.blooms_level,
+                "order_index": q.order_index,
+            }
+            for q in questions
+        ]
+    except Exception:
+        resp_dict["questions"] = []
+
     return resp_dict
 
 
@@ -838,7 +958,13 @@ async def distribute_assessment(
     emails_sent = 0
     if email_token_pairs:
         teacher_name = current_user.name or "Your Teacher"
-        due_str = assessment.due_date.strftime("%d %b %Y, %I:%M %p") if assessment.due_date else None
+        # Convert due_date from UTC to IST (UTC+5:30) for display in email
+        if assessment.due_date:
+            ist = timezone(timedelta(hours=5, minutes=30))
+            due_dt = assessment.due_date if assessment.due_date.tzinfo else assessment.due_date.replace(tzinfo=timezone.utc)
+            due_str = due_dt.astimezone(ist).strftime("%d %b %Y, %I:%M %p")
+        else:
+            due_str = None
         time_limit = assessment.time_limit if assessment.time_limit else None
 
         try:
@@ -913,7 +1039,13 @@ async def reinvite_assessment(
     emails_sent = 0
     if email_token_pairs:
         teacher_name = current_user.name or "Your Teacher"
-        due_str = assessment.due_date.strftime("%d %b %Y, %I:%M %p") if assessment.due_date else None
+        # Convert due_date from UTC to IST (UTC+5:30) for display in email
+        if assessment.due_date:
+            ist = timezone(timedelta(hours=5, minutes=30))
+            due_dt = assessment.due_date if assessment.due_date.tzinfo else assessment.due_date.replace(tzinfo=timezone.utc)
+            due_str = due_dt.astimezone(ist).strftime("%d %b %Y, %I:%M %p")
+        else:
+            due_str = None
         time_limit = assessment.time_limit if assessment.time_limit else None
         try:
             await send_assessment_invitation(
@@ -951,10 +1083,24 @@ async def get_my_eval_assessments(current_user: CurrentUser, db: DBSession):
 
 @router.post("/assessments/{assessment_id}/attempt/start", response_model=EvalAttemptResponse)
 async def start_eval_attempt(assessment_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    # Fetch assessment to get questions for shuffle
+    assessment_result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.id == assessment_id)
+    )
+    assessment = assessment_result.scalar_one_or_none()
+    if not assessment:
+        raise NotFoundException("Assessment not found")
+
+    # Fetch questions and generate shuffle map
+    questions = await _fetch_assessment_questions(assessment, db)
+    questions_data = [{"id": str(q.id), "question_type": q.question_type, "options": q.options} for q in questions]
+    shuffle_map = _shuffle_questions_and_options(questions_data)
+
     attempt = EvaluationAttempt(
         assessment_id=assessment_id,
         student_id=current_user.id,
         status="in_progress",
+        attempt_metadata={"shuffle_map": shuffle_map},
     )
     db.add(attempt)
 
@@ -1018,6 +1164,71 @@ async def submit_eval_attempt(
     return attempt
 
 
+# ---- Student's own evaluation results (org-scoped) ----
+
+@router.get("/my-results", response_model=list[MyEvalResultResponse])
+async def get_my_eval_results(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: uuid.UUID | None = Query(default=None),
+):
+    """Return the current user's submitted evaluation results, scoped to orgs they belong to."""
+    query = (
+        select(
+            EvaluationAttempt,
+            EvaluationAssessment.title.label("assessment_title"),
+            EvaluationAssessment.mode,
+            EvaluationAssessment.org_id,
+            EvaluationAssessment.difficulty,
+            EvaluationAssessment.question_count,
+            EvaluationAssessment.grade,
+            EvaluationAssessment.board,
+            Organization.name.label("org_name"),
+        )
+        .join(EvaluationAssessment, EvaluationAttempt.assessment_id == EvaluationAssessment.id)
+        .join(Organization, EvaluationAssessment.org_id == Organization.id)
+        .join(
+            OrgMember,
+            (OrgMember.org_id == EvaluationAssessment.org_id)
+            & (OrgMember.user_id == current_user.id)
+            & (OrgMember.status == "active"),
+        )
+        .where(
+            EvaluationAttempt.student_id == current_user.id,
+            EvaluationAttempt.status == "submitted",
+        )
+        .order_by(EvaluationAttempt.submitted_at.desc())
+    )
+
+    if org_id:
+        query = query.where(EvaluationAssessment.org_id == org_id)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    return [
+        MyEvalResultResponse(
+            attempt_id=row.EvaluationAttempt.id,
+            assessment_id=row.EvaluationAttempt.assessment_id,
+            assessment_title=row.assessment_title,
+            mode=row.mode,
+            score=row.EvaluationAttempt.score,
+            max_score=row.EvaluationAttempt.max_score,
+            percentage=row.EvaluationAttempt.percentage,
+            status=row.EvaluationAttempt.status,
+            started_at=row.EvaluationAttempt.started_at,
+            submitted_at=row.EvaluationAttempt.submitted_at,
+            org_id=row.org_id,
+            org_name=row.org_name,
+            difficulty=row.difficulty,
+            question_count=row.question_count,
+            grade=row.grade,
+            board=row.board,
+        )
+        for row in rows
+    ]
+
+
 # ---- Public Token-Based Endpoints (no auth required) ----
 
 @router.get("/public/assessment/{token}", response_model=PublicAssessmentInfoResponse)
@@ -1037,26 +1248,68 @@ async def public_assessment_info(token: str, db: DBSession = None):
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
 
-    # Count attempts for this invitation (only after last reinvite)
+    # Auto-submit any stale in_progress attempts for this invitation
+    now = datetime.now(timezone.utc)
+    stale_result = await db.execute(
+        select(EvaluationAttempt).where(
+            EvaluationAttempt.invitation_id == invitation.id,
+            EvaluationAttempt.status == "in_progress",
+        )
+    )
+    stale_attempts = stale_result.scalars().all()
+    for stale in stale_attempts:
+        # Check if this attempt has exceeded its time limit (+ 2 min grace)
+        if assessment.time_limit:
+            deadline = stale.started_at + timedelta(seconds=assessment.time_limit + 120)
+        else:
+            deadline = stale.started_at + timedelta(hours=24)
+        if now > deadline:
+            questions = await _fetch_assessment_questions(assessment, db)
+            _score_attempt(stale, questions, stale.responses or {}, assessment)
+            stale.submitted_at = now
+            stale.status = "submitted"
+            meta = stale.attempt_metadata or {}
+            meta["auto_submitted"] = True
+            meta["submit_reason"] = "server_timeout"
+            stale.attempt_metadata = meta
+
+    if stale_attempts:
+        # Also update invitation status if all attempts are now submitted
+        all_submitted = all(a.status == "submitted" for a in stale_attempts)
+        if all_submitted and invitation.status != "completed":
+            invitation.status = "completed"
+        await db.commit()
+
+    # Count ALL attempts for this invitation (stale cleanup already ran above)
     attempt_query = select(func.count(EvaluationAttempt.id)).where(
-        EvaluationAttempt.invitation_id == invitation.id
+        EvaluationAttempt.invitation_id == invitation.id,
     )
     if invitation.reinvited_at:
         attempt_query = attempt_query.where(
             EvaluationAttempt.started_at > invitation.reinvited_at
         )
     attempts_count_result = await db.execute(attempt_query)
-    attempts_used = attempts_count_result.scalar() or 0
+    total_attempts = attempts_count_result.scalar() or 0
+
+    # Count only in_progress attempts (active, not yet submitted)
+    active_query = select(func.count(EvaluationAttempt.id)).where(
+        EvaluationAttempt.invitation_id == invitation.id,
+        EvaluationAttempt.status == "in_progress",
+    )
+    active_count_result = await db.execute(active_query)
+    active_attempts = active_count_result.scalar() or 0
+
+    # attempts_used = completed attempts (total minus any currently active)
+    attempts_used = total_attempts - active_attempts
 
     # Determine if the user can attempt
     can_attempt = True
     if assessment.mode == "exam":
-        can_attempt = attempts_used == 0
+        can_attempt = attempts_used == 0 and active_attempts == 0
     elif assessment.mode == "practice" and assessment.max_attempts is not None:
-        can_attempt = attempts_used < assessment.max_attempts
+        can_attempt = attempts_used < assessment.max_attempts and active_attempts == 0
 
     # Check if assessment has expired
-    now = datetime.now(timezone.utc)
     if assessment.ends_at and now > assessment.ends_at:
         can_attempt = False
     if assessment.due_date and now > assessment.due_date:
@@ -1110,9 +1363,50 @@ async def public_start_attempt(token: str, payload: PublicStartAttemptRequest, d
     if assessment.due_date and now > assessment.due_date:
         raise HTTPException(status_code=403, detail="This assessment is past its due date")
 
-    # Count existing attempts for this invitation (only after last reinvite)
+    # Store name on invitation if provided
+    if payload.name and not invitation.name:
+        invitation.name = payload.name
+
+    # Auto-submit any stale in_progress attempts first (timed-out or abandoned)
+    stale_result = await db.execute(
+        select(EvaluationAttempt).where(
+            EvaluationAttempt.invitation_id == invitation.id,
+            EvaluationAttempt.status == "in_progress",
+        ).order_by(EvaluationAttempt.started_at.desc())
+    )
+    in_progress_attempts = stale_result.scalars().all()
+
+    existing_attempt = None
+    for ip_attempt in in_progress_attempts:
+        # Determine if this attempt is stale (exceeded time limit + grace period)
+        if assessment.time_limit:
+            deadline = ip_attempt.started_at + timedelta(seconds=assessment.time_limit + 120)
+        else:
+            deadline = ip_attempt.started_at + timedelta(hours=24)
+
+        if now > deadline:
+            # Auto-submit stale attempt
+            questions_for_score = await _fetch_assessment_questions(assessment, db)
+            _score_attempt(ip_attempt, questions_for_score, ip_attempt.responses or {}, assessment)
+            ip_attempt.submitted_at = now
+            ip_attempt.status = "submitted"
+            meta = ip_attempt.attempt_metadata or {}
+            meta["auto_submitted"] = True
+            meta["submit_reason"] = "server_timeout"
+            ip_attempt.attempt_metadata = meta
+            logger.info("Auto-submitted stale attempt %s", ip_attempt.id)
+        elif existing_attempt is None:
+            # Most recent non-stale in_progress attempt = candidate for resume
+            existing_attempt = ip_attempt
+
+    # Commit any auto-submitted stale attempts
+    if any(a.status == "submitted" for a in in_progress_attempts):
+        await db.commit()
+
+    # Count submitted attempts for this invitation (stale cleanup already ran above)
     attempt_query = select(func.count(EvaluationAttempt.id)).where(
-        EvaluationAttempt.invitation_id == invitation.id
+        EvaluationAttempt.invitation_id == invitation.id,
+        EvaluationAttempt.status == "submitted",
     )
     if invitation.reinvited_at:
         attempt_query = attempt_query.where(
@@ -1120,31 +1414,15 @@ async def public_start_attempt(token: str, payload: PublicStartAttemptRequest, d
         )
     attempts_count_result = await db.execute(attempt_query)
     attempts_used = attempts_count_result.scalar() or 0
+    logger.info("Attempt limits check: invitation=%s, submitted=%d, existing_in_progress=%s, mode=%s, max_attempts=%s",
+                invitation.id, attempts_used, existing_attempt is not None, assessment.mode, assessment.max_attempts)
 
-    # Enforce attempt limits
-    if assessment.mode == "exam" and attempts_used > 0:
-        raise HTTPException(status_code=403, detail="You have already taken this exam")
-    if assessment.mode == "practice" and assessment.max_attempts is not None and attempts_used >= assessment.max_attempts:
-        raise HTTPException(status_code=403, detail="Maximum attempts reached")
-
-    # Store name on invitation if provided
-    if payload.name and not invitation.name:
-        invitation.name = payload.name
-
-    # Create the attempt
-    attempt = EvaluationAttempt(
-        assessment_id=assessment.id,
-        student_id=invitation.student_id,
-        invitation_id=invitation.id,
-        status="in_progress",
-    )
-    db.add(attempt)
-
-    # Update invitation status
-    invitation.status = "accepted"
-
-    await db.commit()
-    await db.refresh(attempt)
+    # Enforce attempt limits only if there's no in-progress attempt to resume
+    if not existing_attempt:
+        if assessment.mode == "exam" and attempts_used > 0:
+            raise HTTPException(status_code=403, detail="You have already taken this exam")
+        if assessment.mode == "practice" and assessment.max_attempts is not None and attempts_used >= assessment.max_attempts:
+            raise HTTPException(status_code=403, detail="Maximum attempts reached")
 
     # Fetch questions WITHOUT correct_answer/explanation
     if assessment.question_ids:
@@ -1180,6 +1458,39 @@ async def public_start_attempt(token: str, payload: PublicStartAttemptRequest, d
             "order_index": q.order_index,
         }
         questions_data.append(q_dict)
+
+    if existing_attempt:
+        # Resume: reapply stored shuffle from attempt_metadata
+        shuffle_map = (existing_attempt.attempt_metadata or {}).get("shuffle_map")
+        if shuffle_map:
+            questions_data = _apply_shuffle_to_questions(questions_data, shuffle_map)
+
+        return PublicAttemptResponse(
+            attempt_id=existing_attempt.id,
+            assessment_id=assessment.id,
+            questions=questions_data,
+            time_limit=assessment.time_limit,
+            started_at=existing_attempt.started_at,
+            responses=existing_attempt.responses,
+        )
+
+    # Create new attempt with shuffled questions
+    shuffle_map = _shuffle_questions_and_options(questions_data)
+
+    attempt = EvaluationAttempt(
+        assessment_id=assessment.id,
+        student_id=invitation.student_id,
+        invitation_id=invitation.id,
+        status="in_progress",
+        attempt_metadata={"shuffle_map": shuffle_map},
+    )
+    db.add(attempt)
+
+    # Update invitation status
+    invitation.status = "accepted"
+
+    await db.commit()
+    await db.refresh(attempt)
 
     return PublicAttemptResponse(
         attempt_id=attempt.id,
@@ -1231,7 +1542,10 @@ async def public_submit_attempt(
     attempt.submitted_at = now
     attempt.status = "submitted"
     if payload.metadata:
-        attempt.attempt_metadata = payload.metadata
+        # Merge payload metadata with existing (preserves shuffle_map)
+        meta = attempt.attempt_metadata or {}
+        meta.update(payload.metadata)
+        attempt.attempt_metadata = meta
 
     # Update invitation status
     invitation.status = "completed"
@@ -1318,8 +1632,10 @@ async def public_beacon_submit(
     attempt.submitted_at = datetime.now(timezone.utc)
     attempt.status = "submitted"
 
-    # Merge metadata
-    meta = payload.metadata or {}
+    # Merge metadata (preserves shuffle_map from attempt start)
+    meta = attempt.attempt_metadata or {}
+    if payload.metadata:
+        meta.update(payload.metadata)
     meta["auto_submitted"] = True
     meta["submit_reason"] = meta.get("submit_reason", "browser_close")
     attempt.attempt_metadata = meta
