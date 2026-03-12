@@ -20,6 +20,9 @@ celery.conf.update(
     timezone="UTC",
     task_track_started=True,
     result_expires=3600,  # results expire after 1 hour
+    task_time_limit=900,  # hard kill after 15 minutes
+    task_soft_time_limit=600,  # soft limit (SoftTimeLimitExceeded) after 10 minutes
+    worker_prefetch_multiplier=1,  # don't prefetch tasks — ebook generation is long-running
 )
 
 # Auto-discover tasks in these modules
