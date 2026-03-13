@@ -47,6 +47,13 @@ class AssessmentResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class AssessmentListResponse(BaseModel):
+    items: list[AssessmentResponse]
+    next_cursor: Optional[str] = None
+    has_more: bool = False
+    total: int = 0
+
+
 class AttemptStartResponse(BaseModel):
     id: uuid.UUID
     assessment_id: uuid.UUID

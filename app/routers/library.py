@@ -6,7 +6,7 @@ from sqlalchemy import select, delete as sql_delete, func as sa_func
 from app.dependencies import DBSession, CurrentUser
 from app.models.content import UserLibraryItem, DocChunk
 from app.models.subscription import Subscription, PlanDefinition
-from app.schemas.content import LibraryItemResponse, LibraryItemUpdate, VaultQueryRequest, VaultQueryResponse
+from app.schemas.content import LibraryItemResponse, LibraryItemListResponse, LibraryItemUpdate, VaultQueryRequest, VaultQueryResponse
 from app.core.exceptions import NotFoundException
 from app.services.storage_service import StorageService
 from app.services.ai_service import AIService
@@ -168,27 +168,50 @@ async def upload_document(
     return item
 
 
-@router.get("/", response_model=list[LibraryItemResponse])
+@router.get("/", response_model=LibraryItemListResponse)
 async def list_library_items(
     current_user: CurrentUser,
     db: DBSession,
     folder: str | None = Query(None),
     org_id: str | None = Query(None),
+    limit: int = Query(12, ge=1, le=50),
+    cursor: str | None = Query(None, description="ISO datetime cursor for pagination"),
 ):
-    q = select(UserLibraryItem).where(UserLibraryItem.user_id == current_user.id)
+    from datetime import datetime as dt
+    from sqlalchemy import func as sa_func
+
+    base = select(UserLibraryItem).where(UserLibraryItem.user_id == current_user.id)
     if org_id is not None:
-        q = _apply_org_filter(q, UserLibraryItem.org_id, org_id)
+        base = _apply_org_filter(base, UserLibraryItem.org_id, org_id)
     if folder:
-        # Return only items in the requested folder
-        q = q.where(UserLibraryItem.folder == folder)
+        base = base.where(UserLibraryItem.folder == folder)
     else:
-        # Default: exclude OCR extractions — they belong to the Extract OCR tool, not the vault
-        q = q.where(
+        base = base.where(
             (UserLibraryItem.folder != "ocr") | (UserLibraryItem.folder.is_(None))
         )
-    q = q.order_by(UserLibraryItem.created_at.desc())
+
+    # Total count
+    count_q = select(sa_func.count()).select_from(base.subquery())
+    total = (await db.execute(count_q)).scalar() or 0
+
+    # Apply cursor
+    q = base
+    if cursor:
+        try:
+            cursor_dt = dt.fromisoformat(cursor)
+            q = q.where(UserLibraryItem.created_at < cursor_dt)
+        except (ValueError, TypeError):
+            pass
+
+    q = q.order_by(UserLibraryItem.created_at.desc()).limit(limit + 1)
     result = await db.execute(q)
-    return result.scalars().all()
+    rows = result.scalars().all()
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = items[-1].created_at.isoformat() if has_more and items else None
+
+    return LibraryItemListResponse(items=items, next_cursor=next_cursor, has_more=has_more, total=total)
 
 
 @router.post("/extract-text-inline")

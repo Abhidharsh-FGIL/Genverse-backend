@@ -987,6 +987,218 @@ async def generate_practice_assessment_preview(
     return GeneratedQuestionsResponse(question_json=question_json, answer_key_json=answer_key_json)
 
 
+@router.post("/generate-practice-assessment-stream")
+async def generate_practice_assessment_stream(
+    payload: GeneratePracticeAssessmentRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Generate AI practice questions with SSE progress streaming.
+
+    Primary: Celery worker (offloads LLM work from FastAPI process).
+    Fallback: In-process async (if Celery/Redis dispatch fails).
+    """
+    import asyncio
+    import json
+    from typing import AsyncGenerator
+
+    org_id = _parse_org_id(payload.org_id)
+    points_service = PointsService()
+    await points_service.check_and_increment_usage(
+        user_id=current_user.id, feature_key="create_assessment", db=db, org_id=org_id,
+    )
+    await points_service.deduct(
+        user_id=current_user.id, action="generate_assessment", db=db, org_id=org_id,
+    )
+
+    # Resolve topics
+    if payload.multi_topics:
+        topics = payload.multi_topics
+    elif payload.topic:
+        topics = [t.strip() for t in payload.topic.split(",") if t.strip()]
+    else:
+        topics = None
+
+    # Resolve source text
+    resolved_source_text = payload.source_text
+    if payload.source_ref_id and not resolved_source_text:
+        try:
+            chunks_result = await db.execute(
+                select(DocChunk)
+                .join(UserLibraryItem, DocChunk.library_item_id == UserLibraryItem.id)
+                .where(
+                    UserLibraryItem.id == uuid.UUID(payload.source_ref_id),
+                    UserLibraryItem.user_id == current_user.id,
+                )
+                .order_by(DocChunk.chunk_order)
+            )
+            chunks = chunks_result.scalars().all()
+            if chunks:
+                resolved_source_text = " ".join(c.chunk_text for c in chunks)
+        except Exception:
+            pass
+
+    # Resolve library file content via FAISS RAG
+    if payload.library_file_ids:
+        ai_for_rag = AIService()
+        topic_query = payload.topic or payload.subject or "general content"
+        rag_parts: list[str] = []
+        for lib_fid in payload.library_file_ids:
+            part = await _build_library_rag_context(
+                question=topic_query, library_file_id=lib_fid,
+                db=db, ai=ai_for_rag, k=20,
+            )
+            if part:
+                rag_parts.append(part)
+        if rag_parts:
+            resolved_source_text = "\n\n---\n\n".join(rag_parts)
+
+    allowed_types = {t.lower() for t in (payload.question_types or ["mcq"])}
+
+    task_params = {
+        "subject": payload.subject,
+        "topics": topics,
+        "grade": payload.grade,
+        "board": payload.board,
+        "difficulty": payload.difficulty,
+        "question_count": payload.question_count,
+        "question_types": payload.question_types,
+        "mode": payload.mode,
+        "blooms_level": payload.blooms_level or "mixed",
+        "mcq_subtypes": payload.mcq_subtypes,
+        "type_weightage": payload.type_weightage,
+        "topic_weightage": payload.topic_weightage,
+        "negative_marking": payload.negative_marking,
+        "source_text": resolved_source_text,
+        "allowed_types": list(allowed_types),
+        "user_id": str(current_user.id),
+        "org_id": str(org_id) if org_id else None,
+    }
+
+    # ── Try Celery dispatch (primary path) ──
+    celery_ok = False
+    redis_channel = None
+    pubsub = None
+    aio_redis = None
+
+    try:
+        import redis.asyncio as aioredis
+        from app.tasks.assessment_tasks import generate_assessment_task
+
+        task_id = str(uuid.uuid4())
+        redis_channel = f"assessment:progress:{task_id}"
+        aio_redis = aioredis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+        pubsub = aio_redis.pubsub()
+        await pubsub.subscribe(redis_channel)
+
+        generate_assessment_task.apply_async(args=[task_params], task_id=task_id)
+        celery_ok = True
+        print(f"[Assessment] Celery task dispatched: {task_id}", flush=True)
+    except Exception as e:
+        print(f"[Assessment] Celery dispatch failed, falling back to in-process: {e}", flush=True)
+        if pubsub:
+            try:
+                await pubsub.unsubscribe()
+                await pubsub.close()
+            except Exception:
+                pass
+        if aio_redis:
+            try:
+                await aio_redis.close()
+            except Exception:
+                pass
+
+    if celery_ok:
+        async def celery_event_generator() -> AsyncGenerator[str, None]:
+            try:
+                yield f"data: {json.dumps({'stage': 'points_done', 'progress': 10, 'message': 'Points deducted successfully'})}\n\n"
+                while True:
+                    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=5.0)
+                    if msg and msg["type"] == "message":
+                        try:
+                            event = json.loads(msg["data"])
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        if event.get("stage") == "__DONE__":
+                            yield "data: [DONE]\n\n"
+                            break
+                        yield f"data: {json.dumps(event)}\n\n"
+                        if event.get("stage") in ("complete", "error"):
+                            yield "data: [DONE]\n\n"
+                            break
+                    else:
+                        yield ": heartbeat\n\n"
+            except asyncio.CancelledError:
+                pass
+            finally:
+                await pubsub.unsubscribe(redis_channel)
+                await pubsub.close()
+                await aio_redis.close()
+
+        generator = celery_event_generator()
+    else:
+        # ── FALLBACK: in-process async ──
+        async def inprocess_event_generator() -> AsyncGenerator[str, None]:
+            try:
+                yield f"data: {json.dumps({'stage': 'points_done', 'progress': 10, 'message': 'Points deducted successfully'})}\n\n"
+                yield f"data: {json.dumps({'stage': 'preparing', 'progress': 20, 'message': 'Preparing assessment configuration...'})}\n\n"
+                yield f"data: {json.dumps({'stage': 'generating', 'progress': 30, 'message': f'Generating {payload.question_count} questions with AI...'})}\n\n"
+
+                ai = AIService()
+                raw = await ai.generate_practice_assessment(
+                    subject=payload.subject,
+                    topics=topics,
+                    grade=payload.grade,
+                    board=payload.board,
+                    difficulty=payload.difficulty,
+                    question_count=payload.question_count,
+                    question_types=payload.question_types,
+                    mode=payload.mode,
+                    blooms_level=payload.blooms_level or "mixed",
+                    mcq_subtypes=payload.mcq_subtypes,
+                    type_weightage=payload.type_weightage,
+                    topic_weightage=payload.topic_weightage,
+                    negative_marking=payload.negative_marking,
+                    source_text=resolved_source_text,
+                )
+
+                yield f"data: {json.dumps({'stage': 'processing', 'progress': 80, 'message': 'Processing and validating questions...'})}\n\n"
+
+                import uuid as _uuid
+                question_json = []
+                answer_key_json = []
+                for q in raw:
+                    qid = q.get("id") or str(_uuid.uuid4())
+                    q_type = (q.get("type") or "mcq").lower()
+                    if q_type not in allowed_types:
+                        continue
+                    opts = q.get("options")
+                    if isinstance(opts, dict):
+                        opts = list(opts.values())
+                    question_json.append({
+                        "id": qid, "type": q_type, "subtype": q.get("subtype"),
+                        "text": q.get("text") or q.get("question", ""),
+                        "options": opts, "pairs": q.get("pairs"),
+                        "points": q.get("marks") or q.get("points") or 1,
+                        "blooms_level": q.get("blooms_level"),
+                    })
+                    answer_key_json.append({
+                        "id": qid,
+                        "correctAnswer": q.get("correct_answer") or q.get("correctAnswer", ""),
+                        "explanation": q.get("explanation", ""),
+                    })
+
+                yield f"data: {json.dumps({'stage': 'complete', 'progress': 100, 'message': f'{len(question_json)} questions generated successfully!', 'question_json': question_json, 'answer_key_json': answer_key_json})}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'stage': 'error', 'progress': 0, 'message': str(exc)})}\n\n"
+                yield "data: [DONE]\n\n"
+
+        generator = inprocess_event_generator()
+
+    return StreamingResponse(generator, media_type="text/event-stream")
+
+
 class AutoGradeRequest(BaseModel):
     submissionText: Optional[str] = None
     rubric: Optional[dict] = None

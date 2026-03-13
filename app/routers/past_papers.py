@@ -4,14 +4,14 @@ from sqlalchemy import select, and_
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.content import PastPaper
-from app.schemas.content import PastPaperResponse
+from app.schemas.content import PastPaperResponse, PastPaperListResponse
 from app.core.exceptions import NotFoundException
 from app.services.storage_service import StorageService
 
 router = APIRouter()
 
 
-@router.get("/", response_model=list[PastPaperResponse])
+@router.get("/", response_model=PastPaperListResponse)
 async def list_past_papers(
     current_user: CurrentUser,
     db: DBSession,
@@ -20,22 +20,44 @@ async def list_past_papers(
     subject: str | None = Query(None),
     year: int | None = Query(None),
     exam_type: str | None = Query(None),
-    limit: int = Query(50, le=200),
+    limit: int = Query(12, ge=1, le=50),
+    cursor: str | None = Query(None, description="ISO datetime cursor for pagination"),
 ):
-    q = select(PastPaper).where(PastPaper.is_public == True)
+    from datetime import datetime as dt
+    from sqlalchemy import func as sa_func
+
+    base = select(PastPaper).where(PastPaper.is_public == True)
     if board:
-        q = q.where(PastPaper.board == board)
+        base = base.where(PastPaper.board == board)
     if grade:
-        q = q.where(PastPaper.grade == grade)
+        base = base.where(PastPaper.grade == grade)
     if subject:
-        q = q.where(PastPaper.subject == subject)
+        base = base.where(PastPaper.subject == subject)
     if year:
-        q = q.where(PastPaper.year == year)
+        base = base.where(PastPaper.year == year)
     if exam_type:
-        q = q.where(PastPaper.exam_type == exam_type)
-    q = q.order_by(PastPaper.year.desc()).limit(limit)
+        base = base.where(PastPaper.exam_type == exam_type)
+
+    count_q = select(sa_func.count()).select_from(base.subquery())
+    total = (await db.execute(count_q)).scalar() or 0
+
+    q = base
+    if cursor:
+        try:
+            cursor_dt = dt.fromisoformat(cursor)
+            q = q.where(PastPaper.created_at < cursor_dt)
+        except (ValueError, TypeError):
+            pass
+
+    q = q.order_by(PastPaper.created_at.desc()).limit(limit + 1)
     result = await db.execute(q)
-    return result.scalars().all()
+    rows = result.scalars().all()
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = items[-1].created_at.isoformat() if has_more and items else None
+
+    return PastPaperListResponse(items=items, next_cursor=next_cursor, has_more=has_more, total=total)
 
 
 @router.get("/{paper_id}", response_model=PastPaperResponse)

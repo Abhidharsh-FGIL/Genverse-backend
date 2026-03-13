@@ -13,7 +13,8 @@ from app.dependencies import DBSession, CurrentUser
 from app.models.content import Ebook, Audiobook
 from app.models.subscription import PointCost
 from app.schemas.content import (
-    EbookGenerateRequest, EbookResponse, AudiobookGenerateRequest, AudiobookResponse,
+    EbookGenerateRequest, EbookResponse, EbookListResponse,
+    AudiobookGenerateRequest, AudiobookResponse,
     AudiobookVoicesResponse,
     EbookOutlineRequest, EbookOutlineResponse, EbookGeneratedContent, EbookCreateRequest,
 )
@@ -452,14 +453,43 @@ async def save_ebook(payload: EbookCreateRequest, current_user: CurrentUser, db:
     return ebook
 
 
-@router.get("/", response_model=list[EbookResponse])
-async def list_ebooks(current_user: CurrentUser, db: DBSession, org_id: str | None = Query(None)):
-    q = select(Ebook).where(Ebook.user_id == current_user.id)
+@router.get("/", response_model=EbookListResponse)
+async def list_ebooks(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+    limit: int = Query(12, ge=1, le=50),
+    cursor: str | None = Query(None, description="ISO datetime cursor for pagination"),
+):
+    from datetime import datetime as dt
+    from sqlalchemy import func as sa_func
+
+    base = select(Ebook).where(Ebook.user_id == current_user.id)
     if org_id is not None:
-        q = _apply_org_filter(q, Ebook.org_id, org_id)
-    q = q.order_by(Ebook.created_at.desc())
+        base = _apply_org_filter(base, Ebook.org_id, org_id)
+
+    # Total count (without cursor filter)
+    count_q = select(sa_func.count()).select_from(base.subquery())
+    total = (await db.execute(count_q)).scalar() or 0
+
+    # Apply cursor filter
+    q = base
+    if cursor:
+        try:
+            cursor_dt = dt.fromisoformat(cursor)
+            q = q.where(Ebook.created_at < cursor_dt)
+        except (ValueError, TypeError):
+            pass
+
+    q = q.order_by(Ebook.created_at.desc()).limit(limit + 1)
     result = await db.execute(q)
-    return result.scalars().all()
+    rows = result.scalars().all()
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = items[-1].created_at.isoformat() if has_more and items else None
+
+    return EbookListResponse(items=items, next_cursor=next_cursor, has_more=has_more, total=total)
 
 
 @router.get("/{ebook_id}", response_model=EbookResponse)

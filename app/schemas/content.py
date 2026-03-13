@@ -20,6 +20,13 @@ class LibraryItemResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class LibraryItemListResponse(BaseModel):
+    items: list[LibraryItemResponse]
+    next_cursor: Optional[str] = None
+    has_more: bool = False
+    total: int = 0
+
+
 class LibraryItemUpdate(BaseModel):
     title: Optional[str] = None
     folder: Optional[str] = None
@@ -126,6 +133,13 @@ class EbookResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class EbookListResponse(BaseModel):
+    items: list[EbookResponse]
+    next_cursor: Optional[str] = None
+    has_more: bool = False
+    total: int = 0
+
+
 class AudiobookGenerateRequest(BaseModel):
     ebook_id: Optional[str] = None
     language: str = "en"
@@ -209,6 +223,13 @@ class PastPaperResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class PastPaperListResponse(BaseModel):
+    items: list[PastPaperResponse]
+    next_cursor: Optional[str] = None
+    has_more: bool = False
+    total: int = 0
 
 
 class OCRRequest(BaseModel):

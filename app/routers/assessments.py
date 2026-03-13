@@ -8,6 +8,7 @@ from app.models.assessment import PracticeAssessment, AssessmentAttempt, TopicMa
 from app.schemas.assessment import (
     AssessmentCreate,
     AssessmentResponse,
+    AssessmentListResponse,
     AttemptStartResponse,
     AttemptSubmitRequest,
     AttemptResponse,
@@ -119,21 +120,44 @@ async def save_assessment(payload: AssessmentSaveRequest, current_user: CurrentU
     return assessment
 
 
-@router.get("/", response_model=list[AssessmentResponse])
+@router.get("/", response_model=AssessmentListResponse)
 async def list_assessments(
     current_user: CurrentUser,
     db: DBSession,
     subject: str | None = Query(None),
     org_id: str | None = Query(None, description="'personal' or org UUID for workspace filtering"),
+    limit: int = Query(12, ge=1, le=50),
+    cursor: str | None = Query(None, description="ISO datetime cursor for pagination"),
 ):
-    q = select(PracticeAssessment).where(PracticeAssessment.created_by == current_user.id)
+    from datetime import datetime as dt
+    from sqlalchemy import func as sa_func
+
+    base = select(PracticeAssessment).where(PracticeAssessment.created_by == current_user.id)
     if org_id is not None:
-        q = _apply_org_filter(q, PracticeAssessment.org_id, org_id)
+        base = _apply_org_filter(base, PracticeAssessment.org_id, org_id)
     if subject:
-        q = q.where(PracticeAssessment.subject == subject)
-    q = q.order_by(PracticeAssessment.created_at.desc())
+        base = base.where(PracticeAssessment.subject == subject)
+
+    count_q = select(sa_func.count()).select_from(base.subquery())
+    total = (await db.execute(count_q)).scalar() or 0
+
+    q = base
+    if cursor:
+        try:
+            cursor_dt = dt.fromisoformat(cursor)
+            q = q.where(PracticeAssessment.created_at < cursor_dt)
+        except (ValueError, TypeError):
+            pass
+
+    q = q.order_by(PracticeAssessment.created_at.desc()).limit(limit + 1)
     result = await db.execute(q)
-    return result.scalars().all()
+    rows = result.scalars().all()
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = items[-1].created_at.isoformat() if has_more and items else None
+
+    return AssessmentListResponse(items=items, next_cursor=next_cursor, has_more=has_more, total=total)
 
 
 # ── Static routes MUST be defined before /{assessment_id} ──────────────────
