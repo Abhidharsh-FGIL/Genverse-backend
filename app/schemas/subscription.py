@@ -47,6 +47,7 @@ class UpgradePlanRequest(BaseModel):
 class PointDeductRequest(BaseModel):
     action: str
     subscription_id: Optional[str] = None
+    org_id: Optional[str] = None
 
 
 class PointDeductResponse(BaseModel):

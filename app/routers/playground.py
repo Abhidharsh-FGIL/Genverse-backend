@@ -1,4 +1,5 @@
-from typing import Any
+import uuid
+from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -12,6 +13,16 @@ from app.services.points_service import PointsService
 from app.models.subscription import PointCost
 
 router = APIRouter()
+
+
+def _parse_org_id(raw: Any) -> uuid.UUID | None:
+    """Convert a raw org_id string to UUID, returning None for personal workspace."""
+    if not raw or raw == "personal":
+        return None
+    try:
+        return uuid.UUID(str(raw))
+    except (ValueError, AttributeError):
+        return None
 
 VALID_MODES = {"experiment", "play", "challenge", "imagine"}
 
@@ -56,6 +67,7 @@ class FlashcardsRequest(BaseModel):
     topic: str
     role: str = "student"       # student | teacher | normal_user | guardian
     grade: int | None = None    # 1-12 or None for adults
+    org_id: Optional[str] = None
 
 
 class ImagineEvalRequest(BaseModel):
@@ -65,6 +77,7 @@ class ImagineEvalRequest(BaseModel):
     max_points: int = 20
     role: str = "student"
     grade: int | None = None
+    org_id: Optional[str] = None
 
 
 class QuestRequest(BaseModel):
@@ -90,9 +103,10 @@ async def playground_explore_stream(
     if payload.mode not in VALID_MODES:
         raise HTTPException(status_code=400, detail=f"Mode must be one of: {', '.join(VALID_MODES)}")
 
+    org_id = _parse_org_id((payload.context or {}).get("org_id"))
     points_service = PointsService()
     feature_key = MODE_FEATURE_KEY.get(payload.mode, "playground_rapid_mcq")
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key=feature_key, db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key=feature_key, db=db, org_id=org_id)
 
     # Calculate cost: base + harder_mode bonus
     base_r = await db.execute(select(PointCost).where(PointCost.action == "playground_explore"))
@@ -107,7 +121,7 @@ async def playground_explore_stream(
             total_xp += h_pc.xp_reward or 0
     await points_service.deduct_custom(
         user_id=current_user.id, action="playground_explore", db=db,
-        cost_override=total_cost, xp_override=total_xp,
+        cost_override=total_cost, xp_override=total_xp, org_id=org_id,
     )
 
     ai = AIService()
@@ -141,9 +155,10 @@ async def playground_explore(
     if payload.mode not in VALID_MODES:
         raise HTTPException(status_code=400, detail=f"Mode must be one of: {', '.join(VALID_MODES)}")
 
+    org_id = _parse_org_id((payload.context or {}).get("org_id"))
     points_service = PointsService()
     feature_key = MODE_FEATURE_KEY.get(payload.mode, "playground_rapid_mcq")
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key=feature_key, db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key=feature_key, db=db, org_id=org_id)
 
     # Calculate cost: base + harder_mode bonus
     base_r = await db.execute(select(PointCost).where(PointCost.action == "playground_explore"))
@@ -158,7 +173,7 @@ async def playground_explore(
             total_xp += h_pc.xp_reward or 0
     await points_service.deduct_custom(
         user_id=current_user.id, action="playground_explore", db=db,
-        cost_override=total_cost, xp_override=total_xp,
+        cost_override=total_cost, xp_override=total_xp, org_id=org_id,
     )
 
     ai = AIService()
@@ -240,10 +255,11 @@ async def playground_match_pairs(
     payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
 ):
     """Generate 6 term-definition pairs for Match Mania and Concept Connect. Cost: 2 pts."""
+    org_id = _parse_org_id(payload.org_id)
     points_service = PointsService()
     await points_service.deduct_custom(
         user_id=current_user.id, action="playground_explore", db=db,
-        cost_override=2, xp_override=5,
+        cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
@@ -258,10 +274,11 @@ async def playground_swipe_facts(
     payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
 ):
     """Generate 10 true/false facts for Swipe & Sort. Cost: 2 pts."""
+    org_id = _parse_org_id(payload.org_id)
     points_service = PointsService()
     await points_service.deduct_custom(
         user_id=current_user.id, action="playground_explore", db=db,
-        cost_override=2, xp_override=5,
+        cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
@@ -276,11 +293,12 @@ async def playground_speed_quiz(
     payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
 ):
     """Generate 10 MCQ questions for Speed Blitz. Cost: 2 pts. Requires playground_rapid_mcq."""
+    org_id = _parse_org_id(payload.org_id)
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="playground_rapid_mcq", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="playground_rapid_mcq", db=db, org_id=org_id)
     await points_service.deduct_custom(
         user_id=current_user.id, action="playground_explore", db=db,
-        cost_override=2, xp_override=5,
+        cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
@@ -297,11 +315,12 @@ async def playground_roleplay(
     payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
 ):
     """Generate an immersive roleplay scenario. Cost: 2 pts. Requires playground_roleplay."""
+    org_id = _parse_org_id(payload.org_id)
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="playground_roleplay", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="playground_roleplay", db=db, org_id=org_id)
     await points_service.deduct_custom(
         user_id=current_user.id, action="playground_explore", db=db,
-        cost_override=2, xp_override=5,
+        cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
@@ -316,11 +335,12 @@ async def playground_imagine(
     payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
 ):
     """Generate a creative 'What if?' scenario. Cost: 2 pts. Requires playground_imagine."""
+    org_id = _parse_org_id(payload.org_id)
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="playground_imagine", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="playground_imagine", db=db, org_id=org_id)
     await points_service.deduct_custom(
         user_id=current_user.id, action="playground_explore", db=db,
-        cost_override=2, xp_override=5,
+        cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()
@@ -333,11 +353,12 @@ async def playground_imagine_evaluate(
     payload: ImagineEvalRequest, current_user: CurrentUser, db: DBSession
 ):
     """Evaluate a creative open-ended answer. Cost: 2 pts. Requires playground_imagine."""
+    org_id = _parse_org_id(payload.org_id)
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="playground_imagine", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="playground_imagine", db=db, org_id=org_id)
     await points_service.deduct_custom(
         user_id=current_user.id, action="playground_explore", db=db,
-        cost_override=2, xp_override=5,
+        cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade = _resolve_role_grade(payload, current_user)
     ai = AIService()

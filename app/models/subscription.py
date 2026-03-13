@@ -61,6 +61,9 @@ class PlanDefinition(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+POINT_COST_WORKSPACE = SAEnum("personal", "org", "both", name="point_cost_workspace")
+
+
 class PointCost(Base):
     __tablename__ = "point_costs"
 
@@ -69,6 +72,7 @@ class PointCost(Base):
     cost: Mapped[int] = mapped_column(Integer, nullable=False)
     xp_reward: Mapped[int] = mapped_column(Integer, default=0)
     description: Mapped[str | None] = mapped_column(Text)
+    workspace_type: Mapped[str] = mapped_column(String(20), nullable=False, default="both")
 
 
 class PointTransaction(Base):

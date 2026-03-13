@@ -214,6 +214,7 @@ class GeneratePracticeAssessmentRequest(BaseModel):
     type_weightage: Optional[dict] = None
     topic_weightage: Optional[dict] = None
     chapter_weightage: Optional[dict] = None
+    org_id: Optional[str] = None  # Org workspace: deduct from org subscription
     # Accept remaining extra fields from the frontend without validation errors
     model_config = {"extra": "ignore"}
 

@@ -332,9 +332,12 @@ async def send_message_stream(
     if not chat:
         raise NotFoundException("Chat not found")
 
+    # Extract org_id from context for org-workspace point deduction
+    org_id = _parse_org_id((payload.context or {}).get("org_id"))
+
     # Check feature access + usage limits
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db, org_id=org_id)
 
     # NOTE: Points deduction is deferred until after chat_settings are resolved (below)
     # so we can calculate the total cost including enabled enhancements.
@@ -402,7 +405,7 @@ async def send_message_stream(
             total_xp += pc.xp_reward or 0
     await points_service.deduct_custom(
         user_id=current_user.id, action="basic_chat", db=db,
-        cost_override=total_cost, xp_override=total_xp,
+        cost_override=total_cost, xp_override=total_xp, org_id=org_id,
     )
 
     # Get chat history
@@ -526,8 +529,11 @@ async def send_message(
     if not chat:
         raise NotFoundException("Chat not found")
 
+    # Extract org_id from context for org-workspace point deduction
+    org_id = _parse_org_id((payload.context or {}).get("org_id"))
+
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db, org_id=org_id)
 
     # Calculate dynamic cost based on enabled enhancements
     cs = payload.chat_settings or {}
@@ -543,7 +549,7 @@ async def send_message(
             total_xp += pc.xp_reward or 0
     await points_service.deduct_custom(
         user_id=current_user.id, action="basic_chat", db=db,
-        cost_override=total_cost, xp_override=total_xp,
+        cost_override=total_cost, xp_override=total_xp, org_id=org_id,
     )
 
     user_msg = AiChatMessage(chat_id=chat_id, role="user", content=payload.message)
@@ -867,9 +873,10 @@ async def generate_practice_assessment_preview(
     db: DBSession,
 ):
     """Generate AI practice questions for review — does NOT save to DB."""
+    org_id = _parse_org_id(payload.org_id)
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="create_assessment", db=db)
-    await points_service.deduct(user_id=current_user.id, action="generate_assessment", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="create_assessment", db=db, org_id=org_id)
+    await points_service.deduct(user_id=current_user.id, action="generate_assessment", db=db, org_id=org_id)
 
     # Resolve topic list: prefer explicit multi_topics, fall back to splitting topic string
     if payload.multi_topics:

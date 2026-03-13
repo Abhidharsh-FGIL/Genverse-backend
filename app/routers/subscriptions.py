@@ -104,8 +104,14 @@ async def get_plan(plan_name: str, db: DBSession):
 
 
 @router.get("/point-costs")
-async def list_point_costs(db: DBSession):
-    result = await db.execute(select(PointCost))
+async def list_point_costs(
+    db: DBSession,
+    workspace_type: str | None = Query(None, description="Filter by workspace type: 'personal', 'org', or omit for all"),
+):
+    q = select(PointCost)
+    if workspace_type:
+        q = q.where(PointCost.workspace_type.in_([workspace_type, "both"]))
+    result = await db.execute(q)
     return result.scalars().all()
 
 
@@ -224,8 +230,10 @@ async def deduct_points(
     if not point_cost:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This action is not recognized. Please try again or contact support.")
 
+    # Accept org_id from body or query param (body takes precedence)
+    effective_org_id = payload.org_id or org_id
     sub = await _get_active_subscription(
-        db, current_user.id, uuid.UUID(org_id) if org_id else None
+        db, current_user.id, uuid.UUID(effective_org_id) if effective_org_id else None
     )
     if not sub:
         raise NoSubscriptionException()
