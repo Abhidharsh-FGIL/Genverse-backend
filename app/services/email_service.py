@@ -530,6 +530,155 @@ def send_purchase_invoice_email(
         return False
 
 
+def send_organization_invitation_email(
+    to_email: str,
+    admin_name: str,
+    organization_name: str,
+    role: str,
+    accept_url: str,
+    is_existing_user: bool = False,
+) -> bool:
+    """Send an organization invitation email to a teacher/member.
+
+    If is_existing_user is True, the email tells them they've been added directly.
+    Otherwise, it includes a signup + accept-invitation link.
+    """
+    print(f"[EmailService] send_organization_invitation_email to {to_email}", flush=True)
+
+    if not settings.MAIL_USERNAME or not settings.MAIL_PASSWORD:
+        print(f"[EmailService] SKIPPED: SMTP credentials not configured!", flush=True)
+        return False
+
+    role_display = role.replace("_", " ").title()
+
+    if is_existing_user:
+        headline = "You've Been Added!"
+        intro = f"""
+            <p style="color:#555;font-size:14px;line-height:1.6;">
+                Great news! <strong>{admin_name}</strong> has added you as a
+                <strong>{role_display}</strong> to the <strong>{organization_name}</strong>
+                workspace on {settings.MAIL_FROM_NAME}.
+            </p>
+            <p style="color:#555;font-size:14px;line-height:1.6;">
+                Switch to the organization workspace to get started.
+            </p>
+        """
+        button_text = "Open Workspace"
+        button_url = f"{settings.FRONTEND_URL}/genverse/dashboard"
+    else:
+        headline = "You're Invited!"
+        intro = f"""
+            <p style="color:#555;font-size:14px;line-height:1.6;">
+                <strong>{admin_name}</strong> has invited you to join
+                <strong>{organization_name}</strong> as a <strong>{role_display}</strong>
+                on {settings.MAIL_FROM_NAME}.
+            </p>
+            <p style="color:#555;font-size:14px;line-height:1.6;">
+                Click the button below to accept your invitation. If you don't have an account yet,
+                you'll be able to sign up first — your invitation will be applied automatically.
+            </p>
+        """
+        button_text = "Accept Invitation"
+        button_url = accept_url
+
+    html_body = f'''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Organization Invitation</title>
+    </head>
+    <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f5;">
+        <div style="max-width:520px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+            <!-- Header -->
+            <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:32px;text-align:center;">
+                {LOGO_HTML}
+                <h1 style="color:white;margin:0;font-size:24px;">{settings.MAIL_FROM_NAME}</h1>
+                <p style="color:rgba(255,255,255,0.85);margin:8px 0 0;font-size:14px;">{headline}</p>
+            </div>
+
+            <!-- Body -->
+            <div style="padding:32px;">
+                <p style="color:#333;font-size:15px;margin:0 0 8px;">Hi there,</p>
+                {intro}
+
+                <!-- Org Info Card -->
+                <div style="background:#f9fafb;border-radius:10px;padding:20px;border:1px solid #e5e7eb;margin:20px 0;">
+                    <table width="100%" cellpadding="0" cellspacing="0">
+                        <tr>
+                            <td style="padding:6px 0;color:#666;font-size:13px;">Organization</td>
+                            <td style="padding:6px 0;text-align:right;font-size:13px;font-weight:600;color:#1a1a1a;">{organization_name}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding:6px 0;color:#666;font-size:13px;">Your Role</td>
+                            <td style="padding:6px 0;text-align:right;">
+                                <span style="display:inline-block;background:#6366f1;color:white;padding:3px 12px;
+                                             border-radius:12px;font-size:12px;font-weight:600;">{role_display}</span>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="padding:6px 0;color:#666;font-size:13px;">Invited By</td>
+                            <td style="padding:6px 0;text-align:right;font-size:13px;color:#1a1a1a;">{admin_name}</td>
+                        </tr>
+                    </table>
+                </div>
+
+                <!-- CTA Button -->
+                <div style="text-align:center;margin:28px 0;">
+                    <a href="{button_url}"
+                       style="display:inline-block;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;
+                              padding:14px 36px;text-decoration:none;border-radius:8px;font-weight:600;
+                              font-size:15px;box-shadow:0 4px 12px rgba(99,102,241,0.3);">
+                        {button_text}
+                    </a>
+                </div>
+
+                {"" if is_existing_user else f'''
+                <p style="color:#999;font-size:12px;text-align:center;">
+                    Or copy this link:<br>
+                    <a href="{button_url}" style="color:#6366f1;word-break:break-all;">{button_url}</a>
+                </p>
+                <p style="color:#999;font-size:11px;text-align:center;margin-top:16px;">
+                    This invitation expires in <strong>7 days</strong>. If you didn't expect this, you can safely ignore it.
+                </p>
+                '''}
+            </div>
+
+            <!-- Footer -->
+            <div style="background:#f9fafb;padding:16px;text-align:center;border-top:1px solid #e5e7eb;">
+                <p style="color:#999;font-size:11px;margin:0;">&copy; {settings.MAIL_FROM_NAME} &mdash; AI-powered learning platform</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
+    subject = f"{admin_name} invited you to join {organization_name} on {settings.MAIL_FROM_NAME}"
+
+    try:
+        smtp = smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT)
+        smtp.starttls()
+        smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
+
+        msg = MIMEMultipart('related')
+        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(html_body, 'html'))
+        _attach_logo(msg)
+
+        smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string())
+        smtp.quit()
+        print(f"[EmailService] Invitation email sent to {to_email} for org '{organization_name}'", flush=True)
+        return True
+    except Exception as e:
+        import traceback
+        print(f"[EmailService] INVITATION EMAIL FAILED for {to_email}: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        return False
+
+
 def send_feedback_notification_email(
     user_name: str,
     user_email: str,
