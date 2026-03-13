@@ -21,7 +21,7 @@ class TTSRequest(BaseModel):
     text: str
     language: str = "en"
     voice_profile: str = "female_professional"
-    rate: str = "+15%"
+    rate: str = "+35%"
     pitch: str = "+0Hz"
 
 
