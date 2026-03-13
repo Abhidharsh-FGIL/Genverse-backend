@@ -581,6 +581,18 @@ def send_organization_invitation_email(
         button_text = "Accept Invitation"
         button_url = accept_url
 
+    extra_invite_section = ""
+    if not is_existing_user:
+        extra_invite_section = (
+            '<p style="color:#999;font-size:12px;text-align:center;">'
+            "Or copy this link:<br>"
+            f'<a href="{button_url}" style="color:#6366f1;word-break:break-all;">{button_url}</a>'
+            "</p>"
+            '<p style="color:#999;font-size:11px;text-align:center;margin-top:16px;">'
+            "This invitation expires in <strong>7 days</strong>. If you did not expect this, you can safely ignore it."
+            "</p>"
+        )
+
     html_body = f'''
     <!DOCTYPE html>
     <html lang="en">
@@ -634,15 +646,7 @@ def send_organization_invitation_email(
                     </a>
                 </div>
 
-                {"" if is_existing_user else f'''
-                <p style="color:#999;font-size:12px;text-align:center;">
-                    Or copy this link:<br>
-                    <a href="{button_url}" style="color:#6366f1;word-break:break-all;">{button_url}</a>
-                </p>
-                <p style="color:#999;font-size:11px;text-align:center;margin-top:16px;">
-                    This invitation expires in <strong>7 days</strong>. If you didn't expect this, you can safely ignore it.
-                </p>
-                '''}
+                {extra_invite_section}
             </div>
 
             <!-- Footer -->
