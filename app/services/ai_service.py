@@ -723,9 +723,9 @@ class AIService:
 
         if has_files:
             # File-based queries → Anthropic Claude primary, OpenAI fallback, Gemini fallback
-            anthropic = self._get_anthropic()
-            if anthropic and response_text is None:
-                try:
+            try:
+                anthropic = self._get_anthropic()
+                if anthropic and response_text is None:
                     claude_messages = [
                         {"role": m["role"], "content": m["content"]}
                         for m in messages if m["role"] != "system"
@@ -739,11 +739,11 @@ class AIService:
                         messages=claude_messages,
                     )
                     response_text = response.content[0].text
-                except Exception as e:
-                    print(f"[AIService] Anthropic chat failed: {e}", flush=True)
-            openai = self._get_openai()
-            if openai and response_text is None:
-                try:
+            except Exception as e:
+                print(f"[AIService] Anthropic chat failed: {e}", flush=True)
+            try:
+                openai = self._get_openai()
+                if openai and response_text is None:
                     openai_kwargs: dict = {
                         "model": settings.AI_FALLBACK_MODEL,
                         "messages": [{"role": "system", "content": system_prompt}] + messages,
@@ -753,27 +753,27 @@ class AIService:
                         openai_kwargs["response_format"] = {"type": "json_object"}
                     response = await openai.chat.completions.create(**openai_kwargs)
                     response_text = response.choices[0].message.content
-                except Exception:
-                    pass
-            gemini = self._get_gemini()
-            if gemini and response_text is None:
-                try:
+            except Exception as e:
+                print(f"[AIService] OpenAI chat fallback failed: {e}", flush=True)
+            try:
+                gemini = self._get_gemini()
+                if gemini and response_text is None:
                     response = gemini.generate_content(full_prompt, generation_config=gemini_gen_config)
                     response_text = response.text
-                except Exception:
-                    pass
+            except Exception as e:
+                print(f"[AIService] Gemini chat fallback failed: {e}", flush=True)
         else:
             # Direct questions → Gemini primary, OpenAI fallback
-            gemini = self._get_gemini()
-            if gemini and response_text is None:
-                try:
+            try:
+                gemini = self._get_gemini()
+                if gemini and response_text is None:
                     response = gemini.generate_content(full_prompt, generation_config=gemini_gen_config)
                     response_text = response.text
-                except Exception:
-                    pass
-            openai = self._get_openai()
-            if openai and response_text is None:
-                try:
+            except Exception as e:
+                print(f"[AIService] Gemini chat failed: {e}", flush=True)
+            try:
+                openai = self._get_openai()
+                if openai and response_text is None:
                     openai_kwargs2: dict = {
                         "model": settings.AI_FALLBACK_MODEL,
                         "messages": [{"role": "system", "content": system_prompt}] + messages,
@@ -782,8 +782,8 @@ class AIService:
                         openai_kwargs2["response_format"] = {"type": "json_object"}
                     response = await openai.chat.completions.create(**openai_kwargs2)
                     response_text = response.choices[0].message.content
-                except Exception:
-                    pass
+            except Exception as e:
+                print(f"[AIService] OpenAI chat fallback failed: {e}", flush=True)
 
         if response_text is None:
             return "AI service is not configured or all providers failed. Please check your API keys."
@@ -955,43 +955,53 @@ class AIService:
         async def _provider_stream():
             """Yield chunks from the appropriate provider chain."""
             if has_files:
-                if self._get_anthropic():
-                    try:
+                # Anthropic (primary for document Q&A)
+                try:
+                    client = self._get_anthropic()
+                    if client:
                         async for chunk in self._stream_anthropic(system_prompt, messages):
                             yield chunk
                         return
-                    except Exception as e:
-                        print(f"[AIService] Anthropic stream failed: {e}", flush=True)
-                if self._get_openai():
-                    try:
+                except Exception as e:
+                    print(f"[AIService] Anthropic stream failed: {e}", flush=True)
+                # OpenAI fallback
+                try:
+                    client = self._get_openai()
+                    if client:
                         async for chunk in self._stream_openai(system_prompt, messages):
                             yield chunk
                         return
-                    except Exception as e:
-                        print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
-                if self._get_gemini():
-                    try:
+                except Exception as e:
+                    print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
+                # Gemini fallback
+                try:
+                    client = self._get_gemini()
+                    if client:
                         async for chunk in self._stream_gemini(full_prompt):
                             yield chunk
                         return
-                    except Exception as e:
-                        print(f"[AIService] Gemini stream fallback failed: {e}", flush=True)
+                except Exception as e:
+                    print(f"[AIService] Gemini stream fallback failed: {e}", flush=True)
             else:
-                if self._get_gemini():
-                    try:
+                # Gemini (primary for direct questions)
+                try:
+                    client = self._get_gemini()
+                    if client:
                         async for chunk in self._stream_gemini(full_prompt):
                             yield chunk
                         return
-                    except Exception as e:
-                        print(f"[AIService] Gemini stream failed: {e}", flush=True)
-                if self._get_openai():
-                    try:
+                except Exception as e:
+                    print(f"[AIService] Gemini stream failed: {e}", flush=True)
+                # OpenAI fallback
+                try:
+                    client = self._get_openai()
+                    if client:
                         async for chunk in self._stream_openai(system_prompt, messages):
                             yield chunk
                         return
-                    except Exception as e:
-                        print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
-            yield "AI service not configured."
+                except Exception as e:
+                    print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
+            yield "AI service is temporarily unavailable. Please try again in a moment."
 
         async for chunk in _provider_stream():
             accumulated += chunk

@@ -427,32 +427,38 @@ async def send_message_stream(
         or []
     )
     if selected_files:
-        rag_text = await _build_rag_context(
-            user_id=str(current_user.id),
-            question=payload.message,
-            file_ids=selected_files,
-            db=db,
-            ai=ai,
-        )
-        if rag_text:
-            messages = _inject_rag(messages, payload.message, rag_text)
+        try:
+            rag_text = await _build_rag_context(
+                user_id=str(current_user.id),
+                question=payload.message,
+                file_ids=selected_files,
+                db=db,
+                ai=ai,
+            )
+            if rag_text:
+                messages = _inject_rag(messages, payload.message, rag_text)
+        except Exception as e:
+            print(f"[StreamChat] RAG context build failed: {e}", flush=True)
 
     # Library RAG: use public library book embeddings
     library_file_id: str | None = (payload.context or {}).get("library_file_id")
     if library_file_id:
-        # Fetch book title for prompt context
-        lib_file = await db.get(PublicFile, uuid.UUID(library_file_id))
-        lib_rag_text = await _build_library_rag_context(
-            question=payload.message,
-            library_file_id=library_file_id,
-            db=db,
-            ai=ai,
-        )
-        if lib_rag_text:
-            messages = _inject_library_rag(
-                messages, payload.message, lib_rag_text,
-                book_title=lib_file.title if lib_file else "Unknown Book",
+        try:
+            # Fetch book title for prompt context
+            lib_file = await db.get(PublicFile, uuid.UUID(library_file_id))
+            lib_rag_text = await _build_library_rag_context(
+                question=payload.message,
+                library_file_id=library_file_id,
+                db=db,
+                ai=ai,
             )
+            if lib_rag_text:
+                messages = _inject_library_rag(
+                    messages, payload.message, lib_rag_text,
+                    book_title=lib_file.title if lib_file else "Unknown Book",
+                )
+        except Exception as e:
+            print(f"[StreamChat] Library RAG context build failed: {e}", flush=True)
 
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
@@ -471,7 +477,14 @@ async def send_message_stream(
                 encoded = chunk.replace('\n', '\\n')
                 yield f"data: {encoded}\n\n"
         except Exception as e:
+            import traceback
             print(f"[StreamChat] Streaming error: {e}", flush=True)
+            traceback.print_exc()
+            # Send a user-visible error so the chat doesn't appear blank
+            if not full_response:
+                error_msg = "Sorry, I encountered an issue generating a response. Please try again."
+                yield f"data: {error_msg}\n\n"
+                full_response = error_msg
 
         # Save assistant message after streaming completes
         try:
@@ -574,31 +587,37 @@ async def send_message(
         or []
     )
     if selected_files:
-        rag_text = await _build_rag_context(
-            user_id=str(current_user.id),
-            question=payload.message,
-            file_ids=selected_files,
-            db=db,
-            ai=ai,
-        )
-        if rag_text:
-            messages = _inject_rag(messages, payload.message, rag_text)
+        try:
+            rag_text = await _build_rag_context(
+                user_id=str(current_user.id),
+                question=payload.message,
+                file_ids=selected_files,
+                db=db,
+                ai=ai,
+            )
+            if rag_text:
+                messages = _inject_rag(messages, payload.message, rag_text)
+        except Exception as e:
+            print(f"[SendMessage] RAG context build failed: {e}", flush=True)
 
     # Library RAG: use public library book embeddings
     library_file_id_sync: str | None = (payload.context or {}).get("library_file_id")
     if library_file_id_sync:
-        lib_file_sync = await db.get(PublicFile, uuid.UUID(library_file_id_sync))
-        lib_rag_text_sync = await _build_library_rag_context(
-            question=payload.message,
-            library_file_id=library_file_id_sync,
-            db=db,
-            ai=ai,
-        )
-        if lib_rag_text_sync:
-            messages = _inject_library_rag(
-                messages, payload.message, lib_rag_text_sync,
-                book_title=lib_file_sync.title if lib_file_sync else "Unknown Book",
+        try:
+            lib_file_sync = await db.get(PublicFile, uuid.UUID(library_file_id_sync))
+            lib_rag_text_sync = await _build_library_rag_context(
+                question=payload.message,
+                library_file_id=library_file_id_sync,
+                db=db,
+                ai=ai,
             )
+            if lib_rag_text_sync:
+                messages = _inject_library_rag(
+                    messages, payload.message, lib_rag_text_sync,
+                    book_title=lib_file_sync.title if lib_file_sync else "Unknown Book",
+                )
+        except Exception as e:
+            print(f"[SendMessage] Library RAG context build failed: {e}", flush=True)
 
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
