@@ -137,6 +137,15 @@ POINT_COSTS = [
     # Video Studio
     {"action": "generate_video_script",  "cost": 5,  "xp_reward": 5,  "description": "Video script generation"},
     {"action": "generate_video_visuals", "cost": 5,  "xp_reward": 5,  "description": "Video visuals generation"},
+
+    # ── Organization workspace actions ──
+    {"action": "org_auto_grade",             "cost": 2,  "xp_reward": 8,  "description": "Org: auto-grade student submission", "workspace_type": "org"},
+    {"action": "org_ai_feedback",            "cost": 2,  "xp_reward": 5,  "description": "Org: AI feedback on submission", "workspace_type": "org"},
+    {"action": "org_lesson_plan_gen",        "cost": 3,  "xp_reward": 5,  "description": "Org: AI lesson plan generation", "workspace_type": "org"},
+    {"action": "org_ai_suggest_questions",   "cost": 2,  "xp_reward": 5,  "description": "Org: AI question suggestions", "workspace_type": "org"},
+    {"action": "org_rubric_ai_generate",     "cost": 2,  "xp_reward": 5,  "description": "Org: AI rubric generation", "workspace_type": "org"},
+    {"action": "org_auto_evaluate_attempt",  "cost": 2,  "xp_reward": 8,  "description": "Org: auto-evaluate assessment attempt", "workspace_type": "org"},
+    {"action": "org_class_recommendations",  "cost": 3,  "xp_reward": 3,  "description": "Org: AI class recommendations", "workspace_type": "org"},
 ]
 
 
