@@ -69,13 +69,15 @@ async def list_assignments(
     db: DBSession,
     class_id: str | None = Query(None),
     status: str | None = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
 ):
     q = select(Assignment)
     if class_id:
         q = q.where(Assignment.class_id == uuid.UUID(class_id))
     if status:
         q = q.where(Assignment.status == status)
-    q = q.order_by(Assignment.created_at.desc())
+    q = q.order_by(Assignment.created_at.desc()).offset(skip).limit(limit)
     result = await db.execute(q)
     return result.scalars().all()
 

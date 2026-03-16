@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from sqlalchemy import (
-    String, Boolean, Integer, DateTime, Text, ARRAY,
+    String, Boolean, Integer, Date, DateTime, Text, ARRAY,
     ForeignKey, func, Enum as SAEnum
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -28,6 +28,22 @@ class User(Base):
     phone: Mapped[str | None] = mapped_column(String(20))
     address: Mapped[str | None] = mapped_column(Text)
     grade: Mapped[int | None] = mapped_column(Integer)
+    board_preference: Mapped[str | None] = mapped_column(String(50))
+    date_of_birth: Mapped[date | None] = mapped_column(Date)
+    gender: Mapped[str | None] = mapped_column(String(20))
+    blood_group: Mapped[str | None] = mapped_column(String(5))
+    city: Mapped[str | None] = mapped_column(String(100))
+    state: Mapped[str | None] = mapped_column(String(100))
+    pincode: Mapped[str | None] = mapped_column(String(10))
+    emergency_contact_name: Mapped[str | None] = mapped_column(String(255))
+    emergency_contact_phone: Mapped[str | None] = mapped_column(String(20))
+    emergency_contact_relation: Mapped[str | None] = mapped_column(String(50))
+    employee_id: Mapped[str | None] = mapped_column(String(50))
+    department: Mapped[str | None] = mapped_column(String(100))
+    qualification: Mapped[str | None] = mapped_column(String(255))
+    roll_number: Mapped[str | None] = mapped_column(String(50))
+    parent_name: Mapped[str | None] = mapped_column(String(255))
+    parent_phone: Mapped[str | None] = mapped_column(String(20))
     persona_band: Mapped[str | None] = mapped_column(PERSONA_BAND)
     language: Mapped[str] = mapped_column(String(10), default="en")
     subjects: Mapped[list | None] = mapped_column(ARRAY(String))

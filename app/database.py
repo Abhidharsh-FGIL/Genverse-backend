@@ -132,6 +132,16 @@ async def run_migrations() -> None:
                 "ALTER TABLE plan_definitions ADD COLUMN max_file_size_mb INTEGER DEFAULT 5"
             ))
 
+        # Add allowed_boards to organizations if missing
+        ab_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'organizations' AND column_name = 'allowed_boards'"
+        ))
+        if not ab_exists.scalar():
+            await conn.execute(text(
+                "ALTER TABLE organizations ADD COLUMN allowed_boards JSONB"
+            ))
+
         # Create notifications table if it doesn't exist
         notif_exists = await conn.execute(text(
             "SELECT 1 FROM information_schema.tables WHERE table_name = 'notifications'"

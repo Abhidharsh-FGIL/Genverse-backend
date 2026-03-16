@@ -23,6 +23,7 @@ class OrganizationUpdate(BaseModel):
     locked_board: Optional[str] = None
     enforce_academic_context: Optional[bool] = None
     default_theme: Optional[str] = None
+    allowed_boards: Optional[List[str]] = None
 
 
 class OrganizationResponse(BaseModel):
@@ -35,6 +36,8 @@ class OrganizationResponse(BaseModel):
     locked_grade: Optional[int] = None
     locked_board: Optional[str] = None
     enforce_academic_context: bool
+    default_theme: Optional[str] = None
+    allowed_boards: Optional[List[str]] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -63,7 +66,8 @@ class BulkInviteRequest(BaseModel):
 
 
 class UpdateMemberRoleRequest(BaseModel):
-    role: str
+    role: str | None = None
+    status: str | None = None
 
 
 class OrgInvitationResponse(BaseModel):
@@ -87,7 +91,7 @@ class DirectAddMemberRequest(BaseModel):
 class ModuleOverrideRequest(BaseModel):
     feature_key: str
     enabled: bool
-    access_role: Optional[str] = None
+    access_role: Optional[str] = "both"
 
 
 class ModuleOverrideResponse(BaseModel):

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Boolean, Integer, Float, DateTime, Text, func, ForeignKey
+from sqlalchemy import String, Boolean, Integer, Float, DateTime, Text, func, ForeignKey, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -35,6 +35,9 @@ class PracticeAssessment(Base):
 
 class AssessmentAttempt(Base):
     __tablename__ = "assessment_attempts"
+    __table_args__ = (
+        Index("idx_attempt_user_status", "user_id", "status"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     assessment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("practice_assessments.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -59,8 +62,8 @@ class PersonalAssessmentHistory(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
-    assessment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("practice_assessments.id"), nullable=False)
-    attempt_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("assessment_attempts.id"), nullable=False)
+    assessment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("practice_assessments.id", ondelete="CASCADE"), nullable=False)
+    attempt_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("assessment_attempts.id", ondelete="CASCADE"), nullable=False)
     subject: Mapped[str] = mapped_column(String(100))
     topics: Mapped[dict | None] = mapped_column(JSONB)
     score: Mapped[float | None] = mapped_column(Float)

@@ -1,8 +1,11 @@
 import uuid
+import logging
 from typing import Optional
 from fastapi import APIRouter, status, Request, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
@@ -396,6 +399,8 @@ async def send_message_stream(
     ]
     base_result = await db.execute(select(PointCost).where(PointCost.action == "basic_chat"))
     base_pc = base_result.scalars().first()
+    if not base_pc:
+        logger.warning("PointCost row for 'basic_chat' not found, defaulting to cost=1, xp=0")
     total_cost = base_pc.cost if base_pc else 1
     total_xp = (base_pc.xp_reward or 0) if base_pc else 0
     if enabled_actions:
@@ -553,6 +558,8 @@ async def send_message(
     enabled_actions = [action for key, action in ENHANCEMENT_COST_MAP.items() if cs.get(key)]
     base_result = await db.execute(select(PointCost).where(PointCost.action == "basic_chat"))
     base_pc = base_result.scalars().first()
+    if not base_pc:
+        logger.warning("PointCost row for 'basic_chat' not found, defaulting to cost=1, xp=0")
     total_cost = base_pc.cost if base_pc else 1
     total_xp = (base_pc.xp_reward or 0) if base_pc else 0
     if enabled_actions:

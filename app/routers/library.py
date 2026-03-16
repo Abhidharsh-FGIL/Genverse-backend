@@ -1,7 +1,10 @@
 import uuid
+import logging
 from typing import Optional
 from fastapi import APIRouter, status, UploadFile, File, Form, Query, HTTPException
 from sqlalchemy import select, delete as sql_delete, func as sa_func
+
+logger = logging.getLogger(__name__)
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.content import UserLibraryItem, DocChunk
@@ -92,6 +95,8 @@ async def upload_document(
         select(PlanDefinition).where(PlanDefinition.plan == plan_name)
     )
     plan_def = plan_def_result.scalars().first()
+    if not plan_def:
+        logger.warning("PlanDefinition not found for plan=%s, using default max_file_mb=5", plan_name)
     max_file_mb = plan_def.max_file_size_mb if plan_def else 5
 
     if file_size_mb > max_file_mb:

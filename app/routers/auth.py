@@ -620,6 +620,26 @@ async def forgot_password(payload: ForgotPasswordRequest, db: DBSession):
     return {"message": "If an account with that email exists, we've sent a reset link."}
 
 
+@router.get("/verify-reset-token")
+async def verify_reset_token(token: str, db: DBSession):
+    """Check if a password reset token is still valid (not expired, not used)."""
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    result = await db.execute(
+        select(PasswordResetToken).where(
+            PasswordResetToken.token_hash == token_hash,
+            PasswordResetToken.expires_at > datetime.now(timezone.utc),
+            PasswordResetToken.used == False,
+        )
+    )
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset link. Please request a new one.",
+        )
+    return {"valid": True}
+
+
 @router.post("/reset-password")
 async def reset_password(payload: ResetPasswordRequest, db: DBSession):
     """Reset password using a valid token from the reset email."""

@@ -453,6 +453,39 @@ async def get_assessment(assessment_id: uuid.UUID, current_user: CurrentUser, db
     return assessment
 
 
+@router.patch("/{assessment_id}", response_model=AssessmentResponse)
+async def update_assessment(assessment_id: uuid.UUID, payload: dict, current_user: CurrentUser, db: DBSession):
+    """Update assessment fields (question_json, question_count, title, etc.)."""
+    result = await db.execute(
+        select(PracticeAssessment).where(
+            PracticeAssessment.id == assessment_id,
+            PracticeAssessment.created_by == current_user.id,
+        )
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise NotFoundException("Assessment not found")
+
+    allowed_fields = {
+        "title", "subject", "difficulty", "mode", "question_json",
+        "question_count", "answer_key_json", "time_limit",
+        "negative_marking", "negative_mark_value", "topics",
+    }
+    for key, value in payload.items():
+        if key in allowed_fields and hasattr(assessment, key):
+            setattr(assessment, key, value)
+
+    # If question_json updated but question_count not provided, sync it
+    if "question_json" in payload and "question_count" not in payload:
+        qj = payload["question_json"]
+        if isinstance(qj, list):
+            assessment.question_count = len(qj)
+
+    await db.commit()
+    await db.refresh(assessment)
+    return assessment
+
+
 @router.delete("/{assessment_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_assessment(assessment_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
     result = await db.execute(

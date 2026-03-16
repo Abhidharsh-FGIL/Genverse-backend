@@ -2486,15 +2486,38 @@ Return ONLY valid JSON in this exact format:
 
 Important: criterionTitle in criterionScores must exactly match the title field of each rubric criterion. Points must be a valid integer within that criterion's level range."""
 
+        response = ""
         try:
-            response = await self.chat([{"role": "user", "content": prompt}])
+            response = await self.chat(
+                [{"role": "user", "content": prompt}],
+                json_mode=True,
+            )
             cleaned = response.strip()
+            # Strip markdown code fences if present
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
+                cleaned = cleaned.strip()
             return json.loads(cleaned)
-        except Exception:
+        except json.JSONDecodeError as e:
+            print(f"[AIService] auto_grade_direct JSON parse failed: {e}\nRaw response: {response[:500]}", flush=True)
+            # Try to extract JSON from the response
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                try:
+                    return json.loads(json_match.group())
+                except Exception:
+                    pass
+            return {
+                "overallComment": "AI grading completed. Please review manually.",
+                "strengths": [],
+                "areasForImprovement": [],
+                "remediationTopics": [],
+            }
+        except Exception as e:
+            print(f"[AIService] auto_grade_direct failed: {e}", flush=True)
             return {
                 "overallComment": "AI grading completed. Please review manually.",
                 "strengths": [],

@@ -1,6 +1,6 @@
 import uuid
 from fastapi import APIRouter, Query
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.classes import Class, Assignment, Submission, ClassStudent
@@ -35,23 +35,31 @@ async def get_class_analytics(class_id: uuid.UUID, current_user: CurrentUser, db
     )
     assignments = assignments_result.scalars().all()
 
+    # Batch query: get submission counts per assignment in a single query
+    assignment_ids = [a.id for a in assignments]
+    sub_stats = {}
+    if assignment_ids:
+        stats_result = await db.execute(
+            select(
+                Submission.assignment_id,
+                func.count(Submission.id).label("total"),
+                func.count(case((Submission.status.in_(["graded", "returned"]), 1))).label("graded"),
+            )
+            .where(Submission.assignment_id.in_(assignment_ids))
+            .group_by(Submission.assignment_id)
+        )
+        for row in stats_result.all():
+            sub_stats[row.assignment_id] = {"total": row.total, "graded": row.graded}
+
     assignment_stats = []
     for assignment in assignments:
-        total_submissions = await db.execute(
-            select(func.count(Submission.id)).where(Submission.assignment_id == assignment.id)
-        )
-        graded_submissions = await db.execute(
-            select(func.count(Submission.id)).where(
-                Submission.assignment_id == assignment.id,
-                Submission.status.in_(["graded", "returned"]),
-            )
-        )
+        stats = sub_stats.get(assignment.id, {"total": 0, "graded": 0})
         assignment_stats.append({
             "id": str(assignment.id),
             "title": assignment.title,
-            "total_submissions": total_submissions.scalar_one(),
-            "graded_submissions": graded_submissions.scalar_one(),
-            "completion_rate": (total_submissions.scalar_one() / student_count * 100) if student_count else 0,
+            "total_submissions": stats["total"],
+            "graded_submissions": stats["graded"],
+            "completion_rate": (stats["total"] / student_count * 100) if student_count else 0,
         })
 
     return {
@@ -78,22 +86,32 @@ async def get_gradebook(class_id: uuid.UUID, current_user: CurrentUser, db: DBSe
     )
     assignments = assignments_result.scalars().all()
 
+    # Bulk fetch all submissions for this class's published assignments in one query
+    assignment_ids = [a.id for a in assignments]
+    sub_lookup: dict[tuple, Submission] = {}
+    if assignment_ids:
+        all_subs_result = await db.execute(
+            select(Submission).where(Submission.assignment_id.in_(assignment_ids))
+        )
+        for sub in all_subs_result.scalars().all():
+            sub_lookup[(sub.assignment_id, sub.student_id)] = sub
+
     gradebook = []
     for cs, student in students:
         student_grades = []
         total_score = 0
         total_possible = 0
         for assignment in assignments:
-            sub_result = await db.execute(
-                select(Submission).where(
-                    Submission.assignment_id == assignment.id,
-                    Submission.student_id == student.id,
-                )
+            sub = sub_lookup.get((assignment.id, student.id))
+            has_grade = (
+                sub is not None
+                and sub.grade
+                and isinstance(sub.grade, dict)
+                and ("totalScore" in sub.grade or "score" in sub.grade)
             )
-            sub = sub_result.scalars().first()
-            if sub and sub.grade:
-                score = sub.grade.get("totalScore", 0)
-                max_score = sub.grade.get("maxScore", assignment.points)
+            if has_grade:
+                score = sub.grade.get("totalScore", sub.grade.get("score", 0))
+                max_score = sub.grade.get("maxScore", sub.grade.get("max_score", assignment.points))
                 total_score += score
                 total_possible += max_score
                 student_grades.append({
@@ -102,6 +120,21 @@ async def get_gradebook(class_id: uuid.UUID, current_user: CurrentUser, db: DBSe
                     "score": score,
                     "max_score": max_score,
                     "percentage": (score / max_score * 100) if max_score else 0,
+                    "status": sub.status,
+                })
+            elif sub is not None and sub.status in ("graded", "returned"):
+                # Grade was published but grade dict might be missing totalScore key
+                score = sub.grade.get("totalScore", 0) if isinstance(sub.grade, dict) else 0
+                max_score = assignment.points
+                total_score += score
+                total_possible += max_score
+                student_grades.append({
+                    "assignment_id": str(assignment.id),
+                    "assignment_title": assignment.title,
+                    "score": score,
+                    "max_score": max_score,
+                    "percentage": (score / max_score * 100) if max_score else 0,
+                    "status": sub.status,
                 })
             else:
                 total_possible += assignment.points
@@ -130,27 +163,445 @@ async def get_gradebook(class_id: uuid.UUID, current_user: CurrentUser, db: DBSe
 
 @router.get("/org/{org_id}")
 async def get_org_analytics(org_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
-    """Organization-wide analytics for org admin."""
-    # Member counts
+    """Comprehensive organization-wide analytics for org admin dashboard."""
+    from datetime import datetime, timezone, timedelta
+    from app.models.content import Ebook, UserLibraryItem
+    from app.models.ai import AiChat, AiInteractionHistory
+    from app.models.subscription import Subscription, PointTransaction
+    from app.models.evaluation import EvaluationAssessment, EvaluationAttempt
+
+    now = datetime.now(timezone.utc)
+    thirty_days_ago = now - timedelta(days=30)
+    seven_days_ago = now - timedelta(days=7)
+
+    # --- Member counts by role ---
     member_counts_result = await db.execute(
         select(OrgMember.role, func.count(OrgMember.id))
         .where(OrgMember.org_id == org_id, OrgMember.status == "active")
         .group_by(OrgMember.role)
     )
     member_counts = dict(member_counts_result.all())
+    total_members = sum(member_counts.values())
 
-    # Class count
-    class_count_result = await db.execute(
-        select(func.count(Class.id)).where(Class.org_id == org_id, Class.is_active == True)
+    # --- All member user_ids for sub-queries ---
+    member_ids_result = await db.execute(
+        select(OrgMember.user_id).where(OrgMember.org_id == org_id, OrgMember.status == "active")
     )
-    class_count = class_count_result.scalar_one()
+    member_ids = [r[0] for r in member_ids_result.all()]
+
+    # --- Classes ---
+    classes_result = await db.execute(
+        select(Class.id, Class.name, Class.subject, Class.grade, Class.teacher_id)
+        .where(Class.org_id == org_id, Class.is_active == True)
+    )
+    classes = classes_result.all()
+    class_ids = [c.id for c in classes]
+
+    # --- Total students across all classes ---
+    total_students = 0
+    if class_ids:
+        ts_result = await db.execute(
+            select(func.count(func.distinct(ClassStudent.student_id)))
+            .where(ClassStudent.class_id.in_(class_ids))
+        )
+        total_students = ts_result.scalar_one()
+
+    # --- Students per class ---
+    students_per_class = {}
+    if class_ids:
+        spc_result = await db.execute(
+            select(ClassStudent.class_id, func.count(ClassStudent.id))
+            .where(ClassStudent.class_id.in_(class_ids))
+            .group_by(ClassStudent.class_id)
+        )
+        students_per_class = dict(spc_result.all())
+
+    # --- Assignments & Submissions ---
+    total_assignments = 0
+    total_submissions = 0
+    graded_submissions = 0
+    if class_ids:
+        assign_result = await db.execute(
+            select(func.count(Assignment.id))
+            .where(Assignment.class_id.in_(class_ids))
+        )
+        total_assignments = assign_result.scalar_one()
+
+        sub_result = await db.execute(
+            select(
+                func.count(Submission.id),
+                func.count(case((Submission.status.in_(["graded", "returned"]), 1))),
+            )
+            .join(Assignment, Submission.assignment_id == Assignment.id)
+            .where(Assignment.class_id.in_(class_ids))
+        )
+        row = sub_result.one()
+        total_submissions = row[0]
+        graded_submissions = row[1]
+
+    # --- Submission status distribution ---
+    submission_statuses = {}
+    if class_ids:
+        ss_result = await db.execute(
+            select(Submission.status, func.count(Submission.id))
+            .join(Assignment, Submission.assignment_id == Assignment.id)
+            .where(Assignment.class_id.in_(class_ids))
+            .group_by(Submission.status)
+        )
+        submission_statuses = dict(ss_result.all())
+
+    # --- Practice Assessments (org-scoped) ---
+    practice_count_result = await db.execute(
+        select(func.count(PracticeAssessment.id))
+        .where(PracticeAssessment.org_id == org_id)
+    )
+    practice_count = practice_count_result.scalar_one()
+
+    # Practice attempts & avg score
+    practice_stats_result = await db.execute(
+        select(
+            func.count(AssessmentAttempt.id),
+            func.avg(AssessmentAttempt.percentage),
+        )
+        .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        .where(
+            PracticeAssessment.org_id == org_id,
+            AssessmentAttempt.status == "evaluated",
+        )
+    )
+    ps_row = practice_stats_result.one()
+    practice_attempts = ps_row[0] or 0
+    practice_avg_score = round(ps_row[1] or 0, 1)
+
+    # --- Evaluation Assessments ---
+    eval_count_result = await db.execute(
+        select(func.count(EvaluationAssessment.id))
+        .where(EvaluationAssessment.org_id == org_id)
+    )
+    eval_count = eval_count_result.scalar_one()
+
+    eval_stats_result = await db.execute(
+        select(
+            func.count(EvaluationAttempt.id),
+            func.avg(EvaluationAttempt.percentage),
+        )
+        .join(EvaluationAssessment, EvaluationAttempt.assessment_id == EvaluationAssessment.id)
+        .where(
+            EvaluationAssessment.org_id == org_id,
+            EvaluationAttempt.status == "evaluated",
+        )
+    )
+    es_row = eval_stats_result.one()
+    eval_attempts = es_row[0] or 0
+    eval_avg_score = round(es_row[1] or 0, 1)
+
+    # --- Points usage: derive from subscription (quota - balance) for monthly ---
+    points_balance = 0
+    points_quota = 0
+    if member_ids:
+        pass  # member_ids needed for top-users below
+
+    # Org subscription
+    sub_result2 = await db.execute(
+        select(Subscription.points_balance, Subscription.points_monthly_quota, Subscription.plan)
+        .where(Subscription.org_id == org_id, Subscription.status.in_(["active", "trialing"]))
+        .limit(1)
+    )
+    sub_row = sub_result2.first()
+    if sub_row:
+        points_balance = sub_row.points_balance or 0
+        points_quota = sub_row.points_monthly_quota or 0
+
+    total_points_used = max(0, points_quota - points_balance)
+
+    # --- Top points users ---
+    top_users_data = []
+    if member_ids:
+        tu_result = await db.execute(
+            select(
+                PointTransaction.user_id,
+                func.sum(PointTransaction.points_used).label("total_pts"),
+            )
+            .where(PointTransaction.user_id.in_(member_ids), PointTransaction.points_used > 0)
+            .group_by(PointTransaction.user_id)
+            .order_by(func.sum(PointTransaction.points_used).desc())
+            .limit(10)
+        )
+        top_user_rows = tu_result.all()
+        if top_user_rows:
+            top_uids = [r.user_id for r in top_user_rows]
+            names_result = await db.execute(
+                select(User.id, User.name).where(User.id.in_(top_uids))
+            )
+            name_map = {r.id: r.name for r in names_result.all()}
+            top_users_data = [
+                {"name": name_map.get(r.user_id, "Unknown"), "points": r.total_pts}
+                for r in top_user_rows
+            ]
+
+    # --- Class performance (avg submission scores per class) ---
+    class_performance = []
+    if class_ids:
+        cp_result = await db.execute(
+            select(
+                Assignment.class_id,
+                func.avg(
+                    case(
+                        (Submission.grade.isnot(None), Submission.grade["totalScore"].as_float()),
+                        else_=None,
+                    )
+                ).label("avg_score"),
+                func.count(Submission.id).label("sub_count"),
+            )
+            .join(Submission, Submission.assignment_id == Assignment.id)
+            .where(
+                Assignment.class_id.in_(class_ids),
+                Submission.status.in_(["graded", "returned"]),
+            )
+            .group_by(Assignment.class_id)
+        )
+        cp_rows = cp_result.all()
+        class_name_map = {c.id: c.name for c in classes}
+        for row in cp_rows:
+            class_performance.append({
+                "class_name": class_name_map.get(row.class_id, "Unknown"),
+                "avg_score": round(row.avg_score or 0, 1),
+                "submissions": row.sub_count,
+            })
+
+    # --- Recent activity (last 30 days counts) ---
+    recent_submissions = 0
+    if class_ids:
+        rs_result = await db.execute(
+            select(func.count(Submission.id))
+            .join(Assignment, Submission.assignment_id == Assignment.id)
+            .where(Assignment.class_id.in_(class_ids), Submission.submitted_at >= thirty_days_ago)
+        )
+        recent_submissions = rs_result.scalar_one()
+
+    recent_practice = 0
+    rp_result = await db.execute(
+        select(func.count(AssessmentAttempt.id))
+        .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        .where(PracticeAssessment.org_id == org_id, AssessmentAttempt.submitted_at >= thirty_days_ago)
+    )
+    recent_practice = rp_result.scalar_one()
+
+    # --- AI usage (org members) ---
+    total_chats = 0
+    total_ai_interactions = 0
+    if member_ids:
+        tc_result = await db.execute(
+            select(func.count(AiChat.id)).where(AiChat.user_id.in_(member_ids))
+        )
+        total_chats = tc_result.scalar_one()
+
+        tai_result = await db.execute(
+            select(func.count(AiInteractionHistory.id)).where(AiInteractionHistory.user_id.in_(member_ids))
+        )
+        total_ai_interactions = tai_result.scalar_one()
+
+    # --- Content created by org members ---
+    total_ebooks = 0
+    total_documents = 0
+    if member_ids:
+        eb_result = await db.execute(
+            select(func.count(Ebook.id)).where(Ebook.user_id.in_(member_ids))
+        )
+        total_ebooks = eb_result.scalar_one()
+
+        doc_result = await db.execute(
+            select(func.count(UserLibraryItem.id)).where(UserLibraryItem.user_id.in_(member_ids))
+        )
+        total_documents = doc_result.scalar_one()
+
+    # --- Weekly activity trend (last 4 weeks) ---
+    weekly_activity = []
+    for i in range(3, -1, -1):
+        week_start = now - timedelta(weeks=i + 1)
+        week_end = now - timedelta(weeks=i)
+        wk_count = 0
+        if member_ids:
+            wk_result = await db.execute(
+                select(func.count(AiInteractionHistory.id))
+                .where(
+                    AiInteractionHistory.user_id.in_(member_ids),
+                    AiInteractionHistory.created_at >= week_start,
+                    AiInteractionHistory.created_at < week_end,
+                )
+            )
+            wk_count = wk_result.scalar_one()
+        weekly_activity.append({
+            "week": f"Week {4 - i}",
+            "interactions": wk_count,
+        })
+
+    # --- Assessment score distribution ---
+    score_distribution = {"90-100": 0, "75-89": 0, "60-74": 0, "40-59": 0, "0-39": 0}
+    dist_result = await db.execute(
+        select(AssessmentAttempt.percentage)
+        .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
+        .where(
+            PracticeAssessment.org_id == org_id,
+            AssessmentAttempt.status == "evaluated",
+            AssessmentAttempt.percentage.isnot(None),
+        )
+    )
+    for (pct,) in dist_result.all():
+        if pct >= 90:
+            score_distribution["90-100"] += 1
+        elif pct >= 75:
+            score_distribution["75-89"] += 1
+        elif pct >= 60:
+            score_distribution["60-74"] += 1
+        elif pct >= 40:
+            score_distribution["40-59"] += 1
+        else:
+            score_distribution["0-39"] += 1
+
+    # Also add evaluation attempt scores
+    eval_dist_result = await db.execute(
+        select(EvaluationAttempt.percentage)
+        .join(EvaluationAssessment, EvaluationAttempt.assessment_id == EvaluationAssessment.id)
+        .where(
+            EvaluationAssessment.org_id == org_id,
+            EvaluationAttempt.status == "evaluated",
+            EvaluationAttempt.percentage.isnot(None),
+        )
+    )
+    for (pct,) in eval_dist_result.all():
+        if pct >= 90:
+            score_distribution["90-100"] += 1
+        elif pct >= 75:
+            score_distribution["75-89"] += 1
+        elif pct >= 60:
+            score_distribution["60-74"] += 1
+        elif pct >= 40:
+            score_distribution["40-59"] += 1
+        else:
+            score_distribution["0-39"] += 1
 
     return {
         "org_id": str(org_id),
-        "member_counts": member_counts,
-        "class_count": class_count,
-        "total_members": sum(member_counts.values()),
+        # Summary
+        "total_members": total_members,
+        "member_counts": {k: v for k, v in member_counts.items()},
+        "class_count": len(classes),
+        "total_students": total_students,
+        "total_assignments": total_assignments,
+        "total_submissions": total_submissions,
+        "graded_submissions": graded_submissions,
+        "submission_statuses": submission_statuses,
+        # Assessments
+        "practice_assessments": practice_count,
+        "evaluation_assessments": eval_count,
+        "total_assessments": practice_count + eval_count,
+        "practice_attempts": practice_attempts,
+        "practice_avg_score": practice_avg_score,
+        "eval_attempts": eval_attempts,
+        "eval_avg_score": eval_avg_score,
+        # Points
+        "total_points_used": total_points_used,
+        "points_balance": points_balance,
+        "points_quota": points_quota,
+        "top_users": top_users_data,
+        # Content
+        "total_ebooks": total_ebooks,
+        "total_documents": total_documents,
+        "total_chats": total_chats,
+        "total_ai_interactions": total_ai_interactions,
+        # Class details
+        "classes": [
+            {
+                "id": str(c.id),
+                "name": c.name,
+                "subject": c.subject,
+                "grade": c.grade,
+                "students": students_per_class.get(c.id, 0),
+            }
+            for c in classes
+        ],
+        "class_performance": class_performance,
+        # Trends
+        "weekly_activity": weekly_activity,
+        "recent_submissions_30d": recent_submissions,
+        "recent_practice_30d": recent_practice,
+        "score_distribution": score_distribution,
     }
+
+
+@router.get("/org/{org_id}/member-usage")
+async def get_org_member_usage(org_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    """Per-member points usage for the current billing cycle."""
+    from datetime import datetime, timezone
+    from app.models.subscription import Subscription, PointTransaction
+
+    # Get org member IDs
+    member_result = await db.execute(
+        select(OrgMember.user_id, OrgMember.role)
+        .where(OrgMember.org_id == org_id, OrgMember.status == "active")
+    )
+    members = member_result.all()
+    member_ids = [m.user_id for m in members]
+    role_map = {m.user_id: m.role for m in members}
+
+    if not member_ids:
+        return []
+
+    # Get names
+    names_result = await db.execute(
+        select(User.id, User.name, User.email).where(User.id.in_(member_ids))
+    )
+    name_map = {r.id: r.name or r.email or "Unknown" for r in names_result.all()}
+
+    # Get org subscription ID and billing period
+    sub_result = await db.execute(
+        select(Subscription.id, Subscription.current_period_start)
+        .where(Subscription.org_id == org_id, Subscription.status.in_(["active", "trialing"]))
+        .limit(1)
+    )
+    sub_row = sub_result.first()
+    if not sub_row:
+        # No org subscription — return members with 0 usage
+        return [
+            {"user_id": str(uid), "name": name_map.get(uid, "Unknown"), "role": role_map.get(uid, "student"), "points_used": 0, "last_active": None}
+            for uid in member_ids
+        ]
+
+    org_sub_id = sub_row.id
+    if sub_row.current_period_start:
+        period_start = sub_row.current_period_start
+    else:
+        now = datetime.now(timezone.utc)
+        period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Sum positive point transactions per member — only from the ORG subscription
+    usage_result = await db.execute(
+        select(
+            PointTransaction.user_id,
+            func.coalesce(func.sum(PointTransaction.points_used), 0).label("total"),
+            func.max(PointTransaction.created_at).label("last_active"),
+        )
+        .where(
+            PointTransaction.subscription_id == org_sub_id,
+            PointTransaction.user_id.in_(member_ids),
+            PointTransaction.points_used > 0,
+            PointTransaction.created_at >= period_start,
+        )
+        .group_by(PointTransaction.user_id)
+    )
+    usage_map = {r.user_id: {"total": r.total, "last_active": r.last_active} for r in usage_result.all()}
+
+    return [
+        {
+            "user_id": str(uid),
+            "name": name_map.get(uid, "Unknown"),
+            "role": role_map.get(uid, "student"),
+            "points_used": usage_map.get(uid, {}).get("total", 0),
+            "last_active": usage_map.get(uid, {}).get("last_active"),
+        }
+        for uid in member_ids
+    ]
 
 
 @router.get("/user/progress")

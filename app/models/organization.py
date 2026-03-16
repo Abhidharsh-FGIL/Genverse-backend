@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Boolean, Integer, DateTime, Text, func, Enum as SAEnum, ForeignKey
+from sqlalchemy import String, Boolean, Integer, DateTime, Text, func, Enum as SAEnum, ForeignKey, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -24,6 +24,7 @@ class Organization(Base):
     locked_board: Mapped[str | None] = mapped_column(String(50))
     enforce_academic_context: Mapped[bool] = mapped_column(Boolean, default=False)
     default_theme: Mapped[str | None] = mapped_column(String(50))
+    allowed_boards: Mapped[list | None] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

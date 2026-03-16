@@ -1,6 +1,6 @@
 import uuid
 import secrets
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Query
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -10,6 +10,9 @@ from app.dependencies import DBSession, CurrentUser
 from app.models.organization import Organization, OrgMember, OrgInvitation, OrgModuleOverride
 from app.models.subscription import Subscription, PlanDefinition
 from app.models.user import User
+from app.models.content import Ebook, MindMap, VideoProject, UserLibraryItem
+from app.models.assessment import PracticeAssessment
+from app.models.evaluation import EvaluationAssessment
 from app.schemas.organization import (
     OrganizationCreate,
     OrganizationUpdate,
@@ -426,7 +429,10 @@ async def update_member_role(
     member = result.scalar_one_or_none()
     if not member:
         raise NotFoundException("Member not found")
-    member.role = payload.role
+    if payload.role is not None:
+        member.role = payload.role
+    if payload.status is not None and payload.status in ("active", "deactivated"):
+        member.status = payload.status
     await db.commit()
     await db.refresh(member)
     user_result = await db.execute(select(User).where(User.id == user_id))
@@ -449,8 +455,245 @@ async def remove_member(
     member = result.scalar_one_or_none()
     if not member:
         raise NotFoundException("Member not found")
-    await db.delete(member)
+    member.status = "deactivated"
     await db.commit()
+
+
+class AdminUpdateMemberProfile(BaseModel):
+    name: str | None = None
+    phone: str | None = None
+    address: str | None = None
+    grade: int | None = None
+    subjects: list[str] | None = None
+    language: str | None = None
+    board_preference: str | None = None
+    date_of_birth: str | None = None
+    gender: str | None = None
+    blood_group: str | None = None
+    city: str | None = None
+    state: str | None = None
+    pincode: str | None = None
+    emergency_contact_name: str | None = None
+    emergency_contact_phone: str | None = None
+    emergency_contact_relation: str | None = None
+    employee_id: str | None = None
+    department: str | None = None
+    qualification: str | None = None
+    roll_number: str | None = None
+    parent_name: str | None = None
+    parent_phone: str | None = None
+
+
+@router.get("/{org_id}/members/{user_id}/profile")
+async def get_member_profile(
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Get full profile fields for a member."""
+    await _require_org_admin(current_user.id, org_id, db)
+    result = await db.execute(
+        select(OrgMember).where(OrgMember.org_id == org_id, OrgMember.user_id == user_id)
+    )
+    member = result.scalar_one_or_none()
+    if not member:
+        raise NotFoundException("Member not found in this organization")
+
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise NotFoundException("User not found")
+
+    return {
+        "name": user.name,
+        "phone": user.phone,
+        "address": user.address,
+        "grade": user.grade,
+        "subjects": user.subjects,
+        "board_preference": user.board_preference,
+        "date_of_birth": str(user.date_of_birth) if user.date_of_birth else None,
+        "gender": user.gender,
+        "blood_group": user.blood_group,
+        "city": user.city,
+        "state": user.state,
+        "pincode": user.pincode,
+        "emergency_contact_name": user.emergency_contact_name,
+        "emergency_contact_phone": user.emergency_contact_phone,
+        "emergency_contact_relation": user.emergency_contact_relation,
+        "employee_id": user.employee_id,
+        "department": user.department,
+        "qualification": user.qualification,
+        "roll_number": user.roll_number,
+        "parent_name": user.parent_name,
+        "parent_phone": user.parent_phone,
+    }
+
+
+@router.patch("/{org_id}/members/{user_id}/profile", response_model=OrgMemberResponse)
+async def admin_update_member_profile(
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: AdminUpdateMemberProfile,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Org admin can update a member's profile fields."""
+    await _require_org_admin(current_user.id, org_id, db)
+    # Verify user is a member of this org
+    result = await db.execute(
+        select(OrgMember).where(OrgMember.org_id == org_id, OrgMember.user_id == user_id)
+    )
+    member = result.scalar_one_or_none()
+    if not member:
+        raise NotFoundException("Member not found in this organization")
+
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise NotFoundException("User not found")
+
+    update_data = payload.model_dump(exclude_unset=True)
+    if "date_of_birth" in update_data and update_data["date_of_birth"]:
+        update_data["date_of_birth"] = date.fromisoformat(update_data["date_of_birth"])
+    for key, value in update_data.items():
+        setattr(user, key, value)
+    await db.commit()
+    await db.refresh(user)
+    await db.refresh(member)
+
+    return OrgMemberResponse(
+        id=member.id, org_id=member.org_id, user_id=member.user_id,
+        role=member.role, status=member.status, joined_at=member.joined_at,
+        user_name=user.name, user_email=user.email,
+    )
+
+
+# ---- Content Governance ----
+
+@router.get("/{org_id}/content")
+async def get_org_content(
+    org_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Aggregate all content created by org members for the Content Governance page."""
+    await _require_org_admin(current_user.id, org_id, db)
+
+    # Get member list with user info
+    mem_result = await db.execute(
+        select(OrgMember, User).join(User, OrgMember.user_id == User.id)
+        .where(OrgMember.org_id == org_id)
+    )
+    mem_rows = mem_result.all()
+    member_map = {}
+    role_map = {}
+    for member, user in mem_rows:
+        member_map[str(member.user_id)] = user.name or "Unknown"
+        role_map[str(member.user_id)] = member.role
+
+    # Assessments
+    a_result = await db.execute(
+        select(PracticeAssessment).where(PracticeAssessment.org_id == org_id)
+        .order_by(PracticeAssessment.created_at.desc()).limit(200)
+    )
+    assessments = [
+        {
+            "id": str(a.id), "title": a.title, "subject": a.subject,
+            "difficulty": a.difficulty, "mode": a.mode,
+            "question_count": a.question_count,
+            "created_by": str(a.created_by),
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+        }
+        for a in a_result.scalars().all()
+    ]
+
+    # eBooks
+    e_result = await db.execute(
+        select(Ebook).where(Ebook.org_id == org_id)
+        .order_by(Ebook.created_at.desc()).limit(200)
+    )
+    ebooks = [
+        {
+            "id": str(e.id), "title": e.title, "subject": e.subject,
+            "source_type": e.source_type, "page_count": e.page_count,
+            "user_id": str(e.user_id),
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        }
+        for e in e_result.scalars().all()
+    ]
+
+    # Mind Maps
+    m_result = await db.execute(
+        select(MindMap).where(MindMap.org_id == org_id)
+        .order_by(MindMap.created_at.desc()).limit(200)
+    )
+    mindmaps = [
+        {
+            "id": str(m.id), "title": m.title, "topic": m.topic, "subject": m.subject,
+            "user_id": str(m.user_id),
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in m_result.scalars().all()
+    ]
+
+    # Video Projects
+    v_result = await db.execute(
+        select(VideoProject).where(VideoProject.org_id == org_id)
+        .order_by(VideoProject.created_at.desc()).limit(200)
+    )
+    videos = [
+        {
+            "id": str(v.id), "title": v.title, "topic": v.topic, "subject": v.subject,
+            "status": v.status,
+            "user_id": str(v.user_id),
+            "created_at": v.created_at.isoformat() if v.created_at else None,
+        }
+        for v in v_result.scalars().all()
+    ]
+
+    # Library Documents
+    l_result = await db.execute(
+        select(UserLibraryItem).where(UserLibraryItem.org_id == org_id)
+        .order_by(UserLibraryItem.created_at.desc()).limit(200)
+    )
+    library = [
+        {
+            "id": str(li.id), "title": li.title, "file_type": li.file_type,
+            "file_size_mb": li.file_size_mb,
+            "user_id": str(li.user_id),
+            "created_at": li.created_at.isoformat() if li.created_at else None,
+        }
+        for li in l_result.scalars().all()
+    ]
+
+    # Evaluation Assessments
+    ev_result = await db.execute(
+        select(EvaluationAssessment).where(EvaluationAssessment.org_id == org_id)
+        .order_by(EvaluationAssessment.created_at.desc()).limit(200)
+    )
+    evaluations = [
+        {
+            "id": str(ev.id), "title": ev.title, "mode": ev.mode,
+            "difficulty": ev.difficulty, "question_count": ev.question_count,
+            "max_score": ev.max_score, "status": ev.status,
+            "grade": ev.grade, "board": ev.board,
+            "created_by": str(ev.created_by),
+            "created_at": ev.created_at.isoformat() if ev.created_at else None,
+        }
+        for ev in ev_result.scalars().all()
+    ]
+
+    return {
+        "members": member_map,
+        "roles": role_map,
+        "assessments": assessments,
+        "evaluations": evaluations,
+        "ebooks": ebooks,
+        "mindmaps": mindmaps,
+        "videos": videos,
+        "library": library,
+    }
 
 
 # ---- Module Overrides ----
