@@ -1,4 +1,5 @@
 import uuid
+import asyncio
 import secrets
 import random
 import hashlib
@@ -220,8 +221,8 @@ async def send_otp(payload: SendOtpRequest, db: DBSession):
     db.add(verification)
     await db.commit()
 
-    # Send the OTP email (synchronous SMTP, runs quickly)
-    sent = send_verification_otp(email, otp)
+    # Send the OTP email via thread pool to avoid blocking the event loop
+    sent = await asyncio.to_thread(send_verification_otp, email, otp)
     if not sent:
         # If SMTP is not configured, still allow signup in dev mode
         if settings.ENVIRONMENT == "development":
@@ -621,7 +622,7 @@ async def forgot_password(payload: ForgotPasswordRequest, db: DBSession):
     reset_link = f"{base_url}/auth/reset?token={raw_token}"
 
     from app.services.email_service import send_password_reset_email
-    sent = send_password_reset_email(email, reset_link)
+    sent = await asyncio.to_thread(send_password_reset_email, email, reset_link)
     if not sent:
         if settings.ENVIRONMENT == "development":
             print(f"[DEV] Reset link for {email}: {reset_link}", flush=True)

@@ -25,7 +25,7 @@ from datetime import datetime, timezone, timedelta
 
 import httpx
 import stripe
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy import select, and_
@@ -359,6 +359,7 @@ async def _fulfil_purchase(
     is_renewal: bool = False,
     promo_code: str | None = None,
     promo_discount: int = 0,
+    background_tasks: BackgroundTasks | None = None,
 ):
     """Apply the purchased plan/addon to the user's subscription.
     Idempotent — skips if the same order was already fulfilled."""
@@ -521,7 +522,7 @@ async def _fulfil_purchase(
                 period_start = sub.current_period_start.strftime("%b %d, %Y") if sub.current_period_start else None
                 period_end = sub.current_period_end.strftime("%b %d, %Y") if sub.current_period_end else None
 
-                send_purchase_invoice_email(
+                invoice_kwargs = dict(
                     to_email=user_obj.email,
                     user_name=user_obj.name or "User",
                     invoice_id=inv_id,
@@ -538,6 +539,10 @@ async def _fulfil_purchase(
                     promo_discount=promo_discount,
                     original_amount=price if promo_discount else None,
                 )
+                if background_tasks:
+                    background_tasks.add_task(send_purchase_invoice_email, **invoice_kwargs)
+                else:
+                    send_purchase_invoice_email(**invoice_kwargs)
             elif item_type == "point_pack":
                 addon_info = ADDON_POINT_MAP.get(item_id, {})
                 price = addon_info.get("price", 0)
@@ -545,7 +550,7 @@ async def _fulfil_purchase(
                 label = f"{pts} AI Points Pack"
                 final_price = price - promo_discount if promo_discount else price
 
-                send_purchase_invoice_email(
+                invoice_kwargs = dict(
                     to_email=user_obj.email,
                     user_name=user_obj.name or "User",
                     invoice_id=inv_id,
@@ -560,6 +565,10 @@ async def _fulfil_purchase(
                     promo_discount=promo_discount,
                     original_amount=price if promo_discount else None,
                 )
+                if background_tasks:
+                    background_tasks.add_task(send_purchase_invoice_email, **invoice_kwargs)
+                else:
+                    send_purchase_invoice_email(**invoice_kwargs)
     except Exception as e:
         # Email failure should never block the purchase flow
         print(f"[Payment] Invoice email failed (non-blocking): {e}", flush=True)
@@ -870,6 +879,7 @@ async def check_phonepe_status(
     promo_discount: int = 0,
     current_user: CurrentUser = None,
     db: DBSession = None,
+    background_tasks: BackgroundTasks = None,
 ):
     """Check PhonePe payment status and fulfil if successful."""
     order_status = await _get_phonepe_order_status(merchant_order_id)
@@ -888,6 +898,7 @@ async def check_phonepe_status(
             phonepe_subscription_id=merchant_order_id if item_type == "plan_upgrade" else None,
             promo_code=promo_code if promo_code else None,
             promo_discount=promo_discount,
+            background_tasks=background_tasks,
         )
 
         if item_type == "plan_upgrade":
@@ -916,7 +927,7 @@ async def check_phonepe_status(
 
 
 @router.get("/status/{session_id}", response_model=PaymentStatusResponse)
-async def get_payment_status(session_id: str, current_user: CurrentUser, db: DBSession):
+async def get_payment_status(session_id: str, current_user: CurrentUser, db: DBSession, background_tasks: BackgroundTasks = None):
     """Check Stripe payment status and fulfil if successful."""
     if not session_id.startswith("cs_"):
         return PaymentStatusResponse(status="pending", message="Use /phonepe/status for PhonePe payments")
@@ -948,6 +959,7 @@ async def get_payment_status(session_id: str, current_user: CurrentUser, db: DBS
             stripe_subscription_id=stripe_sub_id,
             promo_code=s_promo_code if s_promo_code else None,
             promo_discount=s_promo_discount,
+            background_tasks=background_tasks,
         )
 
         if item_type == "plan_upgrade":

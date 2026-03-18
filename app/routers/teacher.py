@@ -159,9 +159,9 @@ async def list_teacher_submissions(
     limit: Optional[int] = Query(None),
 ):
     """List submissions for the teacher's classes with nested assignment, class, and student data."""
-    # Resolve class IDs the teacher owns or co-teaches
+    # Resolve class IDs the teacher owns or co-teaches (active AND archived)
     own_result = await db.execute(
-        select(Class.id).where(Class.teacher_id == current_user.id, Class.is_active == True)
+        select(Class.id).where(Class.teacher_id == current_user.id)
     )
     co_result = await db.execute(
         select(ClassTeacher.class_id).where(ClassTeacher.teacher_id == current_user.id)
@@ -306,7 +306,7 @@ async def get_teacher_pending_submissions(
 ):
     """Return submissions awaiting grading (status 'submitted' or 'late') for the teacher's classes."""
     own_result = await db.execute(
-        select(Class.id).where(Class.teacher_id == current_user.id, Class.is_active == True)
+        select(Class.id).where(Class.teacher_id == current_user.id)
     )
     co_result = await db.execute(
         select(ClassTeacher.class_id).where(ClassTeacher.teacher_id == current_user.id)

@@ -1,11 +1,11 @@
 import uuid
 import random
 import string
-from fastapi import APIRouter, HTTPException, status, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from typing import Optional
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.classes import Class, ClassStudent, ClassTeacher, Assignment, Submission, PendingClassEnrollment
@@ -15,6 +15,7 @@ from app.schemas.classes import (
     AssignmentResponse, SubmissionResponse,
 )
 from app.core.exceptions import NotFoundException, ForbiddenException, ConflictException
+from app.models.gamification import WorkspaceGamification, StudentBadge
 
 
 class AddStudentByEmailRequest(BaseModel):
@@ -117,10 +118,27 @@ async def list_classes(
             )
         )
         if admin_check.scalar_one_or_none():
+            parsed_org_id = uuid.UUID(org_id)
+
+            # Get all active teacher/admin member IDs in this org
+            members_result = await db.execute(
+                select(OrgMember.user_id).where(
+                    OrgMember.org_id == parsed_org_id,
+                    OrgMember.role.in_(["teacher", "org_admin"]),
+                    OrgMember.status == "active",
+                )
+            )
+            org_teacher_ids = [row[0] for row in members_result.all()]
+
             result = await db.execute(
                 select(Class).where(
-                    Class.org_id == uuid.UUID(org_id),
                     Class.is_active == True,
+                    or_(
+                        Class.org_id == parsed_org_id,
+                        # Also include classes from org teachers that were created without org_id
+                        (Class.org_id.is_(None) & Class.teacher_id.in_(org_teacher_ids))
+                        if org_teacher_ids else False,
+                    ),
                 )
             )
             all_classes = {c.id: c for c in result.scalars().all()}
@@ -132,7 +150,11 @@ async def list_classes(
     # Teacher / co-teacher: return only classes they are part of
     teacher_q = select(Class).where(Class.teacher_id == current_user.id, Class.is_active == True)
     if org_id:
-        teacher_q = teacher_q.where(Class.org_id == uuid.UUID(org_id))
+        # Include classes that match org_id OR were created without org_id (personal workspace)
+        parsed_org = uuid.UUID(org_id)
+        teacher_q = teacher_q.where(
+            or_(Class.org_id == parsed_org, Class.org_id.is_(None))
+        )
     result = await db.execute(teacher_q)
     classes = result.scalars().all()
 
@@ -243,16 +265,42 @@ async def list_archived_classes(
             )
         )
         if admin_check.scalar_one_or_none():
+            parsed_org_id = uuid.UUID(org_id)
+            members_result = await db.execute(
+                select(OrgMember.user_id).where(
+                    OrgMember.org_id == parsed_org_id,
+                    OrgMember.role.in_(["teacher", "org_admin"]),
+                    OrgMember.status == "active",
+                )
+            )
+            org_teacher_ids = [row[0] for row in members_result.all()]
             result = await db.execute(
-                select(Class).where(Class.org_id == uuid.UUID(org_id), Class.is_active == False)
+                select(Class).where(
+                    Class.is_active == False,
+                    or_(
+                        Class.org_id == parsed_org_id,
+                        (Class.org_id.is_(None) & Class.teacher_id.in_(org_teacher_ids))
+                        if org_teacher_ids else False,
+                    ),
+                )
             )
             classes = result.scalars().all()
             return [await _build_class_response(c, db) for c in classes]
 
-    # Fallback: teacher's own archived classes
-    result = await db.execute(
-        select(Class).where(Class.teacher_id == current_user.id, Class.is_active == False)
-    )
+    # Fallback: teacher's own archived classes (active AND null-org-id)
+    if org_id:
+        parsed_org = uuid.UUID(org_id)
+        result = await db.execute(
+            select(Class).where(
+                Class.teacher_id == current_user.id,
+                Class.is_active == False,
+                or_(Class.org_id == parsed_org, Class.org_id.is_(None))
+            )
+        )
+    else:
+        result = await db.execute(
+            select(Class).where(Class.teacher_id == current_user.id, Class.is_active == False)
+        )
     classes = result.scalars().all()
     return [await _build_class_response(c, db) for c in classes]
 
@@ -294,7 +342,12 @@ async def update_class(
     if not is_owner and not is_org_admin:
         raise ForbiddenException("Only the class teacher or org admin can update this class")
 
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    # Restoring (unarchiving) a class is restricted to org admins only
+    updates = payload.model_dump(exclude_unset=True)
+    if updates.get("is_active") is True and not is_org_admin:
+        raise ForbiddenException("Only an org admin can restore an archived class")
+
+    for key, value in updates.items():
         setattr(class_, key, value)
     await db.commit()
     await db.refresh(class_)
@@ -394,6 +447,60 @@ async def list_class_students(class_id: uuid.UUID, current_user: CurrentUser, db
     ]
 
 
+@router.get("/{class_id}/leaderboard")
+async def get_class_leaderboard(class_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    """Get class leaderboard with XP, streak, and badge count for each student."""
+    class_result = await db.execute(select(Class).where(Class.id == class_id))
+    class_ = class_result.scalar_one_or_none()
+    if not class_:
+        raise NotFoundException("Class not found")
+
+    students_result = await db.execute(
+        select(ClassStudent, User)
+        .join(User, ClassStudent.student_id == User.id)
+        .where(ClassStudent.class_id == class_id)
+    )
+    rows = students_result.all()
+
+    leaderboard = []
+    for enrollment, user in rows:
+        if class_.org_id:
+            ws_result = await db.execute(
+                select(WorkspaceGamification).where(
+                    WorkspaceGamification.user_id == user.id,
+                    WorkspaceGamification.org_id == class_.org_id,
+                )
+            )
+        else:
+            ws_result = await db.execute(
+                select(WorkspaceGamification).where(
+                    WorkspaceGamification.user_id == user.id,
+                    WorkspaceGamification.org_id.is_(None),
+                )
+            )
+        ws_gam = ws_result.scalars().first()
+
+        badge_count_result = await db.execute(
+            select(func.count(StudentBadge.id)).where(StudentBadge.student_id == user.id)
+        )
+        badge_count = badge_count_result.scalar_one()
+
+        leaderboard.append({
+            "student_id": str(user.id),
+            "name": user.name or "Student",
+            "xp": ws_gam.xp if ws_gam else 0,
+            "streak": ws_gam.streak if ws_gam else 0,
+            "badge_count": badge_count,
+            "is_current_user": user.id == current_user.id,
+        })
+
+    leaderboard.sort(key=lambda x: x["xp"], reverse=True)
+    for i, entry in enumerate(leaderboard):
+        entry["rank"] = i + 1
+
+    return leaderboard
+
+
 @router.get("/{class_id}/pending-invites")
 async def list_pending_invites(class_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
     """List pending email invitations for students who haven't signed up yet."""
@@ -478,7 +585,8 @@ async def remove_student(
 
 @router.post("/{class_id}/students", response_model=ClassStudentResponse, status_code=status.HTTP_201_CREATED)
 async def add_student_by_email(
-    class_id: uuid.UUID, payload: AddStudentByEmailRequest, current_user: CurrentUser, db: DBSession
+    class_id: uuid.UUID, payload: AddStudentByEmailRequest, current_user: CurrentUser, db: DBSession,
+    background_tasks: BackgroundTasks,
 ):
     """Teacher adds a student to the class by email. Creates a pending enrollment if the user doesn't exist yet."""
     class_result = await db.execute(select(Class).where(Class.id == class_id))
@@ -522,23 +630,21 @@ async def add_student_by_email(
             await db.commit()
 
         # Send invitation email in background (don't block the response)
-        try:
-            from app.services.email_service import send_class_invitation_email
-            # Get org name if available
-            org_name = None
-            if effective_org_id:
-                from app.models.organization import Organization
-                org_result = await db.execute(select(Organization.name).where(Organization.id == effective_org_id))
-                org_name = org_result.scalar_one_or_none()
-            send_class_invitation_email(
-                to_email=str(payload.email),
-                teacher_name=current_user.name or "Your Teacher",
-                class_name=class_.name,
-                organization_name=org_name,
-                join_code=class_.join_code,
-            )
-        except Exception as e:
-            print(f"[Classes] Failed to send invitation email: {e}", flush=True)
+        from app.services.email_service import send_class_invitation_email
+        # Get org name if available
+        org_name = None
+        if effective_org_id:
+            from app.models.organization import Organization
+            org_result = await db.execute(select(Organization.name).where(Organization.id == effective_org_id))
+            org_name = org_result.scalar_one_or_none()
+        background_tasks.add_task(
+            send_class_invitation_email,
+            str(payload.email),
+            current_user.name or "Your Teacher",
+            class_.name,
+            org_name,
+            class_.join_code,
+        )
 
         return JSONResponse(
             status_code=202,

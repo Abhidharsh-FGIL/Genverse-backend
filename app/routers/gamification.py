@@ -265,3 +265,35 @@ async def get_gamification_summary(
         badges_earned=badge_count,
         titles_earned=title_count,
     )
+
+
+@router.post("/seed-badges")
+async def seed_default_badges(current_user: CurrentUser, db: DBSession):
+    """Seed default badges into the database if none exist."""
+    count_result = await db.execute(select(func.count(Badge.id)))
+    count = count_result.scalar_one()
+    if count > 0:
+        return {"message": f"{count} badges already exist", "seeded": 0}
+
+    DEFAULT_BADGES = [
+        {"name": "First Steps", "description": "Join your first class", "icon": "footprints", "category": "special", "rarity": "common", "xp_reward": 10, "criteria": {"type": "classes_joined", "threshold": 1}},
+        {"name": "Class Explorer", "description": "Join 3 classes", "icon": "book-open", "category": "special", "rarity": "rare", "xp_reward": 30, "criteria": {"type": "classes_joined", "threshold": 3}},
+        {"name": "Bookworm", "description": "Submit 5 assignments", "icon": "graduation-cap", "category": "assignment", "rarity": "common", "xp_reward": 20, "criteria": {"type": "submissions", "threshold": 5}},
+        {"name": "Scholar", "description": "Submit 10 assignments", "icon": "brain", "category": "assignment", "rarity": "rare", "xp_reward": 50, "criteria": {"type": "submissions", "threshold": 10}},
+        {"name": "Dedicated Learner", "description": "Submit 25 assignments", "icon": "trophy", "category": "assignment", "rarity": "epic", "xp_reward": 100, "criteria": {"type": "submissions", "threshold": 25}},
+        {"name": "Streak Starter", "description": "Maintain a 3-day streak", "icon": "flame", "category": "streak", "rarity": "common", "xp_reward": 15, "criteria": {"type": "streak", "threshold": 3}},
+        {"name": "Streak Master", "description": "Maintain a 7-day streak", "icon": "zap", "category": "streak", "rarity": "rare", "xp_reward": 40, "criteria": {"type": "streak", "threshold": 7}},
+        {"name": "Streak Legend", "description": "Maintain a 30-day streak", "icon": "crown", "category": "streak", "rarity": "legendary", "xp_reward": 200, "criteria": {"type": "streak", "threshold": 30}},
+        {"name": "XP Hunter", "description": "Earn 100 XP", "icon": "star", "category": "mastery", "rarity": "common", "xp_reward": 10, "criteria": {"type": "xp", "threshold": 100}},
+        {"name": "XP Master", "description": "Earn 500 XP", "icon": "award", "category": "mastery", "rarity": "rare", "xp_reward": 50, "criteria": {"type": "xp", "threshold": 500}},
+        {"name": "XP Legend", "description": "Earn 1000 XP", "icon": "medal", "category": "mastery", "rarity": "epic", "xp_reward": 100, "criteria": {"type": "xp", "threshold": 1000}},
+        {"name": "Perfectionist", "description": "Score 100% on an assignment", "icon": "trophy", "category": "assignment", "rarity": "rare", "xp_reward": 50, "criteria": {"type": "perfect_score", "threshold": 1}},
+        {"name": "High Achiever", "description": "Score 90%+ on 5 assignments", "icon": "trending-up", "category": "assignment", "rarity": "epic", "xp_reward": 100, "criteria": {"type": "high_scores", "threshold": 5}},
+        {"name": "Quiz Warrior", "description": "Complete 5 quizzes", "icon": "brain", "category": "quiz", "rarity": "rare", "xp_reward": 40, "criteria": {"type": "quizzes_completed", "threshold": 5}},
+        {"name": "Quiz Champion", "description": "Complete 20 quizzes", "icon": "crown", "category": "quiz", "rarity": "epic", "xp_reward": 100, "criteria": {"type": "quizzes_completed", "threshold": 20}},
+    ]
+
+    for badge_data in DEFAULT_BADGES:
+        db.add(Badge(**badge_data))
+    await db.commit()
+    return {"message": "Default badges seeded", "seeded": len(DEFAULT_BADGES)}

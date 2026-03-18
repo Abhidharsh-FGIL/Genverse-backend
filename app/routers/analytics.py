@@ -1,6 +1,6 @@
 import uuid
 from fastapi import APIRouter, Query
-from sqlalchemy import select, func, case
+from sqlalchemy import select, func, case, or_
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.classes import Class, Assignment, Submission, ClassStudent
@@ -189,10 +189,20 @@ async def get_org_analytics(org_id: uuid.UUID, current_user: CurrentUser, db: DB
     )
     member_ids = [r[0] for r in member_ids_result.all()]
 
-    # --- Classes ---
+    # --- Classes (org-scoped + null-org-id classes from org teachers) ---
+    org_teacher_ids = [
+        r for r in member_ids  # member_ids already fetched above
+    ]
     classes_result = await db.execute(
         select(Class.id, Class.name, Class.subject, Class.grade, Class.teacher_id)
-        .where(Class.org_id == org_id, Class.is_active == True)
+        .where(
+            Class.is_active == True,
+            or_(
+                Class.org_id == org_id,
+                (Class.org_id.is_(None) & Class.teacher_id.in_(org_teacher_ids))
+                if org_teacher_ids else False,
+            ),
+        )
     )
     classes = classes_result.all()
     class_ids = [c.id for c in classes]
