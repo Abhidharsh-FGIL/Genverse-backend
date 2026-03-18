@@ -20,6 +20,8 @@ async def create_assignment(payload: AssignmentCreate, current_user: CurrentUser
     class_ = class_result.scalar_one_or_none()
     if not class_:
         raise NotFoundException("Class not found")
+    if not class_.is_active:
+        raise HTTPException(status_code=400, detail="Cannot create assignments in an archived class")
 
     assignment = Assignment(
         class_id=uuid.UUID(payload.class_id),
@@ -68,13 +70,40 @@ async def list_assignments(
     current_user: CurrentUser,
     db: DBSession,
     class_id: str | None = Query(None),
+    classIds: str | None = Query(None),
     status: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
 ):
     q = select(Assignment)
-    if class_id:
+
+    # Filter by class_id (singular) or classIds (comma-separated)
+    if classIds:
+        class_id_list = [uuid.UUID(cid.strip()) for cid in classIds.split(",") if cid.strip()]
+        if class_id_list:
+            q = q.where(Assignment.class_id.in_(class_id_list))
+        else:
+            return []
+    elif class_id:
         q = q.where(Assignment.class_id == uuid.UUID(class_id))
+    else:
+        # No class filter — scope to classes the user has access to (enrolled or teaches)
+        from app.models.classes import ClassStudent, ClassTeacher
+        enrolled_q = select(ClassStudent.class_id).where(ClassStudent.student_id == current_user.id)
+        teaching_q = select(Class.id).where(Class.teacher_id == current_user.id)
+        co_teaching_q = select(ClassTeacher.class_id).where(ClassTeacher.teacher_id == current_user.id)
+        enrolled_result = await db.execute(enrolled_q)
+        teaching_result = await db.execute(teaching_q)
+        co_teaching_result = await db.execute(co_teaching_q)
+        allowed_ids = set(
+            [r[0] for r in enrolled_result.all()] +
+            [r[0] for r in teaching_result.all()] +
+            [r[0] for r in co_teaching_result.all()]
+        )
+        if not allowed_ids:
+            return []
+        q = q.where(Assignment.class_id.in_(list(allowed_ids)))
+
     if status:
         q = q.where(Assignment.status == status)
     q = q.order_by(Assignment.created_at.desc()).offset(skip).limit(limit)

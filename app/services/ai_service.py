@@ -2462,6 +2462,12 @@ Return ONLY valid JSON in this exact format:
   ]
 }}"""
         else:
+            # Extract exact criterion titles for the prompt
+            criterion_titles = []
+            if rubric and rubric.get("criteria"):
+                criterion_titles = [c.get("title", "") for c in rubric["criteria"] if c.get("title")]
+            titles_list = "\n".join(f'  - "{t}"' for t in criterion_titles) if criterion_titles else ""
+
             prompt = f"""You are an expert teacher. Grade this student submission using the rubric criteria.
 
 Student: {student_label}
@@ -2470,6 +2476,9 @@ Student: {student_label}
 
 Rubric criteria:
 {rubric_context}
+
+You MUST provide a score for EVERY criterion. The exact criterion titles you must use are:
+{titles_list}
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -2484,7 +2493,7 @@ Return ONLY valid JSON in this exact format:
   ]
 }}
 
-Important: criterionTitle in criterionScores must exactly match the title field of each rubric criterion. Points must be a valid integer within that criterion's level range."""
+CRITICAL: criterionScores MUST contain exactly {len(criterion_titles)} entries, one for each criterion listed above. Copy each criterion title exactly as written — do not rephrase, abbreviate, or skip any. Points must be a valid integer within that criterion's level range."""
 
         response = ""
         try:

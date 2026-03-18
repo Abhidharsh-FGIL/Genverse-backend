@@ -121,7 +121,16 @@ async def record_activity(
         current_user.last_login_date = now
 
     await db.commit()
-    return {"streak": ws_gam.streak or 0, "xp": ws_gam.xp or 0}
+
+    # Check for newly earned badges after streak/XP update
+    try:
+        from app.services.badge_service import check_and_award_badges
+        parsed_oid = _parse_org_id(org_id)
+        new_badges = await check_and_award_badges(current_user.id, db, parsed_oid)
+    except Exception:
+        new_badges = []
+
+    return {"streak": ws_gam.streak or 0, "xp": ws_gam.xp or 0, "new_badges": new_badges}
 
 
 @router.get("/badges", response_model=list[BadgeResponse])
@@ -209,6 +218,19 @@ async def activate_title(title_id: uuid.UUID, current_user: CurrentUser, db: DBS
     title.is_active = True
     await db.commit()
     return {"message": "Title activated"}
+
+
+@router.post("/check-badges")
+async def check_badges_now(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
+    """Manually trigger badge check. Returns list of newly awarded badges."""
+    from app.services.badge_service import check_and_award_badges
+    parsed_oid = _parse_org_id(org_id)
+    new_badges = await check_and_award_badges(current_user.id, db, parsed_oid)
+    return {"new_badges": new_badges}
 
 
 @router.get("/my/summary", response_model=GamificationSummary)

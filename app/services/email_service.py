@@ -683,6 +683,103 @@ def send_organization_invitation_email(
         return False
 
 
+def send_class_invitation_email(
+    to_email: str,
+    teacher_name: str,
+    class_name: str,
+    organization_name: str | None = None,
+    join_code: str | None = None,
+) -> bool:
+    """Send an invitation email when a teacher adds a student (by email) to a class."""
+    print(f"[EmailService] send_class_invitation_email to {to_email} for class '{class_name}'", flush=True)
+
+    if not settings.MAIL_USERNAME or not settings.MAIL_PASSWORD:
+        print(f"[EmailService] SKIPPED: SMTP credentials not configured!", flush=True)
+        return False
+
+    org_line = f" at <strong>{organization_name}</strong>" if organization_name else ""
+    signup_url = f"{settings.FRONTEND_URL}/genverse/get-started"
+
+    html_body = f'''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Class Invitation</title>
+    </head>
+    <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f5;">
+        <div style="max-width:520px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+            <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:32px;text-align:center;">
+                {LOGO_HTML}
+                <h1 style="color:white;margin:0;font-size:24px;">{settings.MAIL_FROM_NAME}</h1>
+                <p style="color:rgba(255,255,255,0.85);margin:8px 0 0;font-size:14px;">Class Invitation</p>
+            </div>
+            <div style="padding:32px;">
+                <p style="color:#333;font-size:15px;margin:0 0 8px;">Hi there,</p>
+                <p style="color:#555;font-size:14px;line-height:1.6;">
+                    <strong>{teacher_name}</strong> has invited you to join the class
+                    <strong>{class_name}</strong>{org_line} on {settings.MAIL_FROM_NAME}.
+                </p>
+                <div style="background:#f9fafb;border-radius:10px;padding:20px;border:1px solid #e5e7eb;margin:20px 0;">
+                    <table width="100%" cellpadding="0" cellspacing="0">
+                        <tr>
+                            <td style="padding:6px 0;color:#666;font-size:13px;">Class</td>
+                            <td style="padding:6px 0;text-align:right;font-size:13px;font-weight:600;color:#1a1a1a;">{class_name}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding:6px 0;color:#666;font-size:13px;">Teacher</td>
+                            <td style="padding:6px 0;text-align:right;font-size:13px;color:#1a1a1a;">{teacher_name}</td>
+                        </tr>
+                        {f'<tr><td style="padding:6px 0;color:#666;font-size:13px;">Join Code</td><td style="padding:6px 0;text-align:right;font-size:16px;font-weight:700;letter-spacing:2px;color:#6366f1;">{join_code}</td></tr>' if join_code else ''}
+                    </table>
+                </div>
+                <p style="color:#555;font-size:14px;">
+                    Sign up on {settings.MAIL_FROM_NAME} with this email address (<strong>{to_email}</strong>) and you'll be automatically enrolled in the class.
+                </p>
+                <div style="text-align:center;margin:28px 0;">
+                    <a href="{signup_url}"
+                       style="display:inline-block;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;
+                              padding:14px 36px;text-decoration:none;border-radius:8px;font-weight:600;
+                              font-size:15px;box-shadow:0 4px 12px rgba(99,102,241,0.3);">
+                        Sign Up &amp; Join Class
+                    </a>
+                </div>
+                <p style="color:#999;font-size:12px;text-align:center;">
+                    If you already have an account, just log in — the class will appear in your dashboard.
+                </p>
+            </div>
+            <div style="background:#f9fafb;padding:16px;text-align:center;border-top:1px solid #e5e7eb;">
+                <p style="color:#999;font-size:11px;margin:0;">&copy; {settings.MAIL_FROM_NAME} &mdash; AI-powered learning platform</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
+    try:
+        smtp = smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT)
+        smtp.starttls()
+        smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
+
+        msg = MIMEMultipart('related')
+        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['To'] = to_email
+        msg['Subject'] = f"{teacher_name} invited you to join {class_name} on {settings.MAIL_FROM_NAME}"
+        msg.attach(MIMEText(html_body, 'html'))
+        _attach_logo(msg)
+
+        smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string())
+        smtp.quit()
+        print(f"[EmailService] Class invitation sent to {to_email} for '{class_name}'", flush=True)
+        return True
+    except Exception as e:
+        import traceback
+        print(f"[EmailService] CLASS INVITATION FAILED for {to_email}: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        return False
+
+
 def send_feedback_notification_email(
     user_name: str,
     user_email: str,

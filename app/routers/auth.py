@@ -42,7 +42,7 @@ router = APIRouter()
 
 async def _process_pending_enrollments(db: AsyncSession, user: User) -> None:
     """After a new user signs up, auto-enroll them in any classes they were pre-invited to."""
-    from app.models.classes import PendingClassEnrollment, ClassStudent
+    from app.models.classes import PendingClassEnrollment, ClassStudent, Class
     from app.models.organization import OrgMember as OrgMemberModel
 
     pending_result = await db.execute(
@@ -51,6 +51,16 @@ async def _process_pending_enrollments(db: AsyncSession, user: User) -> None:
     pending_enrollments = pending_result.scalars().all()
 
     for pending in pending_enrollments:
+        # Skip archived classes — don't auto-enroll into inactive classes
+        class_check = await db.execute(
+            select(Class.is_active).where(Class.id == pending.class_id)
+        )
+        is_active = class_check.scalar_one_or_none()
+        if is_active is False:
+            # Clean up the stale pending enrollment
+            await db.delete(pending)
+            continue
+
         # Check not already enrolled
         existing = await db.execute(
             select(ClassStudent).where(
