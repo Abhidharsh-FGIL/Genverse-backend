@@ -57,6 +57,79 @@ def _apply_org_filter(q, column, org_id_param: str | None):
     return q.where(column == parsed)
 
 
+import random
+
+# Canned responses for greetings/casual messages — zero LLM tokens
+_CANNED_RESPONSES: dict[str, list[str]] = {
+    # Greetings
+    "hi": [
+        "Hey there! What would you like to learn today?",
+        "Hi! I'm Genverse, your study buddy. What topic can I help you with?",
+        "Hello! Ready to learn something new? Ask me anything!",
+    ],
+    "hello": [
+        "Hello! How can I help you with your studies today?",
+        "Hey! I'm here to help you learn. What subject are you working on?",
+    ],
+    "hey": [
+        "Hey! What would you like to explore today?",
+        "Hey there! Got a question? I'm all ears!",
+    ],
+    # Identity
+    "who are you": [
+        "I'm **Genverse**, your AI-powered study buddy! I can explain concepts, quiz you, summarize notes, and help you prepare for exams. What would you like to work on?",
+    ],
+    "what are you": [
+        "I'm **Genverse**, an AI educational assistant built to help students learn. I can explain topics, solve problems, generate quizzes, and more!",
+    ],
+    "what can you do": [
+        "I can help you with:\n- Explaining difficult topics in simple terms\n- Solving problems step-by-step\n- Summarizing your notes\n- Creating study plans and quizzes\n- And much more! What would you like to try?",
+    ],
+    # Courtesy
+    "thanks": [
+        "You're welcome! Let me know if you need anything else.",
+        "Happy to help! Got more questions?",
+    ],
+    "thank you": [
+        "You're welcome! Feel free to ask anytime.",
+        "Glad I could help! What's next?",
+    ],
+    # Small talk
+    "how are you": [
+        "I'm doing great, thanks for asking! What can I help you learn today?",
+    ],
+    "good morning": [
+        "Good morning! Ready to start learning? What topic shall we dive into?",
+    ],
+    "good afternoon": [
+        "Good afternoon! What subject would you like help with?",
+    ],
+    "good evening": [
+        "Good evening! What can I help you study tonight?",
+    ],
+    "good night": [
+        "Good night! Rest well and come back whenever you need help studying!",
+    ],
+    # Casual
+    "ok": ["Got it! Let me know when you have a question."],
+    "okay": ["Sure thing! Ask me anything when you're ready."],
+    "sure": ["Great! What would you like to learn about?"],
+    "bye": ["Goodbye! Come back anytime you need help studying!"],
+    "hmm": ["Take your time! I'm here whenever you have a question."],
+}
+
+
+def _get_canned_response(message: str) -> str | None:
+    """Return a canned response for greetings/casual messages, or None."""
+    if not message:
+        return None
+    cleaned = message.strip().rstrip("!?.,…").lower()
+    responses = _CANNED_RESPONSES.get(cleaned)
+    if responses:
+        return random.choice(responses)
+    return None
+
+
 async def _build_rag_context(
     user_id: str,
     question: str,
@@ -473,23 +546,32 @@ async def send_message_stream(
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id)
 
+    # --- Instant greeting responses (no LLM call, zero tokens) ---
+    canned = _get_canned_response(payload.message)
+
     async def event_stream():
         full_response = ""
-        try:
-            async for chunk in ai.stream_chat(messages=messages, context=payload.context, chat_settings=chat_settings or None, has_files=has_files):
-                full_response += chunk
-                # Encode newlines so the SSE "data:" line stays intact (decoded by client)
-                encoded = chunk.replace('\n', '\\n')
-                yield f"data: {encoded}\n\n"
-        except Exception as e:
-            import traceback
-            print(f"[StreamChat] Streaming error: {e}", flush=True)
-            traceback.print_exc()
-            # Send a user-visible error so the chat doesn't appear blank
-            if not full_response:
-                error_msg = "Sorry, I encountered an issue generating a response. Please try again."
-                yield f"data: {error_msg}\n\n"
-                full_response = error_msg
+
+        if canned:
+            full_response = canned
+            encoded = canned.replace('\n', '\\n')
+            yield f"data: {encoded}\n\n"
+        else:
+            try:
+                async for chunk in ai.stream_chat(messages=messages, context=payload.context, chat_settings=chat_settings or None, has_files=has_files):
+                    full_response += chunk
+                    # Encode newlines so the SSE "data:" line stays intact (decoded by client)
+                    encoded = chunk.replace('\n', '\\n')
+                    yield f"data: {encoded}\n\n"
+            except Exception as e:
+                import traceback
+                print(f"[StreamChat] Streaming error: {e}", flush=True)
+                traceback.print_exc()
+                # Send a user-visible error so the chat doesn't appear blank
+                if not full_response:
+                    error_msg = "Sorry, I encountered an issue generating a response. Please try again."
+                    yield f"data: {error_msg}\n\n"
+                    full_response = error_msg
 
         # Save assistant message after streaming completes
         try:
@@ -692,13 +774,13 @@ async def update_chat_settings(
 async def _persist_enhancement(db, chat_id: uuid.UUID, key: str, value):
     """Atomically merge one enhancement key into the last assistant message's enhancements_json.
 
-    Uses SQLAlchemy ORM update with PostgreSQL JSONB ``||`` merge so concurrent
-    calls from parallel enhancement endpoints don't overwrite each other.
+    Uses PostgreSQL JSONB ``||`` merge so concurrent calls from parallel
+    enhancement endpoints don't overwrite each other.
     Failures are logged but never propagated — the enhancement data has already
     been generated and will still be returned to the frontend.
     """
     import logging
-    from sqlalchemy import update, type_coerce, func
+    from sqlalchemy import update, type_coerce, func, text
     from sqlalchemy.dialects.postgresql import JSONB as JSONB_TYPE
 
     try:
@@ -711,21 +793,27 @@ async def _persist_enhancement(db, chat_id: uuid.UUID, key: str, value):
         )
         msg_id = result.scalar_one_or_none()
         if not msg_id:
+            logging.getLogger(__name__).warning(
+                "No assistant message found to persist enhancement '%s' for chat %s", key, chat_id
+            )
             return
 
         patch = {key: value}
+        # Use explicit || operator for JSONB merge (more reliable than .concat())
+        merged = func.coalesce(
+            AiChatMessage.enhancements_json, type_coerce({}, JSONB_TYPE)
+        ).op('||')(type_coerce(patch, JSONB_TYPE))
+
         await db.execute(
             update(AiChatMessage)
             .where(AiChatMessage.id == msg_id)
-            .values(
-                enhancements_json=func.coalesce(
-                    AiChatMessage.enhancements_json, type_coerce({}, JSONB_TYPE)
-                ).concat(type_coerce(patch, JSONB_TYPE))
-            )
+            .values(enhancements_json=merged)
         )
         await db.commit()
     except Exception:
-        logging.getLogger(__name__).warning("Failed to persist enhancement '%s' for chat %s", key, chat_id, exc_info=True)
+        logging.getLogger(__name__).warning(
+            "Failed to persist enhancement '%s' for chat %s", key, chat_id, exc_info=True
+        )
         try:
             await db.rollback()
         except Exception:

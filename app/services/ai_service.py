@@ -294,12 +294,16 @@ class AIService:
         # --- Grade-specific engagement style ---
         engagement_styles = {
             "early-primary": (
-                "TONE: Warm, playful, like their favourite teacher.\n"
+                "TONE: Warm, playful, like telling a short bedtime story to a curious child.\n"
+                "- Make it fun and vivid, as if painting a magical picture in their mind.\n"
                 "- Start with a fun hook: a tiny story, 'imagine this…', or a surprising fact.\n"
                 "- Use everyday objects, animals, food as analogies.\n"
                 "- Use 'First… Then… Finally…' patterns for steps.\n"
                 "- Celebrate curiosity: 'Great question!' or 'You're thinking like a little scientist!'\n"
-                "- Suggest a fun try-at-home activity when the topic allows."
+                "- Suggest a fun try-at-home activity when the topic allows.\n"
+                "RESPONSE LENGTH (strictly enforced):\n"
+                "- Short answers → single short paragraph, 8-9 lines max.\n"
+                "- Detailed answers → storytelling with humor and emojis, 10-12 lines max. Do NOT exceed 12 lines."
             ),
             "upper-primary": (
                 "TONE: Friendly and encouraging, like a cool older sibling who knows stuff.\n"
@@ -307,7 +311,10 @@ class AIService:
                 "- Use daily life, sports, nature examples they'd connect with.\n"
                 "- Include 'Think about it' moments and quick challenges.\n"
                 "- Break complex topics into numbered steps.\n"
-                "- End with 'What would happen if…?' scenarios."
+                "- End with 'What would happen if…?' scenarios.\n"
+                "RESPONSE LENGTH (strictly enforced):\n"
+                "- Short answers → concise summary in 4-5 lines. Do NOT exceed 5 lines.\n"
+                "- Detailed answers → step-by-step with real-world applications, 10-15 lines max."
             ),
             "middle-school": (
                 "TONE: Clear and structured, balancing depth with accessibility.\n"
@@ -315,7 +322,10 @@ class AIService:
                 "- Encourage critical thinking: 'What would happen if we changed X?'\n"
                 "- Walk through reasoning step-by-step.\n"
                 "- Connect concepts across subjects.\n"
-                "- Present common misconceptions and ask them to spot the error."
+                "- Present common misconceptions and ask them to spot the error.\n"
+                "RESPONSE LENGTH (strictly enforced):\n"
+                "- Short answers → concise summary in 4-5 lines. Do NOT exceed 5 lines.\n"
+                "- Detailed answers → structured breakdown with applications, 15-20 lines max."
             ),
             "high-school": (
                 "TONE: Precise and academic but still supportive.\n"
@@ -323,7 +333,10 @@ class AIService:
                 "- Use Socratic prompts: 'Think about this before reading the answer…'\n"
                 "- Include 'Exam corner' tips and common pitfalls.\n"
                 "- Connect to competitive exams (JEE, NEET, CUET) where relevant.\n"
-                "- End with a practice problem or discussion question."
+                "- End with a practice problem or discussion question.\n"
+                "RESPONSE LENGTH (strictly enforced):\n"
+                "- Short answers → concise summary in 4-5 lines with exam relevance. Do NOT exceed 5 lines.\n"
+                "- Detailed answers → structured, competitive answer with principles and reasoning, 20-25 lines max."
             ),
         }
 
@@ -352,8 +365,13 @@ class AIService:
                 f"The student is in Grade {grade} ({age}).\n"
                 "LANGUAGE & TONE:\n"
                 "- Use very simple words and short sentences a young child can understand.\n"
-                "- Use a warm, playful, encouraging tone — like their favourite teacher.\n"
-                "- Avoid abstract concepts — make everything concrete and visual.\n"
+                "- Use a warm, playful, encouraging tone — like telling a short bedtime story to a curious child.\n"
+                "- Make it fun and vivid, as if painting a magical picture in their mind.\n"
+                "- Avoid abstract concepts, technical terms, dialogue format, or any formal teaching tone.\n"
+                "RESPONSE LENGTH (strictly enforced):\n"
+                "- Short/simple questions → single short paragraph, 8-9 lines max. Keep words simple and imaginative.\n"
+                "- Detailed explanations → storytelling-based, back-and-forth between characters, "
+                "humor, excitement, emojis. 10-12 lines max. Do NOT exceed 12 lines.\n"
                 "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
                 "- Start explanations with a fun hook: a tiny story, a 'imagine this…' scenario, or a surprising fact.\n"
                 "- Use everyday objects, animals, colours, and food as analogies.\n"
@@ -369,6 +387,11 @@ class AIService:
                 "- Use clear, simple language with age-appropriate vocabulary.\n"
                 "- Introduce technical terms but always explain them in plain words right after.\n"
                 "- Keep explanations structured but friendly — not too formal.\n"
+                "RESPONSE LENGTH (strictly enforced):\n"
+                "- Short/simple questions → concise summary in 4-5 lines with structured explanations "
+                "and real-world applications. Do NOT exceed 5 lines for short answers.\n"
+                "- Detailed explanations → step-by-step breakdown with real-world applications, "
+                "keep within 10-15 lines.\n"
                 "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
                 "- Open with a 'Did you know?' fun fact or a relatable scenario.\n"
                 "- Use examples from daily life, school, sports, nature.\n"
@@ -382,6 +405,11 @@ class AIService:
                 "- Use moderately detailed explanations with proper terminology.\n"
                 "- Define key terms when first introduced, then use them naturally.\n"
                 "- Be clear and structured, balancing depth with accessibility.\n"
+                "RESPONSE LENGTH (strictly enforced):\n"
+                "- Short/simple questions → concise summary in 4-5 lines with structured explanations "
+                "and real-world applications. Do NOT exceed 5 lines for short answers.\n"
+                "- Detailed explanations → detailed step-by-step breakdown with real-world applications, "
+                "keep within 15-20 lines.\n"
                 "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
                 "- Start with a thought-provoking question or real-world connection.\n"
                 "- Encourage critical thinking: 'What do you think would happen if we changed X?'\n"
@@ -395,6 +423,11 @@ class AIService:
                 "- Use precise academic language appropriate for senior students.\n"
                 "- Students are preparing for board exams and competitive entrances.\n"
                 "- Be thorough, cover edge cases, include exam-relevant tips.\n"
+                "RESPONSE LENGTH (strictly enforced):\n"
+                "- Short/simple questions → concise summary in 4-5 lines with technical concepts "
+                "and exam relevance. Do NOT exceed 5 lines for short answers.\n"
+                "- Detailed explanations → structured, competitive answer with principles and reasoning, "
+                "keep within 20-25 lines.\n"
                 "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
                 "- Open with a conceptual question or real-world problem.\n"
                 "- Use Socratic-style prompts.\n"
@@ -557,15 +590,15 @@ class AIService:
         difficulty = chat_settings.get("difficulty", "medium")
         parts.append(difficulty_map.get(difficulty, difficulty_map["medium"]))
 
-        # Content length
+        # Content length — with explicit line limits to prevent over-generation
         length_map = {
-            "small": "LENGTH: Be extremely brief — 1-3 sentences maximum. Just the core answer, nothing extra.",
-            "brief": "LENGTH: Keep it concise — 1-2 short paragraphs. Get to the point fast.",
-            "summary": "LENGTH: Give a focused summary — 2-3 paragraphs covering key points without excessive detail.",
-            "medium": "LENGTH: Provide a moderately detailed response covering key points with some examples.",
-            "detailed": "LENGTH: Provide a comprehensive, in-depth response with thorough explanations, examples, and structure.",
+            "small": "LENGTH: Be extremely brief — 1-3 sentences maximum (4-5 lines). Just the core answer, nothing extra.",
+            "brief": "LENGTH: Keep it concise — 1-2 short paragraphs (6-8 lines max). Get to the point fast.",
+            "summary": "LENGTH: Give a focused summary — 2-3 paragraphs (10-12 lines max) covering key points without excessive detail.",
+            "medium": "LENGTH: Provide a moderately detailed response (12-15 lines) covering key points with some examples.",
+            "detailed": "LENGTH: Provide a comprehensive, in-depth response (18-25 lines) with thorough explanations, examples, and structure.",
             "deep-dive": (
-                "LENGTH: Provide an exhaustive deep-dive. Cover every important aspect, "
+                "LENGTH: Provide an exhaustive deep-dive (30+ lines allowed). Cover every important aspect, "
                 "edge case, and example. Use headings and sub-sections to organise."
             ),
         }
@@ -628,38 +661,6 @@ class AIService:
         # after the response — do NOT include them inside the response body.
 
         return "\n".join(parts) if parts else ""
-
-    @staticmethod
-    def _is_casual_message(text: str) -> bool:
-        """Detect greetings, small talk, and other casual messages that need short responses."""
-        if not text:
-            return False
-        cleaned = text.strip().rstrip("!?.…").lower()
-        # Single-word or very short casual messages
-        casual_words = {
-            "hi", "hey", "hello", "hola", "hii", "hiii", "yo", "sup",
-            "thanks", "thank you", "thankyou", "thx", "ty",
-            "ok", "okay", "k", "sure", "yes", "no", "yep", "nope", "yea", "yeah", "nah",
-            "bye", "goodbye", "good bye", "see you", "cya",
-            "good morning", "good afternoon", "good evening", "good night",
-            "gm", "gn", "morning", "evening",
-            "what's up", "whats up", "wassup", "how are you", "how r u",
-            "nice", "cool", "great", "awesome", "wow", "hmm", "hm",
-            "who are you", "what are you", "what can you do",
-        }
-        if cleaned in casual_words:
-            return True
-        # Short messages (≤ 5 words) that don't contain question-like academic keywords
-        words = cleaned.split()
-        if len(words) <= 5:
-            academic_signals = {
-                "explain", "solve", "what", "why", "how", "define", "calculate",
-                "derive", "prove", "compare", "difference", "formula", "equation",
-                "example", "summarize", "describe", "analyze", "evaluate",
-            }
-            if not any(w in academic_signals for w in words):
-                return True
-        return False
 
     async def chat(
         self, messages: List[dict], context: dict | None = None,
@@ -738,7 +739,11 @@ class AIService:
             "   - Simple/short questions → Brief, focused answer (1 short paragraph).\n"
             "   - Substantive academic questions → Detailed, structured response with examples.\n"
             "   NEVER pad short inputs with unsolicited examples, subject lists, exam tips, or motivational filler. "
-            "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default."
+            "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default.\n"
+            "9. NEVER mention the student's grade level in your response. Do NOT say things like "
+            "'As a Grade 5 student…', 'For your grade level…', 'Since you are in Grade 8…'. "
+            "Just answer naturally — the grade context shapes your tone and depth internally, "
+            "but should never appear in the output."
         )
         if context_str:
             system_prompt += f"\n{context_str}"
@@ -746,15 +751,6 @@ class AIService:
             system_prompt += f"\n\n{settings_str}"
         if grade_context_instruction:
             system_prompt += f"\n\n{grade_context_instruction}"
-
-        # Detect casual/greeting messages and cap output length
-        last_user_msg = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                last_user_msg = m.get("content", "").strip()
-                break
-        if self._is_casual_message(last_user_msg):
-            max_output_tokens = min(max_output_tokens or 150, 150)
 
         full_prompt = system_prompt + "\n\n" + "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in messages
@@ -992,7 +988,11 @@ class AIService:
             "   - Simple/short questions → Brief, focused answer (1 short paragraph).\n"
             "   - Substantive academic questions → Detailed, structured response with examples.\n"
             "   NEVER pad short inputs with unsolicited examples, subject lists, exam tips, or motivational filler. "
-            "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default."
+            "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default.\n"
+            "9. NEVER mention the student's grade level in your response. Do NOT say things like "
+            "'As a Grade 5 student…', 'For your grade level…', 'Since you are in Grade 8…'. "
+            "Just answer naturally — the grade context shapes your tone and depth internally, "
+            "but should never appear in the output."
         )
         if context_str:
             system_prompt += f"\n{context_str}"
@@ -1000,14 +1000,6 @@ class AIService:
             system_prompt += f"\n\n{settings_str}"
         if grade_context_instruction:
             system_prompt += f"\n\n{grade_context_instruction}"
-
-        # Detect casual/greeting messages and cap output length
-        last_user_msg = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                last_user_msg = m.get("content", "").strip()
-                break
-        is_casual = self._is_casual_message(last_user_msg)
 
         full_prompt = system_prompt + "\n\n" + "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in messages
@@ -1068,16 +1060,9 @@ class AIService:
                     print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
             yield "AI service is temporarily unavailable. Please try again in a moment."
 
-        # For casual messages, stop streaming once we have a complete short response
-        casual_char_limit = 300 if is_casual else 0
-
         async for chunk in _provider_stream():
             accumulated += chunk
             yield chunk
-
-            # Stop early for casual/greeting messages once we have enough
-            if casual_char_limit and len(accumulated) >= casual_char_limit:
-                break
 
             # Periodic output safety check
             if len(accumulated) >= next_check_at:
