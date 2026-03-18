@@ -629,6 +629,38 @@ class AIService:
 
         return "\n".join(parts) if parts else ""
 
+    @staticmethod
+    def _is_casual_message(text: str) -> bool:
+        """Detect greetings, small talk, and other casual messages that need short responses."""
+        if not text:
+            return False
+        cleaned = text.strip().rstrip("!?.…").lower()
+        # Single-word or very short casual messages
+        casual_words = {
+            "hi", "hey", "hello", "hola", "hii", "hiii", "yo", "sup",
+            "thanks", "thank you", "thankyou", "thx", "ty",
+            "ok", "okay", "k", "sure", "yes", "no", "yep", "nope", "yea", "yeah", "nah",
+            "bye", "goodbye", "good bye", "see you", "cya",
+            "good morning", "good afternoon", "good evening", "good night",
+            "gm", "gn", "morning", "evening",
+            "what's up", "whats up", "wassup", "how are you", "how r u",
+            "nice", "cool", "great", "awesome", "wow", "hmm", "hm",
+            "who are you", "what are you", "what can you do",
+        }
+        if cleaned in casual_words:
+            return True
+        # Short messages (≤ 5 words) that don't contain question-like academic keywords
+        words = cleaned.split()
+        if len(words) <= 5:
+            academic_signals = {
+                "explain", "solve", "what", "why", "how", "define", "calculate",
+                "derive", "prove", "compare", "difference", "formula", "equation",
+                "example", "summarize", "describe", "analyze", "evaluate",
+            }
+            if not any(w in academic_signals for w in words):
+                return True
+        return False
+
     async def chat(
         self, messages: List[dict], context: dict | None = None,
         chat_settings: dict | None = None, has_files: bool = False,
@@ -699,7 +731,14 @@ class AIService:
             "Present multiple perspectives factually.\n"
             "7. STAY EDUCATIONAL — You are a study buddy. Your purpose is to help students learn. "
             "If a query is clearly non-educational (gossip, dating, social media drama), "
-            "briefly acknowledge it and gently steer back: 'I'm best at helping with learning! What subject are you working on?'"
+            "briefly acknowledge it and gently steer back: 'I'm best at helping with learning! What subject are you working on?'\n"
+            "8. PROPORTIONAL RESPONSES — Always match your response length and depth to the input:\n"
+            "   - Greetings, small talk, thank you, ok, sure, etc. → 1-2 sentences max. "
+            "Example: 'Hey! I'm Genverse, your study buddy. What would you like to learn today?'\n"
+            "   - Simple/short questions → Brief, focused answer (1 short paragraph).\n"
+            "   - Substantive academic questions → Detailed, structured response with examples.\n"
+            "   NEVER pad short inputs with unsolicited examples, subject lists, exam tips, or motivational filler. "
+            "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default."
         )
         if context_str:
             system_prompt += f"\n{context_str}"
@@ -707,6 +746,16 @@ class AIService:
             system_prompt += f"\n\n{settings_str}"
         if grade_context_instruction:
             system_prompt += f"\n\n{grade_context_instruction}"
+
+        # Detect casual/greeting messages and cap output length
+        last_user_msg = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user_msg = m.get("content", "").strip()
+                break
+        if self._is_casual_message(last_user_msg):
+            max_output_tokens = min(max_output_tokens or 150, 150)
+
         full_prompt = system_prompt + "\n\n" + "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in messages
         )
@@ -936,7 +985,14 @@ class AIService:
             "Present multiple perspectives factually.\n"
             "7. STAY EDUCATIONAL — You are a study buddy. Your purpose is to help students learn. "
             "If a query is clearly non-educational (gossip, dating, social media drama), "
-            "briefly acknowledge it and gently steer back: 'I'm best at helping with learning! What subject are you working on?'"
+            "briefly acknowledge it and gently steer back: 'I'm best at helping with learning! What subject are you working on?'\n"
+            "8. PROPORTIONAL RESPONSES — Always match your response length and depth to the input:\n"
+            "   - Greetings, small talk, thank you, ok, sure, etc. → 1-2 sentences max. "
+            "Example: 'Hey! I'm Genverse, your study buddy. What would you like to learn today?'\n"
+            "   - Simple/short questions → Brief, focused answer (1 short paragraph).\n"
+            "   - Substantive academic questions → Detailed, structured response with examples.\n"
+            "   NEVER pad short inputs with unsolicited examples, subject lists, exam tips, or motivational filler. "
+            "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default."
         )
         if context_str:
             system_prompt += f"\n{context_str}"
@@ -944,6 +1000,15 @@ class AIService:
             system_prompt += f"\n\n{settings_str}"
         if grade_context_instruction:
             system_prompt += f"\n\n{grade_context_instruction}"
+
+        # Detect casual/greeting messages and cap output length
+        last_user_msg = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user_msg = m.get("content", "").strip()
+                break
+        is_casual = self._is_casual_message(last_user_msg)
+
         full_prompt = system_prompt + "\n\n" + "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in messages
         )
@@ -1003,9 +1068,17 @@ class AIService:
                     print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
             yield "AI service is temporarily unavailable. Please try again in a moment."
 
+        # For casual messages, stop streaming once we have a complete short response
+        casual_char_limit = 300 if is_casual else 0
+
         async for chunk in _provider_stream():
             accumulated += chunk
             yield chunk
+
+            # Stop early for casual/greeting messages once we have enough
+            if casual_char_limit and len(accumulated) >= casual_char_limit:
+                break
+
             # Periodic output safety check
             if len(accumulated) >= next_check_at:
                 next_check_at += 500
