@@ -39,7 +39,7 @@ async def create_announcement(payload: AnnouncementCreate, current_user: Current
             title="New Announcement",
             body=payload.content[:200] + ("…" if len(payload.content) > 200 else ""),
             icon="megaphone",
-            data_json={"class_id": str(announcement.class_id), "link": f"/student/classes/{announcement.class_id}"},
+            data_json={"class_id": str(announcement.class_id), "link": f"/student/class/{announcement.class_id}"},
         )
         await db.commit()
 

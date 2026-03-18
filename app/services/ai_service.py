@@ -4340,21 +4340,19 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
 
                 print(f"[OCR] Image read: {len(image_data)} bytes, mime={mime_type}")
 
-                # Use the newer google-genai SDK for reliable multimodal support
+                # Use google-generativeai SDK for multimodal OCR
                 try:
-                    from google import genai
-                    from google.genai import types
+                    import google.generativeai as genai
 
-                    client = genai.Client(api_key=settings.GEMINI_API_KEY)
-                    response = client.models.generate_content(
-                        model=settings.AI_PRIMARY_MODEL,
-                        contents=[
-                            f"Extract all text from this image. The text may be in {language} language. "
-                            "Return only the extracted text, preserving the original formatting. "
-                            "If there is no text in the image, return an empty string.",
-                            types.Part.from_bytes(data=image_data, mime_type=mime_type),
-                        ],
-                    )
+                    api_key = settings.GEMINI_API_KEY or settings.GOOGLE_GEMINI_API_KEY
+                    genai.configure(api_key=api_key)
+                    model = genai.GenerativeModel(settings.AI_PRIMARY_MODEL)
+                    response = model.generate_content([
+                        f"Extract all text from this image. The text may be in {language} language. "
+                        "Return only the extracted text, preserving the original formatting. "
+                        "If there is no text in the image, return an empty string.",
+                        {"mime_type": mime_type, "data": image_data},
+                    ])
                     text = response.text or ""
                     print(f"[OCR] Extracted {len(text)} chars from image")
                     return text

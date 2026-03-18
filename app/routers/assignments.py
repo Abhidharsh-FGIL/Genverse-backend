@@ -58,7 +58,7 @@ async def create_assignment(payload: AssignmentCreate, current_user: CurrentUser
             body=f"A new assignment has been posted in {class_.name}.",
             icon="file-text",
             org_id=class_.org_id if hasattr(class_, 'org_id') else None,
-            data_json={"assignment_id": str(assignment.id), "class_id": str(class_.id), "link": f"/student/classes/{class_.id}"},
+            data_json={"assignment_id": str(assignment.id), "class_id": str(class_.id), "link": f"/student/class/{class_.id}"},
         )
         await db.commit()
 
