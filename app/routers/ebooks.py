@@ -72,6 +72,8 @@ async def generate_outline(payload: EbookOutlineRequest, current_user: CurrentUs
         language=payload.language,
         chapter_range=chapter_range,
         tone=payload.tone or "academic",
+        grade=payload.grade,
+        board=payload.board,
     )
     return EbookOutlineResponse(chapters=chapters)
 
@@ -193,6 +195,7 @@ async def generate_ebook_stream(
         "author": payload.author or "",
         "subject": payload.topic or payload.subject,
         "grade": payload.grade,
+        "board": payload.board,
         "language": payload.language,
         "source_type": payload.source_type or "topic",
         "outline": outline,
@@ -303,6 +306,7 @@ async def generate_ebook_stream(
                     author=payload.author or "",
                     subject=payload.topic or payload.subject,
                     grade=payload.grade,
+                    board=payload.board,
                     language=payload.language,
                     source_type=payload.source_type,
                     outline=outline,

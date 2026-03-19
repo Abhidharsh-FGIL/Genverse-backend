@@ -119,6 +119,7 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
         author=params.get("author", ""),
         subject=params.get("subject"),
         grade=params.get("grade"),
+        board=params.get("board"),
         language=params["language"],
         source_type=params.get("source_type", "topic"),
         outline=params.get("outline"),

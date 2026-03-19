@@ -1606,6 +1606,8 @@ Return ONLY valid JSON, no markdown:
         language: str,
         chapter_range: tuple,
         tone: str,
+        grade: int | None = None,
+        board: str | None = None,
     ) -> List[dict]:
         """Generate chapter titles and descriptions only — no full content."""
         min_ch, max_ch = chapter_range
@@ -1617,20 +1619,41 @@ Return ONLY valid JSON, no markdown:
             "exam_oriented": "focused on exam-relevant topics and key facts",
         }.get(tone, "educational")
 
+        # Build grade/board context lines only when provided
+        grade_line = f"Grade level: Grade {grade}" if grade else ""
+        board_line = f"Education board: {board}" if board else ""
+        grade_board_section = "\n".join(filter(None, [grade_line, board_line]))
+
+        grade_board_instructions = ""
+        if grade or board:
+            parts = []
+            if grade:
+                parts.append(f"grade {grade} students")
+            if board:
+                parts.append(f"the {board} curriculum/syllabus")
+            target = " following ".join(parts) if board and grade else parts[0]
+            grade_board_instructions = (
+                f"\n- Content depth and vocabulary must be appropriate for {target}"
+                f"\n- Chapter topics should align with what {target} would study"
+            )
+
         prompt = f"""You are an expert educational author. Create a chapter outline for an eBook.
 
 Title: {title}
 Topic: {topic}
 Subject: {subject or "General"}
+{grade_board_section}
 Language: {language}
 Number of chapters: between {min_ch} and {max_ch}
 Writing style: {tone_context}
 
 Generate a logical, well-structured chapter outline where:
+- The FIRST chapter MUST be an Introduction that sets the context and previews the book
+- The LAST chapter MUST be a Conclusion that summarizes key takeaways
 - Chapter titles are concise and clear (4-8 words)
 - Descriptions are 1-2 sentences explaining what the chapter covers
 - Chapters flow naturally from foundational concepts to advanced ones
-- The tone/style "{tone}" is reflected in how chapters are framed
+- The tone/style "{tone}" is reflected in how chapters are framed{grade_board_instructions}
 
 Return ONLY valid JSON in this exact structure:
 {{
@@ -1996,6 +2019,7 @@ Return this exact JSON structure:
         tone: str,
         total_chapters: int,
         all_chapter_titles: list[str],
+        board: str | None = None,
     ) -> dict:
         """Generate content for a single chapter via its own LLM call."""
         language_name = self._LANGUAGE_NAMES.get(language, language.upper())
@@ -2007,11 +2031,28 @@ Return this exact JSON structure:
             f"  {i+1}. {t}" for i, t in enumerate(all_chapter_titles)
         )
 
+        # Build grade/board context
+        grade_line = f"Grade: {grade}" if grade else "Grade: General"
+        board_line = f"\nBoard/Curriculum: {board}" if board else ""
+
+        grade_board_instructions = ""
+        if grade or board:
+            parts = []
+            if grade:
+                parts.append(
+                    f"- Content depth, vocabulary, and complexity must be appropriate for grade {grade} students."
+                )
+            if board:
+                parts.append(
+                    f"- Align content with the {board} curriculum standards and syllabus expectations."
+                )
+            grade_board_instructions = "\n" + "\n".join(parts)
+
         prompt = f"""You are writing Chapter {chapter_number} of a {total_chapters}-chapter educational eBook.
 
 Book: "{title}"
 Subject: {subject or "General"}
-Grade: {grade or "General"}
+{grade_line}{board_line}
 Language: {language_name}
 
 Full book outline (for context — you are writing ONLY chapter {chapter_number}):
@@ -2029,7 +2070,7 @@ CONTENT REQUIREMENTS:
 - Length: {size_guide["paragraphs"]} — {size_guide["words_hint"]}
 - Structure: {size_guide["depth"]}
 - The content must be the FULL chapter body — not a placeholder, stub, or summary.
-- Do NOT include the chapter title in the content — it will be added separately.
+- Do NOT include the chapter title in the content — it will be added separately.{grade_board_instructions}
 
 {self._HTML_FORMAT_RULES}
 
@@ -2167,6 +2208,7 @@ Return ONLY valid JSON (no markdown fences):
         author: str = "",
         assessment_config: dict | None = None,
         on_chapter_done: Any = None,
+        board: str | None = None,
     ) -> dict:
         """Generate structured eBook content using parallel LLM calls per chapter, then images.
 
@@ -2206,6 +2248,7 @@ Return ONLY valid JSON (no markdown fences):
                 title=title,
                 subject=subject,
                 grade=grade,
+                board=board,
                 language=language,
                 book_size=book_size,
                 tone=tone,
@@ -2314,6 +2357,7 @@ Return ONLY valid JSON (no markdown fences):
         author: str = "",
         assessment_config: dict | None = None,
         on_chapter_done: Any = None,
+        board: str | None = None,
     ) -> dict:
         """Generate structured eBook content as JSON — NO image generation.
         Used by the SSE endpoint which handles images as a separate step."""
@@ -2321,6 +2365,7 @@ Return ONLY valid JSON (no markdown fences):
             title=title,
             subject=subject,
             grade=grade,
+            board=board,
             language=language,
             source_type=source_type,
             outline=outline,
