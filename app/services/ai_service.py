@@ -918,6 +918,170 @@ class AIService:
             async for text in stream.text_stream:
                 yield text
 
+    # ------------------------------------------------------------------
+    # Document summarization (context-aware, map-reduce when needed)
+    # ------------------------------------------------------------------
+
+    # ~200 words/chunk × 1.3 tokens/word ≈ 260 tokens per chunk.
+    # Single-pass limits are kept LOW so the final streaming call has
+    # small context → fast time-to-first-token.  Map-reduce batch limits
+    # are LARGE so fewer concurrent calls are needed.
+    _TOKENS_PER_CHUNK = 260
+    _SINGLE_PASS_LIMITS = {          # max chunks for single-pass (no map-reduce)
+        "gemini":  150,              # ~39K tokens — fast TTFT in final call
+        "claude":  150,              # same — keeps final call responsive
+        "openai":  150,              # same
+    }
+    _MAP_BATCH_LIMITS = {            # max chunks per MAP batch
+        "gemini":  500,              # 500 chunks ≈ 130K tokens — Gemini handles easily
+        "claude":  400,
+        "openai":  300,
+    }
+
+    def _best_available_provider(self) -> str:
+        """Return the best available provider name for summarization."""
+        if self._get_gemini():
+            return "gemini"
+        if self._get_anthropic():
+            return "claude"
+        if self._get_openai():
+            return "openai"
+        return "gemini"  # fallback default
+
+    async def _llm_call(self, prompt: str, max_tokens: int = 2048, tag: str = "") -> str:
+        """Single LLM call with Gemini → Claude → OpenAI fallback chain.
+
+        Gemini is tried first because it has the largest context window
+        and is fastest for large-document workloads.
+        """
+        # 1. Gemini (1M context, fastest)
+        gemini = self._get_gemini()
+        if gemini:
+            try:
+                resp = await asyncio.to_thread(gemini.generate_content, prompt)
+                return resp.text or ""
+            except Exception as e:
+                print(f"[Summary] Gemini {tag} failed: {e}", flush=True)
+        # 2. Claude
+        client = self._get_anthropic()
+        if client:
+            try:
+                resp = await client.messages.create(
+                    model=settings.AI_DOCUMENT_MODEL,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return resp.content[0].text
+            except Exception as e:
+                print(f"[Summary] Claude {tag} failed: {e}", flush=True)
+        # 3. OpenAI
+        openai = self._get_openai()
+        if openai:
+            try:
+                resp = await openai.chat.completions.create(
+                    model=settings.AI_FALLBACK_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                )
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                print(f"[Summary] OpenAI {tag} failed: {e}", flush=True)
+        return ""
+
+    async def summarize_document_chunks(
+        self,
+        chunks: list[str],
+        user_question: str,
+    ) -> str:
+        """Summarize a document's chunks with context-aware strategy.
+
+        1. Small docs (fits in single LLM call) → return raw text, let the
+           final chat call handle it.  Zero extra API calls.
+        2. Medium docs → single-pass summary via one LLM call.
+        3. Large docs → MAP-REDUCE: batch chunks, summarize each batch
+           concurrently, then combine.
+        """
+        provider = self._best_available_provider()
+        single_limit = self._SINGLE_PASS_LIMITS.get(provider, 550)
+        batch_limit = self._MAP_BATCH_LIMITS.get(provider, 400)
+        n = len(chunks)
+
+        print(
+            f"[Summary] {n} chunks, provider={provider}, "
+            f"single_limit={single_limit}, batch_limit={batch_limit}",
+            flush=True,
+        )
+
+        # --- SINGLE PASS: fits in the final chat call's context ---
+        if n <= single_limit:
+            print(f"[Summary] Single-pass: returning {n} raw chunks for final chat call", flush=True)
+            return "\n\n".join(chunks)
+
+        # --- MAP PHASE: split into batches & summarize concurrently ---
+        batches: list[list[str]] = []
+        for i in range(0, n, batch_limit):
+            batches.append(chunks[i : i + batch_limit])
+
+        print(f"[Summary] Map-reduce: {n} chunks → {len(batches)} batches of ~{batch_limit}", flush=True)
+
+        batch_prompts = []
+        for idx, batch in enumerate(batches):
+            batch_text = "\n\n".join(batch)
+            batch_prompts.append(
+                f"You are creating a detailed summary of PART {idx + 1} of {len(batches)} "
+                "from an educational document. Your summary will be combined with "
+                "summaries of other parts to create a complete document summary.\n\n"
+                "--- DOCUMENT SECTION ---\n"
+                f"{batch_text}\n"
+                "--- END ---\n\n"
+                "INSTRUCTIONS:\n"
+                "- Summarize EVERY chapter, section, or topic present in this section.\n"
+                "- Use the document's own headings/chapter titles as your headings.\n"
+                "- Include ALL key definitions, formulas, theorems, equations, and important facts verbatim.\n"
+                "- Preserve specific details: names, numbers, dates, examples, diagrams described.\n"
+                "- For each topic, explain the core concept — not just mention it.\n"
+                "- Use bullet points under each heading for key points.\n"
+                "- Do NOT skip any section or chapter — cover everything.\n"
+                "- Do NOT add any information that is not in the text.\n"
+                "- Be thorough — this summary is the ONLY thing the reader will see."
+            )
+
+        # Use higher token budget so batch summaries retain detail
+        partial_summaries = await asyncio.gather(
+            *(self._llm_call(p, max_tokens=4096, tag=f"map-{i+1}/{len(batches)}")
+              for i, p in enumerate(batch_prompts))
+        )
+
+        partial_summaries = [s for s in partial_summaries if s.strip()]
+        if not partial_summaries:
+            print("[Summary] All MAP batches failed — returning first batch raw", flush=True)
+            return "\n\n".join(chunks[:batch_limit])
+
+        combined = "\n\n---\n\n".join(partial_summaries)
+
+        # --- REDUCE PHASE (only if combined partials are very large) ---
+        combined_word_count = len(combined.split())
+        if combined_word_count > 15_000:
+            print(f"[Summary] Reduce pass: {combined_word_count} words in partials", flush=True)
+            reduce_prompt = (
+                "Below are detailed summaries of consecutive sections of a document, "
+                "presented in order. Merge them into ONE unified, comprehensive summary.\n\n"
+                f"{combined}\n\n"
+                "INSTRUCTIONS:\n"
+                "- Combine all section summaries into a single coherent document summary.\n"
+                "- Preserve ALL chapter/section headings from the partial summaries.\n"
+                "- Keep all key definitions, formulas, and specific details.\n"
+                "- Remove redundancy between sections but do NOT drop any unique content.\n"
+                "- Maintain the original document's order and flow.\n\n"
+                f"User's original request: {user_question}\n\n"
+                "Produce the final unified summary:"
+            )
+            result = await self._llm_call(reduce_prompt, max_tokens=8192, tag="reduce")
+            if result.strip():
+                return result
+
+        return combined
+
     async def stream_chat(
         self, messages: List[dict], context: dict | None = None,
         chat_settings: dict | None = None, has_files: bool = False,
@@ -1456,6 +1620,8 @@ Return ONLY valid JSON, no markdown:
         language: str,
         chapter_range: tuple,
         tone: str,
+        grade: int | None = None,
+        board: str | None = None,
     ) -> List[dict]:
         """Generate chapter titles and descriptions only — no full content."""
         min_ch, max_ch = chapter_range
@@ -1467,20 +1633,41 @@ Return ONLY valid JSON, no markdown:
             "exam_oriented": "focused on exam-relevant topics and key facts",
         }.get(tone, "educational")
 
+        # Build grade/board context lines only when provided
+        grade_line = f"Grade level: Grade {grade}" if grade else ""
+        board_line = f"Education board: {board}" if board else ""
+        grade_board_section = "\n".join(filter(None, [grade_line, board_line]))
+
+        grade_board_instructions = ""
+        if grade or board:
+            parts = []
+            if grade:
+                parts.append(f"grade {grade} students")
+            if board:
+                parts.append(f"the {board} curriculum/syllabus")
+            target = " following ".join(parts) if board and grade else parts[0]
+            grade_board_instructions = (
+                f"\n- Content depth and vocabulary must be appropriate for {target}"
+                f"\n- Chapter topics should align with what {target} would study"
+            )
+
         prompt = f"""You are an expert educational author. Create a chapter outline for an eBook.
 
 Title: {title}
 Topic: {topic}
 Subject: {subject or "General"}
+{grade_board_section}
 Language: {language}
 Number of chapters: between {min_ch} and {max_ch}
 Writing style: {tone_context}
 
 Generate a logical, well-structured chapter outline where:
+- The FIRST chapter MUST be an Introduction that sets the context and previews the book
+- The LAST chapter MUST be a Conclusion that summarizes key takeaways
 - Chapter titles are concise and clear (4-8 words)
 - Descriptions are 1-2 sentences explaining what the chapter covers
 - Chapters flow naturally from foundational concepts to advanced ones
-- The tone/style "{tone}" is reflected in how chapters are framed
+- The tone/style "{tone}" is reflected in how chapters are framed{grade_board_instructions}
 
 Return ONLY valid JSON in this exact structure:
 {{
@@ -1846,6 +2033,7 @@ Return this exact JSON structure:
         tone: str,
         total_chapters: int,
         all_chapter_titles: list[str],
+        board: str | None = None,
     ) -> dict:
         """Generate content for a single chapter via its own LLM call."""
         language_name = self._LANGUAGE_NAMES.get(language, language.upper())
@@ -1857,11 +2045,28 @@ Return this exact JSON structure:
             f"  {i+1}. {t}" for i, t in enumerate(all_chapter_titles)
         )
 
+        # Build grade/board context
+        grade_line = f"Grade: {grade}" if grade else "Grade: General"
+        board_line = f"\nBoard/Curriculum: {board}" if board else ""
+
+        grade_board_instructions = ""
+        if grade or board:
+            parts = []
+            if grade:
+                parts.append(
+                    f"- Content depth, vocabulary, and complexity must be appropriate for grade {grade} students."
+                )
+            if board:
+                parts.append(
+                    f"- Align content with the {board} curriculum standards and syllabus expectations."
+                )
+            grade_board_instructions = "\n" + "\n".join(parts)
+
         prompt = f"""You are writing Chapter {chapter_number} of a {total_chapters}-chapter educational eBook.
 
 Book: "{title}"
 Subject: {subject or "General"}
-Grade: {grade or "General"}
+{grade_line}{board_line}
 Language: {language_name}
 
 Full book outline (for context — you are writing ONLY chapter {chapter_number}):
@@ -1879,7 +2084,7 @@ CONTENT REQUIREMENTS:
 - Length: {size_guide["paragraphs"]} — {size_guide["words_hint"]}
 - Structure: {size_guide["depth"]}
 - The content must be the FULL chapter body — not a placeholder, stub, or summary.
-- Do NOT include the chapter title in the content — it will be added separately.
+- Do NOT include the chapter title in the content — it will be added separately.{grade_board_instructions}
 
 {self._HTML_FORMAT_RULES}
 
@@ -2017,6 +2222,7 @@ Return ONLY valid JSON (no markdown fences):
         author: str = "",
         assessment_config: dict | None = None,
         on_chapter_done: Any = None,
+        board: str | None = None,
     ) -> dict:
         """Generate structured eBook content using parallel LLM calls per chapter, then images.
 
@@ -2056,6 +2262,7 @@ Return ONLY valid JSON (no markdown fences):
                 title=title,
                 subject=subject,
                 grade=grade,
+                board=board,
                 language=language,
                 book_size=book_size,
                 tone=tone,
@@ -2164,6 +2371,7 @@ Return ONLY valid JSON (no markdown fences):
         author: str = "",
         assessment_config: dict | None = None,
         on_chapter_done: Any = None,
+        board: str | None = None,
     ) -> dict:
         """Generate structured eBook content as JSON — NO image generation.
         Used by the SSE endpoint which handles images as a separate step."""
@@ -2171,6 +2379,7 @@ Return ONLY valid JSON (no markdown fences):
             title=title,
             subject=subject,
             grade=grade,
+            board=board,
             language=language,
             source_type=source_type,
             outline=outline,

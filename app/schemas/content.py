@@ -51,6 +51,7 @@ class EbookOutlineRequest(BaseModel):
     topic: str
     subject: Optional[str] = None
     grade: Optional[int] = None
+    board: Optional[str] = None
     language: str = "en"
     book_size: Optional[Literal["short", "medium", "large"]] = "short"
     tone: Optional[Literal["academic", "simple", "story_based", "exam_oriented"]] = "academic"
@@ -83,6 +84,7 @@ class EbookGenerateRequest(BaseModel):
     topic: Optional[str] = None
     subject: Optional[str] = None
     grade: Optional[int] = None
+    board: Optional[str] = None
     language: str = "en"
     author: Optional[str] = None
     source_type: str = "topic"  # topic | vault | pdf

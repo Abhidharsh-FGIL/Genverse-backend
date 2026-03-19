@@ -130,6 +130,118 @@ def _get_canned_response(message: str) -> str | None:
     return None
 
 
+import re as _re
+
+# ---------------------------------------------------------------------------
+# Intent detection: SUMMARY vs SPECIFIC QUERY
+# ---------------------------------------------------------------------------
+
+_SUMMARY_PATTERNS = _re.compile(
+    r"\b("
+    r"summarize|summarise|summary|summarization|"
+    r"overview|give me an overview|"
+    r"what is this (file|document|book|note|pdf) about|"
+    r"what does this (file|document|book|note|pdf) (say|contain|cover|talk about)|"
+    r"brief me|brief overview|"
+    r"key points|main points|main ideas|key takeaways|highlights|"
+    r"tl;?dr|tldr|"
+    r"explain the (whole|entire|full) (document|file|book|note)|"
+    r"gist of"
+    r")\b",
+    _re.IGNORECASE,
+)
+
+
+def _is_summary_intent(question: str) -> bool:
+    """Return True if the user's question is asking for a full summary."""
+    return bool(_SUMMARY_PATTERNS.search(question))
+
+
+# ---------------------------------------------------------------------------
+# Summary path: fetch ALL chunks in sequential order (map-reduce ready)
+# ---------------------------------------------------------------------------
+
+async def _fetch_all_chunks(
+    user_id: str,
+    file_ids: list[str],
+    db,
+) -> list[str]:
+    """Fetch ALL chunks for the selected files in sequential order.
+
+    Returns a list of chunk texts (not joined) so the caller can decide
+    whether to use them directly or run map-reduce.
+    """
+    if not file_ids:
+        return []
+
+    file_uuids = [uuid.UUID(fid) for fid in file_ids]
+    result = await db.execute(
+        select(DocChunk)
+        .join(UserLibraryItem, DocChunk.library_item_id == UserLibraryItem.id)
+        .where(
+            UserLibraryItem.user_id == uuid.UUID(user_id),
+            UserLibraryItem.id.in_(file_uuids),
+        )
+        .order_by(DocChunk.library_item_id, DocChunk.chunk_order)
+    )
+    return [c.chunk_text for c in result.scalars().all()]
+
+
+def _inject_summary_rag(
+    messages: list[dict],
+    question: str,
+    full_text: str,
+    file_name: str | None = None,
+) -> list[dict]:
+    """Inject the full document text with a summary-optimised prompt."""
+    file_label = f' "{file_name}"' if file_name else ""
+    enriched = (
+        f"The user wants a summary of their uploaded document{file_label}. "
+        "Below is the FULL document content in sequential order.\n\n"
+        "--- FULL DOCUMENT ---\n"
+        f"{full_text}\n"
+        "--- END OF DOCUMENT ---\n\n"
+        "Instructions:\n"
+        "- Base your summary ENTIRELY on the document content above — do NOT add external information.\n"
+        "- Identify and explain the specific topics, concepts, and themes present in the document.\n"
+        "- If the document contains chapters, sections, or distinct units, summarize each one.\n"
+        "- Extract key definitions, formulas, theorems, examples, and important facts from the text.\n"
+        "- Preserve the logical flow and structure of the original document.\n"
+        "- Use clear headings that reflect the document's own section titles where possible.\n"
+        "- Include specific details (names, numbers, dates, equations) — not just vague descriptions.\n"
+        "- Keep the summary comprehensive yet concise — cover all major content without unnecessary repetition.\n\n"
+        f"User request: {question}"
+    )
+    updated = list(messages)
+    if updated and updated[-1]["role"] == "user":
+        updated[-1] = {"role": "user", "content": enriched}
+    else:
+        updated.append({"role": "user", "content": enriched})
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Library summary path (public library books)
+# ---------------------------------------------------------------------------
+
+async def _fetch_all_library_chunks(
+    library_file_id: str,
+    db,
+) -> list[str]:
+    """Fetch ALL chunks for a public library file in sequential order."""
+    file_uuid = uuid.UUID(library_file_id)
+    result = await db.execute(
+        select(PublicFileChunk)
+        .where(PublicFileChunk.file_id == file_uuid)
+        .order_by(PublicFileChunk.chunk_order)
+    )
+    return [c.chunk_text for c in result.scalars().all()]
+
+
+# ---------------------------------------------------------------------------
+# Specific-query path: FAISS similarity search (existing logic)
+# ---------------------------------------------------------------------------
+
 async def _build_rag_context(
     user_id: str,
     question: str,
@@ -498,43 +610,86 @@ async def send_message_stream(
 
     ai = AIService()
 
-    # RAG: enrich messages with vault content when files are selected
+    # RAG: enrich messages with vault/library content when files are selected
     selected_files: list[str] = (
         payload.selected_files
         or (payload.context or {}).get("selected_files")
         or []
     )
+    library_file_id: str | None = (payload.context or {}).get("library_file_id")
+    is_summary = _is_summary_intent(payload.message)
+
     if selected_files:
         try:
-            rag_text = await _build_rag_context(
-                user_id=str(current_user.id),
-                question=payload.message,
-                file_ids=selected_files,
-                db=db,
-                ai=ai,
-            )
-            if rag_text:
-                messages = _inject_rag(messages, payload.message, rag_text)
+            if is_summary:
+                # SUMMARY intent → fetch ALL chunks, map-reduce if large
+                # Resolve file name(s) for context
+                file_uuids = [uuid.UUID(fid) for fid in selected_files]
+                name_result = await db.execute(
+                    select(UserLibraryItem.file_name)
+                    .where(UserLibraryItem.id.in_(file_uuids))
+                )
+                vault_names = [n for n in name_result.scalars().all() if n]
+                vault_file_label = ", ".join(vault_names) if vault_names else None
+                print(f"[StreamChat] Summary intent detected — fetching full document: {vault_file_label}", flush=True)
+                chunk_texts = await _fetch_all_chunks(
+                    user_id=str(current_user.id),
+                    file_ids=selected_files,
+                    db=db,
+                )
+                if chunk_texts:
+                    summary_text = await ai.summarize_document_chunks(
+                        chunks=chunk_texts,
+                        user_question=payload.message,
+                    )
+                    if summary_text:
+                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=vault_file_label)
+            else:
+                # SPECIFIC QUERY → FAISS similarity search (top-K chunks)
+                rag_text = await _build_rag_context(
+                    user_id=str(current_user.id),
+                    question=payload.message,
+                    file_ids=selected_files,
+                    db=db,
+                    ai=ai,
+                )
+                if rag_text:
+                    messages = _inject_rag(messages, payload.message, rag_text)
         except Exception as e:
             print(f"[StreamChat] RAG context build failed: {e}", flush=True)
 
     # Library RAG: use public library book embeddings
-    library_file_id: str | None = (payload.context or {}).get("library_file_id")
     if library_file_id:
         try:
-            # Fetch book title for prompt context
             lib_file = await db.get(PublicFile, uuid.UUID(library_file_id))
-            lib_rag_text = await _build_library_rag_context(
-                question=payload.message,
-                library_file_id=library_file_id,
-                db=db,
-                ai=ai,
-            )
-            if lib_rag_text:
-                messages = _inject_library_rag(
-                    messages, payload.message, lib_rag_text,
-                    book_title=lib_file.title if lib_file else "Unknown Book",
+            book_title = lib_file.title if lib_file else "Unknown Book"
+            if is_summary:
+                # SUMMARY intent → fetch ALL library chunks, map-reduce if large
+                print(f"[StreamChat] Summary intent for library book: {book_title}", flush=True)
+                chunk_texts = await _fetch_all_library_chunks(
+                    library_file_id=library_file_id,
+                    db=db,
                 )
+                if chunk_texts:
+                    summary_text = await ai.summarize_document_chunks(
+                        chunks=chunk_texts,
+                        user_question=payload.message,
+                    )
+                    if summary_text:
+                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=book_title)
+            else:
+                # SPECIFIC QUERY → similarity search
+                lib_rag_text = await _build_library_rag_context(
+                    question=payload.message,
+                    library_file_id=library_file_id,
+                    db=db,
+                    ai=ai,
+                )
+                if lib_rag_text:
+                    messages = _inject_library_rag(
+                        messages, payload.message, lib_rag_text,
+                        book_title=book_title,
+                    )
         except Exception as e:
             print(f"[StreamChat] Library RAG context build failed: {e}", flush=True)
 
@@ -669,42 +824,79 @@ async def send_message(
 
     ai = AIService()
 
-    # RAG: enrich messages with vault content when files are selected
+    # RAG: enrich messages with vault/library content when files are selected
     selected_files: list[str] = (
         payload.selected_files
         or (payload.context or {}).get("selected_files")
         or []
     )
+    library_file_id_sync: str | None = (payload.context or {}).get("library_file_id")
+    is_summary_sync = _is_summary_intent(payload.message)
+
     if selected_files:
         try:
-            rag_text = await _build_rag_context(
-                user_id=str(current_user.id),
-                question=payload.message,
-                file_ids=selected_files,
-                db=db,
-                ai=ai,
-            )
-            if rag_text:
-                messages = _inject_rag(messages, payload.message, rag_text)
+            if is_summary_sync:
+                file_uuids_sync = [uuid.UUID(fid) for fid in selected_files]
+                name_result_sync = await db.execute(
+                    select(UserLibraryItem.file_name)
+                    .where(UserLibraryItem.id.in_(file_uuids_sync))
+                )
+                vault_names_sync = [n for n in name_result_sync.scalars().all() if n]
+                vault_label_sync = ", ".join(vault_names_sync) if vault_names_sync else None
+                chunk_texts = await _fetch_all_chunks(
+                    user_id=str(current_user.id),
+                    file_ids=selected_files,
+                    db=db,
+                )
+                if chunk_texts:
+                    summary_text = await ai.summarize_document_chunks(
+                        chunks=chunk_texts,
+                        user_question=payload.message,
+                    )
+                    if summary_text:
+                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=vault_label_sync)
+            else:
+                rag_text = await _build_rag_context(
+                    user_id=str(current_user.id),
+                    question=payload.message,
+                    file_ids=selected_files,
+                    db=db,
+                    ai=ai,
+                )
+                if rag_text:
+                    messages = _inject_rag(messages, payload.message, rag_text)
         except Exception as e:
             print(f"[SendMessage] RAG context build failed: {e}", flush=True)
 
     # Library RAG: use public library book embeddings
-    library_file_id_sync: str | None = (payload.context or {}).get("library_file_id")
     if library_file_id_sync:
         try:
             lib_file_sync = await db.get(PublicFile, uuid.UUID(library_file_id_sync))
-            lib_rag_text_sync = await _build_library_rag_context(
-                question=payload.message,
-                library_file_id=library_file_id_sync,
-                db=db,
-                ai=ai,
-            )
-            if lib_rag_text_sync:
-                messages = _inject_library_rag(
-                    messages, payload.message, lib_rag_text_sync,
-                    book_title=lib_file_sync.title if lib_file_sync else "Unknown Book",
+            book_title_sync = lib_file_sync.title if lib_file_sync else "Unknown Book"
+            if is_summary_sync:
+                chunk_texts = await _fetch_all_library_chunks(
+                    library_file_id=library_file_id_sync,
+                    db=db,
                 )
+                if chunk_texts:
+                    summary_text = await ai.summarize_document_chunks(
+                        chunks=chunk_texts,
+                        user_question=payload.message,
+                    )
+                    if summary_text:
+                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=book_title_sync)
+            else:
+                lib_rag_text_sync = await _build_library_rag_context(
+                    question=payload.message,
+                    library_file_id=library_file_id_sync,
+                    db=db,
+                    ai=ai,
+                )
+                if lib_rag_text_sync:
+                    messages = _inject_library_rag(
+                        messages, payload.message, lib_rag_text_sync,
+                        book_title=book_title_sync,
+                    )
         except Exception as e:
             print(f"[SendMessage] Library RAG context build failed: {e}", flush=True)
 
