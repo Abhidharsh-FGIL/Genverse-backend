@@ -512,7 +512,34 @@ class AIService:
         if subject:
             parts.append(f"Subject focus: {subject}. Keep your response relevant to this subject area.")
         if language and language.lower() != "english":
-            parts.append(f"Respond in {language}. Use {language} script and phrasing naturally.")
+            # Map language names to their specific scripts to prevent script mixing
+            _script_map = {
+                "hindi": "Devanagari (हिन्दी)",
+                "tamil": "Tamil (தமிழ்)",
+                "telugu": "Telugu (తెలుగు)",
+                "kannada": "Kannada (ಕನ್ನಡ)",
+                "malayalam": "Malayalam (മലയാളം)",
+                "bengali": "Bengali (বাংলা)",
+                "marathi": "Devanagari (मराठी)",
+                "gujarati": "Gujarati (ગુજરાતી)",
+                "punjabi": "Gurmukhi (ਪੰਜਾਬੀ)",
+                "odia": "Odia (ଓଡ଼ିଆ)",
+                "urdu": "Urdu (اردو)",
+                "arabic": "Arabic (العربية)",
+                "french": "Latin",
+                "spanish": "Latin",
+                "german": "Latin",
+            }
+            script = _script_map.get(language.lower(), f"{language}")
+            parts.append(
+                f"RESPONSE LANGUAGE: {language}. Write your ENTIRE response using ONLY {script} script. "
+                f"Do NOT mix characters from other Indian/foreign scripts. "
+                f"For example, if writing in Tamil, never use Devanagari (Hindi) characters — use only Tamil script. "
+                f"Do NOT put English translations in parentheses like '(Gravity)' or '(Mass)' — "
+                f"write the term directly in {language} or use the English term as-is without parenthetical translation. "
+                f"Do NOT use emojis or special Unicode symbols (🌟, ⚡, 🍔, etc.) in the response. "
+                f"Only keep code snippets, math notation, chemical formulas, and technical acronyms in English."
+            )
 
         return "\n".join(parts) if parts else ""
 
@@ -752,9 +779,12 @@ class AIService:
         if grade_context_instruction:
             system_prompt += f"\n\n{grade_context_instruction}"
 
-        full_prompt = system_prompt + "\n\n" + "\n".join(
-            f"{m['role'].upper()}: {m['content']}" for m in messages
-        )
+        _conv = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+        _lang_tag = ""
+        _rlang = (context or {}).get("language")
+        if _rlang and _rlang.lower() != "english":
+            _lang_tag = f"\n\n[SYSTEM: Respond entirely in {_rlang}. Use ONLY {_rlang} script — do NOT mix other scripts like Devanagari in Tamil or Tamil in Hindi.]"
+        full_prompt = system_prompt + "\n\n" + _conv + _lang_tag
 
         response_text: str | None = None
 
@@ -1165,9 +1195,12 @@ class AIService:
         if grade_context_instruction:
             system_prompt += f"\n\n{grade_context_instruction}"
 
-        full_prompt = system_prompt + "\n\n" + "\n".join(
-            f"{m['role'].upper()}: {m['content']}" for m in messages
-        )
+        _conv = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+        _lang_tag = ""
+        _rlang = (context or {}).get("language")
+        if _rlang and _rlang.lower() != "english":
+            _lang_tag = f"\n\n[SYSTEM: Respond entirely in {_rlang}. Use ONLY {_rlang} script — do NOT mix other scripts like Devanagari in Tamil or Tamil in Hindi.]"
+        full_prompt = system_prompt + "\n\n" + _conv + _lang_tag
 
         # --- Helper: stream from providers with output safety check ---
         accumulated = ""
