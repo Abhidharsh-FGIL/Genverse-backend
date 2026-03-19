@@ -86,9 +86,10 @@ async def delete_rubric(rubric_id: uuid.UUID, current_user: CurrentUser, db: DBS
     await db.commit()
 
 
-@router.post("/generate", response_model=RubricResponse)
+@router.post("/generate")
 async def generate_rubric_ai(payload: GenerateRubricRequest, current_user: CurrentUser, db: DBSession):
-    """Use AI to auto-generate a rubric based on board, grade, subject and topic."""
+    """Use AI to auto-generate rubric criteria. Does NOT save to DB — the user
+    reviews and clicks Save to persist."""
     ai = AIService()
     criteria = await ai.generate_rubric(
         board=payload.board,
@@ -98,18 +99,4 @@ async def generate_rubric_ai(payload: GenerateRubricRequest, current_user: Curre
         criteria_count=payload.criteria_count,
         difficulty_level=payload.difficulty_level,
     )
-    # Prepend __meta so the chosen difficulty_level is persisted in the JSONB
-    criteria_with_meta = [{"__meta": True, "difficulty_level": payload.difficulty_level}] + criteria
-    rubric = Rubric(
-        title=f"{payload.subject} Rubric - {payload.topic}",
-        board=payload.board,
-        grade=payload.grade,
-        subject=payload.subject,
-        criteria=criteria_with_meta,
-        created_by=current_user.id,
-        is_ai_generated=True,
-    )
-    db.add(rubric)
-    await db.commit()
-    await db.refresh(rubric)
-    return rubric
+    return {"criteria": criteria}

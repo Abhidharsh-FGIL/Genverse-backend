@@ -6,7 +6,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 
 from app.database import Base
 
-BOARD_ENUM = SAEnum("CBSE", "ICSE", "IGCSE", "IB", "Cambridge", name="board_type")
+BOARD_ENUM = SAEnum("CBSE", "ICSE", "IGCSE", "IB", "Cambridge", "State Board", name="board_type")
 ASSIGNMENT_STATUS = SAEnum("draft", "published", "archived", name="assignment_status")
 SUBMISSION_STATUS = SAEnum("submitted", "late", "graded", "returned", "pending", name="submission_status")
 CO_TEACHER_ROLE = SAEnum("co_teacher", "assistant", name="co_teacher_role")
@@ -74,6 +74,7 @@ class Assignment(Base):
     due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     points: Mapped[int] = mapped_column(Integer, default=100)
     rubric_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("rubrics.id"))
+    lesson_plan_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("lesson_plans.id"), nullable=True)
     status: Mapped[str] = mapped_column(ASSIGNMENT_STATUS, default="draft")
     questions: Mapped[dict | None] = mapped_column(JSONB)  # Array of Question objects
     attachments: Mapped[dict | None] = mapped_column(JSONB)  # Array of {name, url, type}
@@ -114,7 +115,7 @@ class Rubric(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
-    board: Mapped[str] = mapped_column(BOARD_ENUM)
+    board: Mapped[str] = mapped_column(String(50))
     grade: Mapped[int] = mapped_column(Integer)
     subject: Mapped[str] = mapped_column(String(100))
     criteria: Mapped[dict] = mapped_column(JSONB, nullable=False)  # [{id, title, weight, linkedOutcome, levels[]}]

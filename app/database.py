@@ -190,6 +190,17 @@ async def run_migrations() -> None:
                 "ALTER TABLE subscriptions ADD COLUMN phonepe_subscription_id VARCHAR(255)"
             ))
 
+        # Change rubrics.board from board_type enum to varchar so all board names (including 'State Board') work
+        rb_type = await conn.execute(text(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = 'rubrics' AND column_name = 'board'"
+        ))
+        row = rb_type.fetchone()
+        if row and row[0] == 'USER-DEFINED':
+            await conn.execute(text(
+                "ALTER TABLE rubrics ALTER COLUMN board TYPE VARCHAR(50) USING board::VARCHAR"
+            ))
+
 
 async def close_db() -> None:
     await engine.dispose()

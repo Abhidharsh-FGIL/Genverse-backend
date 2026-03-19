@@ -31,6 +31,7 @@ async def create_assignment(payload: AssignmentCreate, current_user: CurrentUser
         due_date=payload.due_date,
         points=payload.points,
         rubric_id=uuid.UUID(payload.rubric_id) if payload.rubric_id else None,
+        lesson_plan_id=uuid.UUID(payload.lesson_plan_id) if payload.lesson_plan_id else None,
         status=payload.status,
         questions=payload.questions,
         attachments=payload.attachments,
@@ -131,7 +132,13 @@ async def update_assignment(
     if assignment.created_by != current_user.id:
         raise ForbiddenException("Only the assignment creator can modify it")
 
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    # Convert string UUIDs to proper UUID objects
+    for uuid_field in ('rubric_id', 'lesson_plan_id'):
+        if uuid_field in updates:
+            val = updates[uuid_field]
+            updates[uuid_field] = uuid.UUID(val) if val else None
+    for key, value in updates.items():
         setattr(assignment, key, value)
     await db.commit()
     await db.refresh(assignment)
@@ -162,3 +169,18 @@ async def suggest_questions(payload: SuggestQuestionsRequest, current_user: Curr
         db=db,
     )
     return {"suggestions": suggestions}
+
+
+@router.post("/files/upload")
+async def upload_assignment_file(
+    file: UploadFile = File(...),
+    path: str = Form(""),
+    current_user: CurrentUser = None,
+):
+    """Upload a file (image, document) for assignment questions or documents."""
+    from app.services.storage_service import StorageService
+
+    storage = StorageService()
+    prefix = path.rsplit("/", 1)[0] if "/" in path else "general"
+    file_info = await storage.upload_file(file=file, bucket="assignment-files", prefix=prefix)
+    return {"url": file_info["url"]}

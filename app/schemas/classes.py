@@ -71,6 +71,7 @@ class AssignmentCreate(BaseModel):
     due_date: Optional[datetime] = None
     points: int = 100
     rubric_id: Optional[str] = None
+    lesson_plan_id: Optional[str] = None
     status: str = "draft"
     questions: Optional[List[Any]] = None
     attachments: Optional[List[Any]] = None
@@ -84,6 +85,7 @@ class AssignmentUpdate(BaseModel):
     due_date: Optional[datetime] = None
     points: Optional[int] = None
     rubric_id: Optional[str] = None
+    lesson_plan_id: Optional[str] = None
     status: Optional[str] = None
     questions: Optional[List[Any]] = None
     attachments: Optional[List[Any]] = None
@@ -99,6 +101,7 @@ class AssignmentResponse(BaseModel):
     due_date: Optional[datetime] = None
     points: int
     rubric_id: Optional[uuid.UUID] = None
+    lesson_plan_id: Optional[uuid.UUID] = None
     status: str
     questions: Optional[Any] = None
     attachments: Optional[Any] = None

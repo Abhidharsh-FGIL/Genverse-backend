@@ -320,6 +320,7 @@ async def update_class(
     class_id: uuid.UUID, payload: ClassUpdate, current_user: CurrentUser, db: DBSession
 ):
     from app.models.organization import OrgMember
+    from app.models.user import UserRole
 
     result = await db.execute(select(Class).where(Class.id == class_id))
     class_ = result.scalar_one_or_none()
@@ -330,6 +331,7 @@ async def update_class(
     is_owner = class_.teacher_id == current_user.id
     is_org_admin = False
     if class_.org_id:
+        # Check OrgMember table
         admin_result = await db.execute(
             select(OrgMember).where(
                 OrgMember.org_id == class_.org_id,
@@ -339,6 +341,16 @@ async def update_class(
             )
         )
         is_org_admin = admin_result.scalar_one_or_none() is not None
+
+        # Fallback: also check UserRole table for org_admin role
+        if not is_org_admin:
+            role_result = await db.execute(
+                select(UserRole).where(
+                    UserRole.user_id == current_user.id,
+                    UserRole.role == "org_admin",
+                )
+            )
+            is_org_admin = role_result.scalar_one_or_none() is not None
     if not is_owner and not is_org_admin:
         raise ForbiddenException("Only the class teacher or org admin can update this class")
 
@@ -359,6 +371,7 @@ async def update_class(
 async def delete_class(class_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
     """Soft-delete (archive) a class by setting is_active = False."""
     from app.models.organization import OrgMember
+    from app.models.user import UserRole
 
     result = await db.execute(select(Class).where(Class.id == class_id))
     class_ = result.scalar_one_or_none()
@@ -377,6 +390,16 @@ async def delete_class(class_id: uuid.UUID, current_user: CurrentUser, db: DBSes
             )
         )
         is_org_admin = admin_result.scalar_one_or_none() is not None
+
+        # Fallback: also check UserRole table for org_admin role
+        if not is_org_admin:
+            role_result = await db.execute(
+                select(UserRole).where(
+                    UserRole.user_id == current_user.id,
+                    UserRole.role == "org_admin",
+                )
+            )
+            is_org_admin = role_result.scalar_one_or_none() is not None
     if not is_owner and not is_org_admin:
         raise ForbiddenException("Only the class teacher or org admin can archive this class")
 

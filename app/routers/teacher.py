@@ -20,6 +20,7 @@ class RubricCreateRequest(BaseModel):
     class_id: Optional[str] = None
     criteria: Optional[List[Any]] = None
     difficulty_level: Optional[str] = None
+    is_ai_generated: bool = False
 
 
 @router.get("/assignments")
@@ -363,7 +364,7 @@ async def create_teacher_rubric(
         subject=payload.subject,
         criteria=payload.criteria or [],
         created_by=current_user.id,
-        is_ai_generated=False,
+        is_ai_generated=payload.is_ai_generated,
     )
     db.add(rubric)
     await db.commit()

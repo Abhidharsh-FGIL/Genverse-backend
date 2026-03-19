@@ -2381,38 +2381,73 @@ Return ONLY valid JSON matching this schema exactly:
         self, board: str, grade: int, subject: str, topic: str, criteria_count: int,
         difficulty_level: str = 'medium'
     ) -> List[dict]:
-        """Generate grading rubric criteria."""
-        import uuid as _uuid
-        difficulty_guidance = {
-            'simple': 'Use straightforward, basic descriptors suitable for foundational understanding.',
-            'medium': 'Use moderately detailed descriptors that require applied understanding.',
-            'complex': 'Use rigorous, nuanced descriptors requiring higher-order thinking and mastery.',
-        }.get(difficulty_level, 'Use moderately detailed descriptors.')
-        prompt = f"""Create a detailed grading rubric for:
-Subject: {subject}
-Board: {board}
-Grade: {grade}
-Topic: {topic}
-Difficulty Level: {difficulty_level} — {difficulty_guidance}
-Number of criteria: {criteria_count}
+        """Generate grading rubric criteria aligned to board, grade, subject and difficulty."""
+        board_context = {
+            'CBSE': 'Follow CBSE/NCERT curriculum framework and learning outcomes. Use terminology aligned with CBSE competency-based evaluation.',
+            'ICSE': 'Follow ICSE/CISCE curriculum standards. Use detailed analytical descriptors matching ICSE application-based assessment.',
+            'IGCSE': 'Follow Cambridge IGCSE assessment objectives. Use command words (describe, explain, evaluate, analyse) consistent with Cambridge grading.',
+            'IB': 'Follow IB curriculum framework with ATL skills integration. Use criterion-referenced descriptors aligned with IB rubric conventions.',
+            'Cambridge': 'Follow Cambridge International assessment objectives. Use descriptors consistent with Cambridge mark schemes.',
+            'State Board': 'Follow state board curriculum standards. Use clear, accessible descriptors appropriate for regional assessment style.',
+        }.get(board, 'Follow the relevant curriculum standards for this education board.')
 
-Return JSON array of criteria:
+        difficulty_guidance = {
+            'simple': 'Focus on recall, basic comprehension, and foundational skills. Use clear, simple language. Assess whether the student can identify, list, define, or demonstrate basic understanding.',
+            'medium': 'Focus on application and analysis. Assess whether the student can explain, compare, apply concepts to new situations, and demonstrate working knowledge.',
+            'complex': 'Focus on higher-order thinking: evaluation, synthesis, critical analysis. Assess depth of reasoning, originality, ability to justify arguments, and mastery of advanced concepts.',
+        }.get(difficulty_level, 'Use moderately detailed descriptors.')
+
+        if grade <= 5:
+            grade_lang = 'Use age-appropriate, simple language suitable for primary school students.'
+        elif grade <= 8:
+            grade_lang = 'Use clear academic language suitable for middle school students.'
+        else:
+            grade_lang = 'Use formal academic language and rigorous expectations suitable for senior secondary students.'
+
+        prompt = f"""You are an expert educator and curriculum designer. Create a detailed, classroom-ready grading rubric.
+
+CONTEXT:
+- Title/Topic: {topic}
+- Subject: {subject}
+- Board: {board}
+- Grade: {grade}
+- Difficulty: {difficulty_level}
+- Number of criteria: {criteria_count}
+
+BOARD-SPECIFIC GUIDANCE:
+{board_context}
+
+DIFFICULTY GUIDANCE:
+{difficulty_guidance}
+
+GRADE LEVEL:
+{grade_lang}
+
+INSTRUCTIONS:
+1. Create exactly {criteria_count} evaluation criteria relevant to "{topic}" in {subject}.
+2. Each criterion title must reflect a specific skill or learning outcome from the {board} Grade {grade} {subject} curriculum.
+3. Weights across all criteria MUST total exactly 100%. Distribute based on importance.
+4. Each criterion must have exactly 4 performance levels with clear, distinct, observable descriptors.
+5. Descriptors must be specific — not vague (avoid generic phrases like "good work" without detail).
+6. Each level must clearly differentiate from adjacent levels so teachers can objectively assess.
+7. Align criteria to {board} curriculum expectations for Grade {grade} {subject}.
+
+Return a JSON array in this exact format:
 [
   {{
     "id": "criterion_1",
-    "title": "...",
+    "title": "Criterion Name",
     "weight": 25,
-    "linkedOutcome": "...",
     "levels": [
-      {{"level": "Excellent", "score": 4, "description": "..."}},
-      {{"level": "Good", "score": 3, "description": "..."}},
-      {{"level": "Satisfactory", "score": 2, "description": "..."}},
-      {{"level": "Needs Improvement", "score": 1, "description": "..."}}
+      {{"level": "Excellent", "score": 4, "description": "Detailed descriptor..."}},
+      {{"level": "Good", "score": 3, "description": "Detailed descriptor..."}},
+      {{"level": "Satisfactory", "score": 2, "description": "Detailed descriptor..."}},
+      {{"level": "Needs Improvement", "score": 1, "description": "Detailed descriptor..."}}
     ]
   }}
 ]
 
-Return ONLY valid JSON.
+Return ONLY valid JSON array. No markdown, no explanation.
 """
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -2632,12 +2667,14 @@ Return ONLY valid JSON.
         mcq_count: int = 0,
         fib_count: int = 0,
         short_answer_count: int = 0,
+        long_answer_count: int = 0,
         true_false_count: int = 0,
         match_count: int = 0,
         difficulty: str = "medium",
         lesson_plan_context: dict | None = None,
         rubric_criteria: list | None = None,
         source_text: str | None = None,
+        topic_weightage: dict | None = None,
     ) -> List[dict]:
         """Generate structured assignment questions for an AssignmentEditor.
 
@@ -2652,6 +2689,8 @@ Return ONLY valid JSON.
             parts.append(f"{fib_count} Fill-in-the-blank")
         if short_answer_count:
             parts.append(f"{short_answer_count} Short answer")
+        if long_answer_count:
+            parts.append(f"{long_answer_count} Long answer")
         if true_false_count:
             parts.append(f"{true_false_count} True/False")
         if match_count:
@@ -2720,25 +2759,40 @@ Source Document (generate questions ONLY from the content below — do not inven
 
 """
 
+        # Build topic weightage section
+        weightage_section = ""
+        if topic_weightage and len(topic_weightage) > 1:
+            weightage_lines = [f"  - {t}: {w}%" for t, w in topic_weightage.items()]
+            weightage_section = f"""
+Topic Weightage (distribute questions proportionally based on these weights):
+{chr(10).join(weightage_lines)}
+
+You MUST distribute the total number of questions across topics according to these percentages.
+For example, if there are 10 questions total and Topic A has 60% weight, generate ~6 questions about Topic A.
+"""
+
         prompt = f"""Generate assignment questions for a Grade {grade} {subject} class.
 Topic: {topic}
 Difficulty: {difficulty}
 Question breakdown: {types_str}
-{source_section}{lesson_plan_section}{rubric_section}
-Return a JSON object with a "questions" array. Each question must follow this schema exactly:
-- type: one of "mcq", "fill-blank", "short-answer", "true-false", "match"
-- text: the question text
-- points: integer (2 for fill-blank/true-false, 5 for mcq/short-answer, 10 for match)
-- For MCQ: include "options" (array of 4 strings), "correctAnswer" (index 0-3 as number), and "explanation" (1-2 sentences explaining why the correct answer is right)
-- For fill-blank: include "correctAnswer" as a string and "explanation" (1-2 sentences explaining the answer)
-- For true-false: include "correctAnswer" as "true" or "false"
-- For match: include "matchPairs" as array of {{"left": "...", "right": "..."}} (4-5 pairs)
-- For short-answer: no extra fields needed
+{source_section}{lesson_plan_section}{rubric_section}{weightage_section}
+Return a JSON object with a "questions" array. Each question MUST follow this schema exactly:
+- type: one of "mcq", "fill-blank", "short-answer", "long-answer", "true-false", "match"
+- text: the question text (REQUIRED for ALL types including match-the-following)
+- points: integer (2 for fill-blank/true-false, 5 for mcq/short-answer, 10 for match/long-answer)
 
-The "explanation" field is REQUIRED for MCQ and fill-blank questions. It helps students understand why the answer is correct.
+REQUIRED fields per type:
+- MCQ: "options" (array of 4 strings), "correctAnswer" (index 0-3 as integer), "explanation" (1-2 sentences)
+- Fill-in-the-blank: "correctAnswer" (string — the word/phrase that fills the blank), "explanation" (1-2 sentences). The question text MUST contain ___ to mark the blank.
+- True/False: "correctAnswer" (string: "True" or "False"), "explanation" (1-2 sentences explaining why it is true or false)
+- Short answer: "correctAnswer" (string — the expected model answer, 1-3 sentences), "explanation" (1-2 sentences)
+- Long answer: "correctAnswer" (string — a detailed model answer, 3-6 sentences), "explanation" (brief grading guidance)
+- Match the following: "text" (a question/instruction like "Match the following items"), "matchPairs" (array of 4-5 objects with "left" and "right" keys), "explanation" (brief explanation of the correct matches)
 
-Return ONLY valid JSON, no markdown.
-Example: {{"questions": [{{"type": "mcq", "text": "...", "options": ["A","B","C","D"], "correctAnswer": 0, "points": 5, "explanation": "Tuple is immutable because..."}}]}}
+CRITICAL: Every question MUST have "correctAnswer" (or "matchPairs" for match type), "explanation", and "text" fields. Do NOT omit any of these.
+
+Return ONLY valid JSON, no markdown fences.
+Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A","B","C","D"], "correctAnswer": 0, "points": 5, "explanation": "Because ..."}}, {{"type": "true-false", "text": "The earth is flat.", "correctAnswer": "False", "points": 2, "explanation": "The earth is an oblate spheroid."}}, {{"type": "short-answer", "text": "Explain photosynthesis.", "correctAnswer": "Photosynthesis is the process by which plants convert sunlight into energy.", "points": 5, "explanation": "Key concepts: light energy, chlorophyll, glucose production."}}, {{"type": "long-answer", "text": "Discuss the causes of World War I.", "correctAnswer": "World War I was caused by a combination of factors including militarism, alliances, imperialism, and nationalism...", "points": 10, "explanation": "Should cover at least 3 major causes with examples."}}, {{"type": "match", "text": "Match the following terms with their definitions.", "matchPairs": [{{"left": "Mitosis", "right": "Cell division"}}, {{"left": "Meiosis", "right": "Reproductive cell division"}}], "points": 10, "explanation": "Mitosis produces identical cells while meiosis produces gametes."}}]}}
 """
         try:
             response = await self.chat([{"role": "user", "content": prompt}])

@@ -1374,12 +1374,14 @@ class SuggestQuestionsRequest(BaseModel):
     mcqCount: int = 0
     fibCount: int = 0
     shortAnswerCount: int = 0
+    longAnswerCount: int = 0
     trueFalseCount: int = 0
     matchCount: int = 0
     difficulty: Optional[str] = "medium"
     lesson_plan_id: Optional[str] = None
     rubric_id: Optional[str] = None
     source_text: Optional[str] = None  # Full text from a vault file for document-grounded generation
+    topic_weightage: Optional[dict] = None  # e.g. {"Heart Valves": 50, "Atrium": 50}
 
 
 @router.post("/suggest-questions")
@@ -1438,11 +1440,13 @@ async def suggest_questions_for_assignment(
         mcq_count=payload.mcqCount,
         fib_count=payload.fibCount,
         short_answer_count=payload.shortAnswerCount,
+        long_answer_count=payload.longAnswerCount,
         true_false_count=payload.trueFalseCount,
         match_count=payload.matchCount,
         difficulty=payload.difficulty or "medium",
         lesson_plan_context=lesson_plan_context,
         rubric_criteria=rubric_criteria,
         source_text=payload.source_text,
+        topic_weightage=payload.topic_weightage,
     )
     return {"questions": questions}
