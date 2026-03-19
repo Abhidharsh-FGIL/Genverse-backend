@@ -255,6 +255,7 @@ async def extract_text_inline(
 
 
 @router.get("/signed-url")
+@router.get("/signed-url/", include_in_schema=False)
 async def get_signed_url(
     path: str = Query(...),
     current_user: CurrentUser = None,
