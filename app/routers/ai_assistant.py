@@ -187,20 +187,29 @@ async def _fetch_all_chunks(
     return [c.chunk_text for c in result.scalars().all()]
 
 
-def _inject_summary_rag(messages: list[dict], question: str, full_text: str) -> list[dict]:
+def _inject_summary_rag(
+    messages: list[dict],
+    question: str,
+    full_text: str,
+    file_name: str | None = None,
+) -> list[dict]:
     """Inject the full document text with a summary-optimised prompt."""
+    file_label = f' "{file_name}"' if file_name else ""
     enriched = (
-        "The user wants a summary of their uploaded document(s). "
+        f"The user wants a summary of their uploaded document{file_label}. "
         "Below is the FULL document content in sequential order.\n\n"
         "--- FULL DOCUMENT ---\n"
         f"{full_text}\n"
         "--- END OF DOCUMENT ---\n\n"
         "Instructions:\n"
-        "- Provide a well-structured, cohesive summary covering all major topics/sections.\n"
-        "- Preserve the logical flow and order of the original document.\n"
-        "- Highlight key concepts, definitions, formulas, or important facts.\n"
-        "- Use headings, bullet points, or numbered lists for clarity.\n"
-        "- Keep the summary comprehensive yet concise.\n\n"
+        "- Base your summary ENTIRELY on the document content above — do NOT add external information.\n"
+        "- Identify and explain the specific topics, concepts, and themes present in the document.\n"
+        "- If the document contains chapters, sections, or distinct units, summarize each one.\n"
+        "- Extract key definitions, formulas, theorems, examples, and important facts from the text.\n"
+        "- Preserve the logical flow and structure of the original document.\n"
+        "- Use clear headings that reflect the document's own section titles where possible.\n"
+        "- Include specific details (names, numbers, dates, equations) — not just vague descriptions.\n"
+        "- Keep the summary comprehensive yet concise — cover all major content without unnecessary repetition.\n\n"
         f"User request: {question}"
     )
     updated = list(messages)
@@ -614,7 +623,15 @@ async def send_message_stream(
         try:
             if is_summary:
                 # SUMMARY intent → fetch ALL chunks, map-reduce if large
-                print(f"[StreamChat] Summary intent detected — fetching full document", flush=True)
+                # Resolve file name(s) for context
+                file_uuids = [uuid.UUID(fid) for fid in selected_files]
+                name_result = await db.execute(
+                    select(UserLibraryItem.file_name)
+                    .where(UserLibraryItem.id.in_(file_uuids))
+                )
+                vault_names = [n for n in name_result.scalars().all() if n]
+                vault_file_label = ", ".join(vault_names) if vault_names else None
+                print(f"[StreamChat] Summary intent detected — fetching full document: {vault_file_label}", flush=True)
                 chunk_texts = await _fetch_all_chunks(
                     user_id=str(current_user.id),
                     file_ids=selected_files,
@@ -626,7 +643,7 @@ async def send_message_stream(
                         user_question=payload.message,
                     )
                     if summary_text:
-                        messages = _inject_summary_rag(messages, payload.message, summary_text)
+                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=vault_file_label)
             else:
                 # SPECIFIC QUERY → FAISS similarity search (top-K chunks)
                 rag_text = await _build_rag_context(
@@ -659,7 +676,7 @@ async def send_message_stream(
                         user_question=payload.message,
                     )
                     if summary_text:
-                        messages = _inject_summary_rag(messages, payload.message, summary_text)
+                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=book_title)
             else:
                 # SPECIFIC QUERY → similarity search
                 lib_rag_text = await _build_library_rag_context(
@@ -819,6 +836,13 @@ async def send_message(
     if selected_files:
         try:
             if is_summary_sync:
+                file_uuids_sync = [uuid.UUID(fid) for fid in selected_files]
+                name_result_sync = await db.execute(
+                    select(UserLibraryItem.file_name)
+                    .where(UserLibraryItem.id.in_(file_uuids_sync))
+                )
+                vault_names_sync = [n for n in name_result_sync.scalars().all() if n]
+                vault_label_sync = ", ".join(vault_names_sync) if vault_names_sync else None
                 chunk_texts = await _fetch_all_chunks(
                     user_id=str(current_user.id),
                     file_ids=selected_files,
@@ -830,7 +854,7 @@ async def send_message(
                         user_question=payload.message,
                     )
                     if summary_text:
-                        messages = _inject_summary_rag(messages, payload.message, summary_text)
+                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=vault_label_sync)
             else:
                 rag_text = await _build_rag_context(
                     user_id=str(current_user.id),
@@ -860,7 +884,7 @@ async def send_message(
                         user_question=payload.message,
                     )
                     if summary_text:
-                        messages = _inject_summary_rag(messages, payload.message, summary_text)
+                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=book_title_sync)
             else:
                 lib_rag_text_sync = await _build_library_rag_context(
                     question=payload.message,

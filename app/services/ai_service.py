@@ -1028,18 +1028,27 @@ class AIService:
         for idx, batch in enumerate(batches):
             batch_text = "\n\n".join(batch)
             batch_prompts.append(
-                f"You are summarizing part {idx + 1} of {len(batches)} from a document.\n\n"
+                f"You are creating a detailed summary of PART {idx + 1} of {len(batches)} "
+                "from an educational document. Your summary will be combined with "
+                "summaries of other parts to create a complete document summary.\n\n"
                 "--- DOCUMENT SECTION ---\n"
                 f"{batch_text}\n"
                 "--- END ---\n\n"
-                "Produce a detailed summary of this section. "
-                "Preserve all key facts, definitions, formulas, and important details. "
-                "Use bullet points and headings where appropriate. "
-                "Do NOT add information that is not in the text."
+                "INSTRUCTIONS:\n"
+                "- Summarize EVERY chapter, section, or topic present in this section.\n"
+                "- Use the document's own headings/chapter titles as your headings.\n"
+                "- Include ALL key definitions, formulas, theorems, equations, and important facts verbatim.\n"
+                "- Preserve specific details: names, numbers, dates, examples, diagrams described.\n"
+                "- For each topic, explain the core concept — not just mention it.\n"
+                "- Use bullet points under each heading for key points.\n"
+                "- Do NOT skip any section or chapter — cover everything.\n"
+                "- Do NOT add any information that is not in the text.\n"
+                "- Be thorough — this summary is the ONLY thing the reader will see."
             )
 
+        # Use higher token budget so batch summaries retain detail
         partial_summaries = await asyncio.gather(
-            *(self._llm_call(p, max_tokens=2048, tag=f"map-{i+1}/{len(batches)}")
+            *(self._llm_call(p, max_tokens=4096, tag=f"map-{i+1}/{len(batches)}")
               for i, p in enumerate(batch_prompts))
         )
 
@@ -1055,14 +1064,19 @@ class AIService:
         if combined_word_count > 15_000:
             print(f"[Summary] Reduce pass: {combined_word_count} words in partials", flush=True)
             reduce_prompt = (
-                "Below are partial summaries of different sections of a document, "
-                "presented in order. Combine them into ONE cohesive, well-structured "
-                "summary that covers all sections.\n\n"
+                "Below are detailed summaries of consecutive sections of a document, "
+                "presented in order. Merge them into ONE unified, comprehensive summary.\n\n"
                 f"{combined}\n\n"
+                "INSTRUCTIONS:\n"
+                "- Combine all section summaries into a single coherent document summary.\n"
+                "- Preserve ALL chapter/section headings from the partial summaries.\n"
+                "- Keep all key definitions, formulas, and specific details.\n"
+                "- Remove redundancy between sections but do NOT drop any unique content.\n"
+                "- Maintain the original document's order and flow.\n\n"
                 f"User's original request: {user_question}\n\n"
                 "Produce the final unified summary:"
             )
-            result = await self._llm_call(reduce_prompt, max_tokens=4096, tag="reduce")
+            result = await self._llm_call(reduce_prompt, max_tokens=8192, tag="reduce")
             if result.strip():
                 return result
 
