@@ -52,7 +52,7 @@ async def generate_assessment(payload: GenerateAssessmentRequest, current_user: 
     """Use AI to generate practice assessment questions and save them."""
     # Check feature access + usage, then deduct points
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="create_assessment", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="create_assessment", db=db, org_id=_parse_org_id(payload.org_id))
     await points_service.deduct(
         user_id=current_user.id,
         action="generate_assessment",

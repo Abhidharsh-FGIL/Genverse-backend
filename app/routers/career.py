@@ -107,7 +107,7 @@ async def analyze_career(
     parsed_oid = _parse_org_id(org_id)
 
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="career_guidance", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="career_guidance", db=db, org_id=parsed_oid)
     await points_service.deduct(user_id=current_user.id, action="career_guidance", db=db)
 
     ai = AIService()

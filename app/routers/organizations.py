@@ -324,6 +324,14 @@ async def bulk_invite(
     admin_name = current_user.name or current_user.email
 
     invitations = []
+    profile_fields = [
+        "name", "phone", "grade", "board_preference", "subjects",
+        "date_of_birth", "gender", "blood_group", "city", "state", "pincode",
+        "roll_number", "parent_name", "parent_phone",
+        "employee_id", "department", "qualification",
+        "emergency_contact_name", "emergency_contact_phone",
+        "emergency_contact_relation", "address",
+    ]
     for item in payload.members:
         # Check if user already exists
         user_result = await db.execute(select(User).where(User.email == item.email))
@@ -346,6 +354,14 @@ async def bulk_invite(
             )
             if not role_result.scalar_one_or_none():
                 db.add(UserRole(user_id=existing_user.id, role=item.role))
+
+            # Apply optional profile fields from CSV
+            item_data = item.model_dump(include=set(profile_fields), exclude_unset=True)
+            for key, value in item_data.items():
+                if value is not None:
+                    if key == "date_of_birth":
+                        value = date.fromisoformat(value)
+                    setattr(existing_user, key, value)
 
         token = secrets.token_urlsafe(32)
         inv = OrgInvitation(

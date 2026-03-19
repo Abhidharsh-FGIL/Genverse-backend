@@ -922,56 +922,184 @@ async def get_recent_activity(
     current_user: CurrentUser,
     db: DBSession,
     org_id: str | None = Query(None),
+    limit: int = Query(5, ge=1, le=50),
 ):
-    """Last 5 user actions merged across assessments, library, chats, and ebooks."""
+    """Recent user actions merged across assessments, library, chats, ebooks,
+    submissions, and assignments.
+
+    When the caller is an org admin and org_id is provided, returns org-wide
+    activity from all members instead of only the caller's own activity.
+    Includes the acting user's name for org-wide views.
+    """
     from datetime import datetime, timezone
     from app.models.content import UserLibraryItem, Ebook
     from app.models.ai import AiChat
 
     parsed_oid = _parse_org_id(org_id)
-    events = []
+    events: list[dict] = []
 
+    # Determine if the current user is an org admin for org-wide activity
+    is_org_admin = False
+    org_member_ids: list | None = None
+    if parsed_oid:
+        membership = (await db.execute(
+            select(OrgMember).where(
+                OrgMember.org_id == parsed_oid,
+                OrgMember.user_id == current_user.id,
+                OrgMember.role == "org_admin",
+            )
+        )).scalar_one_or_none()
+        if membership:
+            is_org_admin = True
+            org_member_ids = [
+                row[0] for row in (await db.execute(
+                    select(OrgMember.user_id).where(
+                        OrgMember.org_id == parsed_oid,
+                        OrgMember.status == "active",
+                    )
+                )).all()
+            ]
+
+    show_user = is_org_admin and bool(org_member_ids)
+
+    # Helper: user filter — all org members for admins, else just the caller
+    def _user_filter(user_col):
+        if show_user:
+            return user_col.in_(org_member_ids)
+        return user_col == current_user.id
+
+    # Pre-load user names for org-wide view
+    user_names: dict = {}
+    if show_user:
+        name_rows = (await db.execute(
+            select(User.id, User.name).where(User.id.in_(org_member_ids))
+        )).all()
+        user_names = {uid: name for uid, name in name_rows}
+
+    def _uname(uid) -> str:
+        if not show_user:
+            return ""
+        return user_names.get(uid, "Member")
+
+    # --- Assessments ---
     attempt_q = (
         select(AssessmentAttempt, PracticeAssessment.title.label("ptitle"))
         .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
         .where(
-            AssessmentAttempt.user_id == current_user.id,
+            _user_filter(AssessmentAttempt.user_id),
             AssessmentAttempt.submitted_at.isnot(None),
         )
     )
-    if org_id is not None:
-        attempt_q = attempt_q.where(
-            PracticeAssessment.org_id == parsed_oid if parsed_oid else PracticeAssessment.org_id.is_(None)
-        )
-    attempt_q = attempt_q.order_by(AssessmentAttempt.submitted_at.desc()).limit(5)
+    if parsed_oid:
+        attempt_q = attempt_q.where(PracticeAssessment.org_id == parsed_oid)
+    elif org_id is not None:
+        attempt_q = attempt_q.where(PracticeAssessment.org_id.is_(None))
+    attempt_q = attempt_q.order_by(AssessmentAttempt.submitted_at.desc()).limit(limit)
     rows = (await db.execute(attempt_q)).all()
     for attempt, title in rows:
-        events.append({"type": "assessment", "label": f"Completed: {title or 'Assessment'}",
-                       "icon": "📝", "ts": attempt.submitted_at})
+        uname = _uname(attempt.user_id)
+        label = f"{uname} completed {title or 'Assessment'}" if uname else f"Completed: {title or 'Assessment'}"
+        events.append({"type": "assessment", "label": label, "icon": "📝",
+                       "ts": attempt.submitted_at, "user_name": uname})
 
+    # --- Library uploads ---
+    lib_q = select(UserLibraryItem).where(_user_filter(UserLibraryItem.user_id))
+    if parsed_oid:
+        lib_q = lib_q.where(UserLibraryItem.org_id == parsed_oid)
     lib_rows = (await db.execute(
-        select(UserLibraryItem).where(UserLibraryItem.user_id == current_user.id)
-        .order_by(UserLibraryItem.created_at.desc()).limit(5)
+        lib_q.order_by(UserLibraryItem.created_at.desc()).limit(limit)
     )).scalars().all()
     for item in lib_rows:
-        events.append({"type": "document", "label": f"Uploaded: {item.title or 'Document'}",
-                       "icon": "📄", "ts": item.created_at})
+        uname = _uname(item.user_id)
+        label = f"{uname} uploaded {item.title or 'Document'}" if uname else f"Uploaded: {item.title or 'Document'}"
+        events.append({"type": "document", "label": label, "icon": "📄",
+                       "ts": item.created_at, "user_name": uname})
 
+    # --- AI Chats ---
+    chat_q = select(AiChat).where(_user_filter(AiChat.user_id))
+    if parsed_oid:
+        chat_q = chat_q.where(AiChat.org_id == parsed_oid)
     chat_rows = (await db.execute(
-        select(AiChat).where(AiChat.user_id == current_user.id)
-        .order_by(AiChat.created_at.desc()).limit(5)
+        chat_q.order_by(AiChat.created_at.desc()).limit(limit)
     )).scalars().all()
     for chat in chat_rows:
-        events.append({"type": "chat", "label": f"AI Chat: {chat.title or 'New Chat'}",
-                       "icon": "💬", "ts": chat.created_at})
+        uname = _uname(chat.user_id)
+        label = f"{uname} started AI Chat: {chat.title or 'New Chat'}" if uname else f"AI Chat: {chat.title or 'New Chat'}"
+        events.append({"type": "chat", "label": label, "icon": "💬",
+                       "ts": chat.created_at, "user_name": uname})
 
+    # --- eBooks ---
+    ebook_q = select(Ebook).where(_user_filter(Ebook.user_id))
+    if parsed_oid:
+        ebook_q = ebook_q.where(Ebook.org_id == parsed_oid)
     ebook_rows = (await db.execute(
-        select(Ebook).where(Ebook.user_id == current_user.id)
-        .order_by(Ebook.created_at.desc()).limit(5)
+        ebook_q.order_by(Ebook.created_at.desc()).limit(limit)
     )).scalars().all()
     for ebook in ebook_rows:
-        events.append({"type": "ebook", "label": f"Created eBook: {ebook.title or 'eBook'}",
-                       "icon": "📚", "ts": ebook.created_at})
+        uname = _uname(ebook.user_id)
+        label = f"{uname} created eBook: {ebook.title or 'eBook'}" if uname else f"Created eBook: {ebook.title or 'eBook'}"
+        events.append({"type": "ebook", "label": label, "icon": "📚",
+                       "ts": ebook.created_at, "user_name": uname})
+
+    # --- Submissions (student submitted assignment work) ---
+    if parsed_oid:
+        sub_q = (
+            select(Submission, Assignment.title.label("atitle"))
+            .join(Assignment, Submission.assignment_id == Assignment.id)
+            .join(Class, Assignment.class_id == Class.id)
+            .where(
+                Class.org_id == parsed_oid,
+                _user_filter(Submission.student_id),
+                Submission.submitted_at.isnot(None),
+            )
+            .order_by(Submission.submitted_at.desc()).limit(limit)
+        )
+        sub_rows = (await db.execute(sub_q)).all()
+        for sub, atitle in sub_rows:
+            uname = _uname(sub.student_id)
+            label = f"{uname} submitted {atitle or 'Assignment'}" if uname else f"Submitted: {atitle or 'Assignment'}"
+            events.append({"type": "submission", "label": label, "icon": "📥",
+                           "ts": sub.submitted_at, "user_name": uname})
+
+        # --- Graded submissions ---
+        graded_q = (
+            select(Submission, Assignment.title.label("atitle"))
+            .join(Assignment, Submission.assignment_id == Assignment.id)
+            .join(Class, Assignment.class_id == Class.id)
+            .where(
+                Class.org_id == parsed_oid,
+                Submission.graded_at.isnot(None),
+                Submission.status == "graded",
+            )
+        )
+        if show_user:
+            graded_q = graded_q.where(Submission.graded_by.in_(org_member_ids))
+        else:
+            graded_q = graded_q.where(Submission.graded_by == current_user.id)
+        graded_q = graded_q.order_by(Submission.graded_at.desc()).limit(limit)
+        graded_rows = (await db.execute(graded_q)).all()
+        for sub, atitle in graded_rows:
+            uname = _uname(sub.graded_by) if sub.graded_by else ""
+            label = f"{uname} graded {atitle or 'Assignment'}" if uname else f"Graded: {atitle or 'Assignment'}"
+            events.append({"type": "grading", "label": label, "icon": "✅",
+                           "ts": sub.graded_at, "user_name": uname})
+
+        # --- Assignments posted ---
+        assign_q = (
+            select(Assignment, Class.name.label("cname"))
+            .join(Class, Assignment.class_id == Class.id)
+            .where(
+                Class.org_id == parsed_oid,
+                Assignment.status == "published",
+            )
+            .order_by(Assignment.created_at.desc()).limit(limit)
+        )
+        assign_rows = (await db.execute(assign_q)).all()
+        for asgn, cname in assign_rows:
+            # Assignment doesn't have created_by; use class teacher
+            uname = ""
+            events.append({"type": "assignment", "label": f"Assignment posted: {asgn.title} ({cname})",
+                           "icon": "📋", "ts": asgn.created_at, "user_name": uname})
 
     now = datetime.now(timezone.utc)
 
@@ -994,6 +1122,7 @@ async def get_recent_activity(
         return f"{s // 86400} day{'s' if s // 86400 > 1 else ''} ago"
 
     return [
-        {"type": e["type"], "label": e["label"], "icon": e["icon"], "time": human_time(e["ts"])}
-        for e in events[:5]
+        {"type": e["type"], "label": e["label"], "icon": e["icon"],
+         "time": human_time(e["ts"]), "user_name": e.get("user_name", "")}
+        for e in events[:limit]
     ]

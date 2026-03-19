@@ -92,11 +92,12 @@ async def generate_ebook(payload: EbookGenerateRequest, current_user: CurrentUse
         resolved_page_count = num_chapters * PAGES_PER_CHAPTER.get(resolved_size, 3)
 
     points_service = PointsService()
+    parsed_org_id = _parse_org_id(payload.org_id)
     # Gate medium/large books by plan
     if resolved_size == "large":
-        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_large", db=db)
+        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_large", db=db, org_id=parsed_org_id)
     elif resolved_size == "medium":
-        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_medium", db=db)
+        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_medium", db=db, org_id=parsed_org_id)
     # Look up per-page cost from DB (seed value = 1 pt/page)
     pc_result = await db.execute(select(PointCost).where(PointCost.action == "generate_ebook"))
     pc = pc_result.scalars().first()
@@ -162,10 +163,11 @@ async def generate_ebook_stream(
 
     # ── Do ALL database work BEFORE streaming ──────────────────────────────
     points_service = PointsService()
+    parsed_org_id = _parse_org_id(payload.org_id)
     if resolved_size == "large":
-        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_large", db=db)
+        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_large", db=db, org_id=parsed_org_id)
     elif resolved_size == "medium":
-        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_medium", db=db)
+        await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_medium", db=db, org_id=parsed_org_id)
 
     pc_result = await db.execute(select(PointCost).where(PointCost.action == "generate_ebook"))
     pc = pc_result.scalars().first()
@@ -529,9 +531,9 @@ async def download_ebook_pdf(ebook_id: uuid.UUID, current_user: CurrentUser, db:
     if not ebook:
         raise NotFoundException("eBook not found")
 
-    # Check usage + deduct download cost
+    # Check usage + deduct download cost (skip for org workspace)
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_pdf", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_pdf", db=db, org_id=ebook.org_id)
     await points_service.deduct(user_id=current_user.id, action="ebook_download_pdf", db=db)
 
     pdf_bytes = await run_in_threadpool(generate_pdf, ebook.ebook_json, ebook.title)
@@ -556,9 +558,9 @@ async def download_ebook_doc(ebook_id: uuid.UUID, current_user: CurrentUser, db:
     if not ebook:
         raise NotFoundException("eBook not found")
 
-    # Check usage + deduct download cost
+    # Check usage + deduct download cost (skip for org workspace)
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_docx", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_docx", db=db, org_id=ebook.org_id)
     await points_service.deduct(user_id=current_user.id, action="ebook_download_docx", db=db)
 
     docx_bytes = await run_in_threadpool(generate_docx, ebook.ebook_json, ebook.title)
@@ -650,9 +652,9 @@ async def generate_audiobook(
     if not ebook:
         raise NotFoundException("eBook not found")
 
-    # Check feature access, then deduct points
+    # Check feature access, then deduct points (skip for org workspace)
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_audio", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_audio", db=db, org_id=ebook.org_id)
     await points_service.deduct(user_id=current_user.id, action="generate_audiobook", db=db)
 
     ai = AIService()

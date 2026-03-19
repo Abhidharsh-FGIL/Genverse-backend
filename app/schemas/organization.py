@@ -59,6 +59,28 @@ class OrgMemberResponse(BaseModel):
 class InviteMemberRequest(BaseModel):
     email: EmailStr
     role: str  # org_admin | teacher | student | guardian
+    # Optional profile fields (populated from CSV bulk upload)
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    grade: Optional[int] = None
+    board_preference: Optional[str] = None
+    subjects: Optional[List[str]] = None
+    date_of_birth: Optional[str] = None  # ISO format: YYYY-MM-DD
+    gender: Optional[str] = None
+    blood_group: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+    roll_number: Optional[str] = None
+    parent_name: Optional[str] = None
+    parent_phone: Optional[str] = None
+    employee_id: Optional[str] = None
+    department: Optional[str] = None
+    qualification: Optional[str] = None
+    emergency_contact_name: Optional[str] = None
+    emergency_contact_phone: Optional[str] = None
+    emergency_contact_relation: Optional[str] = None
+    address: Optional[str] = None
 
 
 class BulkInviteRequest(BaseModel):

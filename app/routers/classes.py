@@ -239,7 +239,7 @@ async def list_students_for_classes(
     return [
         ClassStudentResponse(
             id=cs.id, class_id=cs.class_id, student_id=cs.student_id,
-            roll_no=cs.roll_no, joined_at=cs.joined_at,
+            roll_no=cs.roll_no or user.roll_number, joined_at=cs.joined_at,
             student_name=user.name, student_email=user.email,
         )
         for cs, user in rows
@@ -463,7 +463,7 @@ async def list_class_students(class_id: uuid.UUID, current_user: CurrentUser, db
     return [
         ClassStudentResponse(
             id=cs.id, class_id=cs.class_id, student_id=cs.student_id,
-            roll_no=cs.roll_no, joined_at=cs.joined_at,
+            roll_no=cs.roll_no or user.roll_number, joined_at=cs.joined_at,
             student_name=user.name, student_email=user.email,
         )
         for cs, user in rows
@@ -719,7 +719,7 @@ async def add_student_by_email(
     await db.refresh(enrollment)
     return ClassStudentResponse(
         id=enrollment.id, class_id=enrollment.class_id, student_id=enrollment.student_id,
-        roll_no=enrollment.roll_no, joined_at=enrollment.joined_at,
+        roll_no=enrollment.roll_no or student.roll_number, joined_at=enrollment.joined_at,
         student_name=student.name, student_email=student.email,
     )
 

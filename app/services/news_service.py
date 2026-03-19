@@ -8,7 +8,7 @@ frontend shows an empty state.
 """
 
 import aiohttp
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from app.config import settings
 
 # ---------------------------------------------------------------------------
@@ -47,13 +47,27 @@ LANGUAGE_KEYWORD_HINT: dict[str, str] = {
     # "en" intentionally omitted — English is the default index language
 }
 
-BASE_URL = "https://google-news13.p.rapidapi.com/search"
+SEARCH_URL = "https://google-news13.p.rapidapi.com/search"
+LATEST_URL = "https://google-news13.p.rapidapi.com/latest"
 _PLACEHOLDER = "your_rapidapi_key_here"
 
 
 # ---------------------------------------------------------------------------
 # Service class
 # ---------------------------------------------------------------------------
+
+def _recency_hint() -> str:
+    """Return a recency hint covering the last 30 days (e.g. 'February March 2026').
+
+    On day 1 of a month, using only the current month name would miss the
+    previous month's news, so we always include both the current and the
+    month-from-30-days-ago names.
+    """
+    now = datetime.now()
+    ago = now - timedelta(days=30)
+    months = sorted(set([ago.strftime("%B"), now.strftime("%B")]))
+    return f"{' '.join(months)} {now.year}"
+
 
 class NewsService:
     """Fetches and normalises real-time Google News articles via RapidAPI."""
@@ -66,19 +80,30 @@ class NewsService:
         language: str = "en",
         max_results: int = 10,
     ) -> list[dict]:
-        """Return real-time news for the given UI category."""
+        """Return real-time news for the given UI category.
+
+        Uses /latest for today's headlines (``all`` category) and /search with
+        current-year hint for category-specific results.
+        Results are always sorted newest-first.
+        """
         if not self._key_configured():
             return []
 
-        keyword = CATEGORY_KEYWORDS.get(category, CATEGORY_KEYWORDS["all"])
-        lr      = LANGUAGE_LOCALE.get(language, "en-US")
+        lr = LANGUAGE_LOCALE.get(language, "en-US")
 
-        # Append language hint for better non-English coverage
+        if category == "all":
+            # Use /latest for today's top headlines
+            articles = await self._fetch_latest(lr=lr)
+            return self._normalize(articles, fallback_category="all")[:max_results]
+
+        # For specific categories — append recency hint for freshness
+        keyword = CATEGORY_KEYWORDS.get(category, CATEGORY_KEYWORDS["all"])
+        keyword = f"{keyword} {_recency_hint()}"
         hint = LANGUAGE_KEYWORD_HINT.get(language)
         if hint:
             keyword = f"{keyword} {hint}"
 
-        articles = await self._fetch(keyword=keyword, lr=lr)
+        articles = await self._fetch_search(keyword=keyword, lr=lr)
         return self._normalize(articles, fallback_category=category)[:max_results]
 
     async def get_personal_news(
@@ -119,6 +144,9 @@ class NewsService:
         if not parts:
             parts = ["education", "learning"]
 
+        # Append recency hint to boost freshness (covers last 30 days)
+        parts.append(_recency_hint())
+
         keyword = " ".join(parts)[:150]
         lr      = LANGUAGE_LOCALE.get(language, "en-US")
 
@@ -127,7 +155,7 @@ class NewsService:
         if hint:
             keyword = f"{keyword} {hint}"
 
-        articles = await self._fetch(keyword=keyword, lr=lr)
+        articles = await self._fetch_search(keyword=keyword, lr=lr)
         return self._normalize(articles, fallback_category="education", personal=True)[:max_results]
 
     # ---- private helpers --------------------------------------------------
@@ -136,22 +164,24 @@ class NewsService:
         key = settings.RAPIDAPI_KEY
         return bool(key) and key != _PLACEHOLDER
 
-    async def _fetch(self, keyword: str, lr: str) -> list[dict]:
-        """
-        Call google-news13.p.rapidapi.com/search and return the raw item list.
-        """
+    async def _fetch_search(self, keyword: str, lr: str) -> list[dict]:
+        """Call /search endpoint — keyword-based results (may not be the freshest)."""
+        return await self._raw_fetch(SEARCH_URL, {"keyword": keyword, "lr": lr})
+
+    async def _fetch_latest(self, lr: str) -> list[dict]:
+        """Call /latest endpoint — today's top headlines (always fresh)."""
+        return await self._raw_fetch(LATEST_URL, {"lr": lr})
+
+    async def _raw_fetch(self, url: str, params: dict) -> list[dict]:
+        """Generic HTTP GET against the RapidAPI host."""
         headers = {
             "X-RapidAPI-Key":  settings.RAPIDAPI_KEY,
             "X-RapidAPI-Host": settings.RAPIDAPI_NEWS_HOST,
         }
-        params = {
-            "keyword": keyword,
-            "lr":      lr,
-        }
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    BASE_URL,
+                    url,
                     headers=headers,
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=10),
@@ -159,7 +189,6 @@ class NewsService:
                     if resp.status != 200:
                         return []
                     data = await resp.json()
-                    # google-news13 returns {"items": [...]}
                     return data.get("items", [])
         except Exception:
             return []
@@ -221,4 +250,7 @@ class NewsService:
                 "image_url":   image_url,
                 "created_at":  created_at,
             })
+
+        # Sort by date — newest first
+        result.sort(key=lambda a: a["created_at"], reverse=True)
         return result

@@ -32,7 +32,7 @@ def _apply_org_filter(q, column, org_id_param: str | None):
 async def generate_video_script(payload: VideoScriptRequest, current_user: CurrentUser, db: DBSession):
     """Generate a video script using AI. Cost: 10 pts per script."""
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="video_studio", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="video_studio", db=db, org_id=_parse_org_id(payload.org_id))
     await points_service.deduct(user_id=current_user.id, action="generate_video_script", db=db)
 
     ai = AIService()
@@ -72,7 +72,7 @@ async def generate_video_visuals(project_id: uuid.UUID, current_user: CurrentUse
         raise NotFoundException("Video project not found")
 
     points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="video_studio", db=db)
+    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="video_studio", db=db, org_id=project.org_id)
     await points_service.deduct(user_id=current_user.id, action="generate_video_visuals", db=db)
 
     ai = AIService()

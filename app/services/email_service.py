@@ -661,8 +661,10 @@ def send_organization_invitation_email(
     subject = f"{admin_name} invited you to join {organization_name} on {settings.MAIL_FROM_NAME}"
 
     try:
-        smtp = smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT)
+        smtp = smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT, timeout=15)
+        smtp.ehlo()
         smtp.starttls()
+        smtp.ehlo()
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
         msg = MIMEMultipart('related')
@@ -672,10 +674,16 @@ def send_organization_invitation_email(
         msg.attach(MIMEText(html_body, 'html'))
         _attach_logo(msg)
 
-        smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string())
+        result = smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string())
         smtp.quit()
-        print(f"[EmailService] Invitation email sent to {to_email} for org '{organization_name}'", flush=True)
+        if result:
+            print(f"[EmailService] SMTP sendmail partial failure for {to_email}: {result}", flush=True)
+        else:
+            print(f"[EmailService] Invitation email sent to {to_email} for org '{organization_name}'", flush=True)
         return True
+    except smtplib.SMTPRecipientsRefused as e:
+        print(f"[EmailService] RECIPIENT REFUSED for {to_email}: {e.recipients}", flush=True)
+        return False
     except Exception as e:
         import traceback
         print(f"[EmailService] INVITATION EMAIL FAILED for {to_email}: {type(e).__name__}: {e}", flush=True)
