@@ -1254,6 +1254,7 @@ async def generate_practice_assessment_preview(
         topic_weightage=payload.topic_weightage,
         negative_marking=payload.negative_marking,
         source_text=resolved_source_text,
+        language=payload.language,
     )
 
     import uuid as _uuid
@@ -1376,6 +1377,7 @@ async def generate_practice_assessment_stream(
         "topic_weightage": payload.topic_weightage,
         "negative_marking": payload.negative_marking,
         "source_text": resolved_source_text,
+        "language": payload.language,
         "allowed_types": list(allowed_types),
         "user_id": str(current_user.id),
         "org_id": str(org_id) if org_id else None,
@@ -1466,6 +1468,7 @@ async def generate_practice_assessment_stream(
                     topic_weightage=payload.topic_weightage,
                     negative_marking=payload.negative_marking,
                     source_text=resolved_source_text,
+                    language=payload.language,
                 )
 
                 yield f"data: {json.dumps({'stage': 'processing', 'progress': 80, 'message': 'Processing and validating questions...'})}\n\n"
