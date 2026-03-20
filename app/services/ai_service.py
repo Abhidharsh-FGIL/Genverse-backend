@@ -4574,77 +4574,244 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
 
         return await self.generate_embedding(query)
 
+    # ------------------------------------------------------------------
+    # OCR prompt (ported from legacy GenVerse API)
+    # ------------------------------------------------------------------
+    _OCR_PROMPT = (
+        "Analyze and extract all text from the uploaded image, "
+        "including formulas, mathematical expressions, and physics/chemistry equations, "
+        "while preserving their exact format as presented.\n\n"
+        "### Key Extraction Guidelines:\n\n"
+        "Mathematical & Chemical Accuracy:\n"
+        "- Capture all equations, formulas, and notations as they appear.\n"
+        "- Accurately preserve subscripts, superscripts, fractions, limits, summations, "
+        "and integrals in their correct placement.\n"
+        "- Prevent misinterpretation of mathematical numbers, symbols, and notations.\n\n"
+        "Line Breaks & Formatting:\n"
+        "- Maintain original line breaks and step-by-step formatting for clarity.\n"
+        "- Ensure each step in equations or derivations appears on a separate line.\n\n"
+        "Strikethrough Content Handling:\n"
+        "- Identify and list all strikethrough content separately.\n"
+        "- Do not include strikethrough text in the main transcription.\n\n"
+        "Diagrams & Non-Text Elements:\n"
+        "- If a diagram, graph, or image cannot be converted into text, "
+        'include a note: [Refer to source file for diagram].\n\n'
+        "Tabular Data Extraction:\n"
+        "- Extract tables as structured text while maintaining alignment and readability.\n\n"
+        "Language & Text Integrity:\n"
+        "- Do not modify or interpret the text.\n"
+        "- Do not add extra comments, headers, or additional explanations.\n"
+        "- Correct only basic spelling and grammatical errors while preserving the original meaning.\n"
+        "- Do not introduce new numbering, bullet points, or formatting unless present in the source.\n"
+        "- Maintain the original line breaks, spacing, and order of text exactly as presented.\n\n"
+        "### Return Format:\n"
+        "1. Use # for Title or Headings if there is any, else don't add anything as heading.\n"
+        "2. Use ## for Subsections.\n"
+        "3. Use - for bullet points.\n"
+        "4. If the text is part of a table, format it using markdown tables.\n"
+        "5. If images or diagrams exist, describe them briefly; otherwise don't add remarks.\n"
+    )
+
+    _MAX_PDF_PAGES = 15
+    _PDF_PARALLEL_WORKERS = 4
+
+    # ------------------------------------------------------------------
+    # Image preprocessing (OpenCV) — improves OCR on scanned/handwritten
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _preprocess_image(image_path: str) -> bytes | None:
+        """Resize, grayscale, denoise, threshold → return JPEG bytes."""
+        try:
+            import cv2
+            image = cv2.imread(image_path)
+            if image is None:
+                return None
+            # Resize 2x for better OCR accuracy
+            img = cv2.resize(image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            # Grayscale
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            # Denoise
+            img = cv2.bilateralFilter(img, 9, 75, 75)
+            # Binary threshold (OTSU)
+            img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            # Convert back to RGB for Gemini
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            # Encode to JPEG bytes
+            _, buf = cv2.imencode(".jpg", img_rgb)
+            return buf.tobytes()
+        except Exception as e:
+            print(f"[OCR] Preprocessing failed, using raw image: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Language detection via Gemini vision
+    # ------------------------------------------------------------------
+    async def _detect_image_language(self, image_data: bytes) -> str:
+        """Detect language in an image using Gemini vision. Returns ISO 639-1 code."""
+        try:
+            import google.generativeai as genai
+            api_key = settings.GEMINI_API_KEY or settings.GOOGLE_GEMINI_API_KEY
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(settings.AI_PRIMARY_MODEL)
+            prompt = (
+                "Extract the text from this image and identify the language. "
+                "Return the result in strict JSON format using double quotes only. "
+                'Respond like this: {"language": "en"}\n'
+                "Use ISO 639-1 codes: en, hi, ta, te, kn, ml, bn, gu, mr, etc."
+            )
+            resp = await asyncio.to_thread(
+                model.generate_content,
+                [prompt, {"mime_type": "image/jpeg", "data": image_data}],
+            )
+            text = (resp.text or "").strip()
+            # Clean markdown code fences
+            text = re.sub(r"^```(?:json)?\n?", "", text)
+            text = re.sub(r"\n?```$", "", text.strip())
+            data = json.loads(text)
+            lang = data.get("language", "en")
+            print(f"[OCR] Detected language: {lang}")
+            return lang
+        except Exception as e:
+            print(f"[OCR] Language detection failed, defaulting to 'en': {e}")
+            return "en"
+
+    # ------------------------------------------------------------------
+    # Single-page OCR via Gemini vision
+    # ------------------------------------------------------------------
+    async def _ocr_single_image(
+        self, image_data: bytes, language: str, page_label: str = "",
+    ) -> str:
+        """Run OCR on a single image using Gemini vision with the comprehensive prompt."""
+        import google.generativeai as genai
+        api_key = settings.GEMINI_API_KEY or settings.GOOGLE_GEMINI_API_KEY
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(settings.AI_PRIMARY_MODEL)
+
+        lang_hint = f"The text may be in {language} language. " if language != "en" else ""
+        prompt = f"{lang_hint}{self._OCR_PROMPT}"
+
+        resp = await asyncio.to_thread(
+            model.generate_content,
+            [prompt, {"mime_type": "image/jpeg", "data": image_data}],
+        )
+        text = resp.text or ""
+        if page_label:
+            print(f"[OCR] {page_label}: extracted {len(text)} chars")
+        return text
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
     async def extract_text_from_file(self, file_path: str, language: str = "en") -> str:
-        """Extract text from a file (PDF, DOCX, image, etc.)."""
+        """Extract text from a file (PDF, DOCX, image, etc.).
+
+        Implements the legacy GenVerse OCR pipeline:
+        - Image preprocessing (resize, grayscale, denoise, threshold)
+        - Language auto-detection
+        - Vision-based OCR via Gemini (works on scanned/handwritten docs)
+        - Parallel page processing for multi-page PDFs
+        """
         path = Path(file_path)
         if not path.exists():
             return ""
 
         ext = path.suffix.lower()
         try:
+            # ── PDF: convert pages to images → parallel vision OCR ──
             if ext == ".pdf":
-                # Try PyMuPDF first (handles complex/large PDFs better)
-                try:
-                    import fitz  # PyMuPDF
-                    doc = fitz.open(file_path)
-                    text = "\n".join(page.get_text() or "" for page in doc)
-                    doc.close()
-                    if text.strip():
-                        return text
-                except Exception as e:
-                    print(f"[OCR] PyMuPDF failed, falling back to PyPDF2: {e}")
-                # Fallback to PyPDF2
-                import PyPDF2
-                with open(file_path, "rb") as f:
-                    reader = PyPDF2.PdfReader(f)
-                    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-                return text
+                from pdf2image import convert_from_path
+                from PyPDF2 import PdfReader
 
+                reader = PdfReader(file_path)
+                page_count = len(reader.pages)
+
+                if page_count > self._MAX_PDF_PAGES:
+                    print(f"[OCR] PDF has {page_count} pages (limit {self._MAX_PDF_PAGES})")
+                    return (
+                        f"This file has {page_count} pages (limit is {self._MAX_PDF_PAGES}). "
+                        "Please upload a shorter PDF."
+                    )
+
+                # Convert PDF pages to images
+                images = await asyncio.to_thread(convert_from_path, file_path)
+                print(f"[OCR] PDF → {len(images)} page images")
+
+                # Detect language from first page
+                import io
+                buf = io.BytesIO()
+                images[0].save(buf, format="JPEG")
+                first_page_bytes = buf.getvalue()
+                detected_lang = await self._detect_image_language(first_page_bytes)
+                effective_lang = detected_lang if language == "en" else language
+
+                # Preprocess & prepare all pages
+                page_data: list[bytes] = []
+                import tempfile, os
+                tmp_dir = tempfile.mkdtemp(prefix="ocr_pages_")
+                try:
+                    for i, pil_img in enumerate(images):
+                        page_path = os.path.join(tmp_dir, f"page_{i}.jpg")
+                        pil_img.save(page_path, "JPEG")
+                        preprocessed = await asyncio.to_thread(self._preprocess_image, page_path)
+                        if preprocessed:
+                            page_data.append(preprocessed)
+                        else:
+                            # Fallback: use raw image bytes
+                            buf = io.BytesIO()
+                            pil_img.save(buf, format="JPEG")
+                            page_data.append(buf.getvalue())
+                finally:
+                    import shutil
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+                # Parallel OCR all pages
+                tasks = [
+                    self._ocr_single_image(data, effective_lang, f"Page {i+1}")
+                    for i, data in enumerate(page_data)
+                ]
+                # Process in batches of _PDF_PARALLEL_WORKERS
+                results: list[str] = []
+                for batch_start in range(0, len(tasks), self._PDF_PARALLEL_WORKERS):
+                    batch = tasks[batch_start : batch_start + self._PDF_PARALLEL_WORKERS]
+                    batch_results = await asyncio.gather(*batch, return_exceptions=True)
+                    for r in batch_results:
+                        results.append(r if isinstance(r, str) else "")
+
+                whole_content = "\n\n---\n\n".join(
+                    f"**Page {i+1}:**\n\n{text}" for i, text in enumerate(results) if text.strip()
+                )
+                print(f"[OCR] PDF extraction complete: {len(whole_content)} chars total")
+                return whole_content
+
+            # ── DOCX: extract paragraphs ──
             elif ext in (".docx",):
                 from docx import Document
                 doc = Document(file_path)
                 return "\n".join(para.text for para in doc.paragraphs)
 
+            # ── Plain text ──
             elif ext in (".txt", ".md"):
                 return path.read_text(encoding="utf-8", errors="ignore")
 
+            # ── Images: preprocess → vision OCR ──
             elif ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
-                # Map extension to correct MIME type for Gemini vision
-                mime_map = {
-                    ".jpg": "image/jpeg",
-                    ".jpeg": "image/jpeg",
-                    ".png": "image/png",
-                    ".webp": "image/webp",
-                    ".gif": "image/gif",
-                }
-                mime_type = mime_map.get(ext, "image/jpeg")
+                # Preprocess image for better OCR
+                preprocessed = await asyncio.to_thread(self._preprocess_image, file_path)
+                if preprocessed:
+                    image_data = preprocessed
+                else:
+                    with open(file_path, "rb") as f:
+                        image_data = f.read()
 
-                with open(file_path, "rb") as f:
-                    image_data = f.read()
+                print(f"[OCR] Image ready: {len(image_data)} bytes")
 
-                print(f"[OCR] Image read: {len(image_data)} bytes, mime={mime_type}")
+                # Auto-detect language if not specified
+                if language == "en":
+                    language = await self._detect_image_language(image_data)
 
-                # Use google-generativeai SDK for multimodal OCR
-                try:
-                    import google.generativeai as genai
-
-                    api_key = settings.GEMINI_API_KEY or settings.GOOGLE_GEMINI_API_KEY
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel(settings.AI_PRIMARY_MODEL)
-                    response = model.generate_content([
-                        f"Extract all text from this image. The text may be in {language} language. "
-                        "Return only the extracted text, preserving the original formatting. "
-                        "If there is no text in the image, return an empty string.",
-                        {"mime_type": mime_type, "data": image_data},
-                    ])
-                    text = response.text or ""
-                    print(f"[OCR] Extracted {len(text)} chars from image")
-                    return text
-                except Exception as img_err:
-                    print(f"[OCR] Image extraction failed: {img_err}")
-                    import traceback
-                    traceback.print_exc()
-                    return ""
+                text = await self._ocr_single_image(image_data, language, "Image")
+                print(f"[OCR] Extracted {len(text)} chars from image")
+                return text
 
         except Exception as e:
             print(f"[OCR] Error extracting text from {file_path}: {e}")
