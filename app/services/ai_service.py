@@ -1702,13 +1702,24 @@ Return ONLY valid JSON, no markdown:
                 f"\n- Chapter topics should align with what {target} would study"
             )
 
+        language_name = self._LANGUAGE_NAMES.get(language, language.upper())
+
+        lang_instruction = ""
+        if language != "en":
+            lang_instruction = (
+                f"\n\nLANGUAGE REQUIREMENT (MANDATORY):"
+                f"\n- Write ALL chapter titles and descriptions in {language_name}."
+                f"\n- Do NOT use English for titles or descriptions."
+                f"\n- Every single word in the output must be in {language_name}."
+            )
+
         prompt = f"""You are an expert educational author. Create a chapter outline for an eBook.
 
 Title: {title}
 Topic: {topic}
 Subject: {subject or "General"}
 {grade_board_section}
-Language: {language}
+Language: {language_name}
 Number of chapters: between {min_ch} and {max_ch}
 Writing style: {tone_context}
 
@@ -1718,7 +1729,7 @@ Generate a logical, well-structured chapter outline where:
 - Chapter titles are concise and clear (4-8 words)
 - Descriptions are 1-2 sentences explaining what the chapter covers
 - Chapters flow naturally from foundational concepts to advanced ones
-- The tone/style "{tone}" is reflected in how chapters are framed{grade_board_instructions}
+- The tone/style "{tone}" is reflected in how chapters are framed{grade_board_instructions}{lang_instruction}
 
 Return ONLY valid JSON in this exact structure:
 {{
