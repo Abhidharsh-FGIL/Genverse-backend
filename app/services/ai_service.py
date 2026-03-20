@@ -3773,7 +3773,10 @@ Return ONLY valid JSON.
             source_type = s.get("source_type", "online")
             source_text = s.get("source_text", "")
 
-            section = f"\n### {subj_name} (Chapters: {chapters_str})"
+            chapter_names = [c.get("name", "") for c in chapters] if chapters else []
+            section = f"\n### {subj_name}"
+            if chapter_names:
+                section += f"\nALLOWED CHAPTER NAMES (use ONLY these exact names in the 'chapter' field): {', '.join(chapter_names)}"
             if source_type in ("text", "file") and source_text and source_text.strip():
                 section += (
                     f"\nSOURCE TEXT (generate questions for {subj_name} ONLY from this content):\n"
@@ -3981,8 +3984,8 @@ Return a JSON array of EXACTLY {question_count} objects. Each object MUST have A
 - "correct_answer": string (required)
 - "explanation": 1-2 sentence explanation
 - "marks": 1 for mcq/fill/true_false; 2 for short/match; 4 for long
-- "subject": the subject name
-- "chapter": the chapter name
+- "subject": MUST be one of the subject names listed above — use the EXACT spelling provided
+- "chapter": MUST be one of the chapter names listed above — use the EXACT spelling provided, do NOT invent your own chapter names
 - "blooms_level": one of "remember"|"understand"|"apply"|"analyze"|"evaluate"|"create"
 
 Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""

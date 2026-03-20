@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, status, Query, UploadFile, File, HTTPException
 from sqlalchemy import select, delete, distinct, union_all, func
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.evaluation import (
@@ -1268,10 +1269,11 @@ async def public_assessment_info(token: str, db: DBSession = None):
             _score_attempt(stale, questions, stale.responses or {}, assessment)
             stale.submitted_at = now
             stale.status = "submitted"
-            meta = stale.attempt_metadata or {}
+            meta = dict(stale.attempt_metadata or {})
             meta["auto_submitted"] = True
             meta["submit_reason"] = "server_timeout"
             stale.attempt_metadata = meta
+            flag_modified(stale, "attempt_metadata")
 
     if stale_attempts:
         # Also update invitation status if all attempts are now submitted
@@ -1390,10 +1392,11 @@ async def public_start_attempt(token: str, payload: PublicStartAttemptRequest, d
             _score_attempt(ip_attempt, questions_for_score, ip_attempt.responses or {}, assessment)
             ip_attempt.submitted_at = now
             ip_attempt.status = "submitted"
-            meta = ip_attempt.attempt_metadata or {}
+            meta = dict(ip_attempt.attempt_metadata or {})
             meta["auto_submitted"] = True
             meta["submit_reason"] = "server_timeout"
             ip_attempt.attempt_metadata = meta
+            flag_modified(ip_attempt, "attempt_metadata")
             logger.info("Auto-submitted stale attempt %s", ip_attempt.id)
         elif existing_attempt is None:
             # Most recent non-stale in_progress attempt = candidate for resume
@@ -1543,9 +1546,10 @@ async def public_submit_attempt(
     attempt.status = "submitted"
     if payload.metadata:
         # Merge payload metadata with existing (preserves shuffle_map)
-        meta = attempt.attempt_metadata or {}
+        meta = dict(attempt.attempt_metadata or {})
         meta.update(payload.metadata)
         attempt.attempt_metadata = meta
+        flag_modified(attempt, "attempt_metadata")
 
     # Update invitation status
     invitation.status = "completed"
@@ -1584,9 +1588,10 @@ async def public_autosave_attempt(
 
     attempt.responses = payload.responses
     # Merge autosave timestamp into metadata
-    meta = attempt.attempt_metadata or {}
+    meta = dict(attempt.attempt_metadata or {})
     meta["last_autosave_at"] = datetime.now(timezone.utc).isoformat()
     attempt.attempt_metadata = meta
+    flag_modified(attempt, "attempt_metadata")
 
     await db.commit()
     return {"status": "saved"}
@@ -1633,12 +1638,13 @@ async def public_beacon_submit(
     attempt.status = "submitted"
 
     # Merge metadata (preserves shuffle_map from attempt start)
-    meta = attempt.attempt_metadata or {}
+    meta = dict(attempt.attempt_metadata or {})
     if payload.metadata:
         meta.update(payload.metadata)
     meta["auto_submitted"] = True
     meta["submit_reason"] = meta.get("submit_reason", "browser_close")
     attempt.attempt_metadata = meta
+    flag_modified(attempt, "attempt_metadata")
 
     invitation.status = "completed"
     await db.commit()

@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import AsyncSessionLocal
 from app.models.evaluation import (
@@ -109,10 +110,11 @@ async def _cleanup_stale_attempts():
             attempt.status = "submitted"
 
             # Set metadata
-            meta = attempt.attempt_metadata or {}
+            meta = dict(attempt.attempt_metadata or {})
             meta["auto_submitted"] = True
             meta["submit_reason"] = "server_timeout"
             attempt.attempt_metadata = meta
+            flag_modified(attempt, "attempt_metadata")
 
             # Update invitation status if linked
             if attempt.invitation_id:
