@@ -324,6 +324,7 @@ async def bulk_invite(
     admin_name = current_user.name or current_user.email
 
     invitations = []
+    skipped = []
     profile_fields = [
         "name", "phone", "grade", "board_preference", "subjects",
         "date_of_birth", "gender", "blood_group", "city", "state", "pincode",
@@ -338,13 +339,14 @@ async def bulk_invite(
         existing_user = user_result.scalar_one_or_none()
 
         if existing_user:
-            existing_member = await db.execute(
+            existing_member_result = await db.execute(
                 select(OrgMember).where(OrgMember.org_id == org_id, OrgMember.user_id == existing_user.id)
             )
-            member = existing_member.scalar_one_or_none()
+            member = existing_member_result.scalar_one_or_none()
             if member:
-                member.role = item.role
-                member.status = "active"
+                # Skip already-existing members — do NOT overwrite their role
+                skipped.append({"email": item.email, "role": member.role, "reason": "already a member"})
+                continue
             else:
                 db.add(OrgMember(org_id=org_id, user_id=existing_user.id, role=item.role, status="active"))
 
@@ -360,7 +362,10 @@ async def bulk_invite(
             for key, value in item_data.items():
                 if value is not None:
                     if key == "date_of_birth":
-                        value = date.fromisoformat(value)
+                        try:
+                            value = date.fromisoformat(value)
+                        except (ValueError, TypeError):
+                            continue
                     setattr(existing_user, key, value)
 
         token = secrets.token_urlsafe(32)
@@ -388,7 +393,7 @@ async def bulk_invite(
 
         invitations.append({"email": item.email, "role": item.role})
     await db.commit()
-    return {"invited": len(invitations), "members": invitations}
+    return {"invited": len(invitations), "skipped": len(skipped), "skipped_members": skipped, "members": invitations}
 
 
 @router.post("/{org_id}/members/add-direct", response_model=OrgMemberResponse)

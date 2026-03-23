@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 # Make sure project root is on the path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from app.database import AsyncSessionLocal
 from app.models.user import User, UserRole
 from app.models.subscription import Subscription
@@ -281,15 +281,66 @@ async def _seed_org_admin(db, data, now, period_end):
         user_id = existing.id
         print(f"  [skip] user already exists: {data['email']}")
 
-        # Ensure org exists for this user
+        # Ensure org exists for this user — first try org_admin, then any role (may have been corrupted)
         member = await db.scalar(
             select(OrgMember).where(
                 OrgMember.user_id == user_id,
                 OrgMember.role == "org_admin",
             )
         )
+        if not member:
+            # Role may have been corrupted (e.g. bulk upload changed org_admin to student)
+            member = await db.scalar(
+                select(OrgMember).where(OrgMember.user_id == user_id)
+            )
+            if member:
+                print(f"  [fix] restoring org_admin role (was '{member.role}') for {data['email']}")
+                member.role = "org_admin"
+                member.status = "active"
+
         if member:
             org_id = member.org_id
+
+            # Clean up ALL other OrgMember entries for this user (duplicate orgs, stale roles)
+            all_memberships = await db.execute(
+                select(OrgMember).where(
+                    OrgMember.user_id == user_id,
+                    OrgMember.id != member.id,
+                )
+            )
+            for stale in all_memberships.scalars().all():
+                # If it's a duplicate org created by the seed script, also remove that org
+                if stale.role == "org_admin" and stale.org_id != org_id:
+                    dup_org = await db.scalar(select(Organization).where(Organization.id == stale.org_id))
+                    if dup_org:
+                        # Remove subscription for duplicate org
+                        dup_sub = await db.scalar(
+                            select(Subscription).where(Subscription.org_id == stale.org_id)
+                        )
+                        if dup_sub:
+                            await db.delete(dup_sub)
+                        # Remove all members of duplicate org
+                        dup_members = await db.execute(
+                            select(OrgMember).where(OrgMember.org_id == stale.org_id)
+                        )
+                        for dm in dup_members.scalars().all():
+                            await db.delete(dm)
+                        await db.delete(dup_org)
+                        print(f"  [cleanup] removed duplicate org '{dup_org.name}' for {data['email']}")
+                    continue
+                print(f"  [cleanup] removing stale '{stale.role}' membership for {data['email']}")
+                await db.delete(stale)
+
+            # Clean up stale UserRole entries (e.g. student/teacher roles added by bad bulk uploads)
+            stale_roles = await db.execute(
+                select(UserRole).where(
+                    UserRole.user_id == user_id,
+                    UserRole.role.notin_(["normal_user", "org_admin", "teacher"]),
+                )
+            )
+            for stale in stale_roles.scalars().all():
+                print(f"  [cleanup] removing stale UserRole '{stale.role}' for {data['email']}")
+                await db.delete(stale)
 
             # Update org product_type flags
             org = await db.scalar(
