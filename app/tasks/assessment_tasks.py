@@ -103,6 +103,7 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
         topic_weightage=params.get("topic_weightage"),
         negative_marking=params.get("negative_marking", False),
         source_text=params.get("source_text"),
+        language=params.get("language"),
     )
 
     _publish(r, channel, {

@@ -1324,8 +1324,10 @@ Answer:"""
         topic_weightage: dict | None = None,
         negative_marking: bool = False,
         source_text: str | None = None,
+        language: str | None = None,
     ) -> List[dict]:
         """Generate practice assessment questions as JSON — respects all config options."""
+        print(f"[Assessment] language={language}, grade={grade}, board={board}, subject={subject}", flush=True)
         types = question_types or ["mcq"]
 
         # ── Compute exact counts per question type ──────────────────────────
@@ -1416,13 +1418,28 @@ Answer:"""
 
         allowed_types_str = " | ".join(f'"{t}"' for t in types)
 
+        # ── Language instruction ─────────────────────────────────────────────
+        lang_code = (language or "en").strip().lower()
+        lang_name = self._LANGUAGE_NAMES.get(lang_code, language or "English")
+        is_non_english = lang_code not in ("en", "english", "")
+        if is_non_english:
+            lang_section = (
+                f"\nLANGUAGE: You MUST write ALL question text, options, explanations, "
+                f"and correct answers ENTIRELY in {lang_name}. "
+                f"Use the native script of {lang_name} throughout — do NOT mix in English "
+                f"words or translations unless they are technical terms with no equivalent. "
+                f"The JSON keys (\"id\", \"type\", \"text\", etc.) must remain in English."
+            )
+        else:
+            lang_section = ""
+
         prompt = f"""You are an expert question paper setter. Generate exactly {question_count} questions for a {mode} assessment.
 
 SUBJECT: {subject or topics_str}
 TOPICS: {topics_str}
 GRADE: {f'Grade {grade}' if grade else 'General'}{f' ({board})' if board else ''}
 DIFFICULTY: {difficulty}
-MODE: {mode}
+MODE: {mode}{lang_section}
 {blooms_section}
 {neg_section}
 
@@ -1487,7 +1504,8 @@ Return a JSON array of EXACTLY {question_count} objects. Each object MUST have A
 - "blooms_level": one of "remember" | "understand" | "apply" | "analyze" | "evaluate" | "create"
 
 ⚠️ FINAL CHECK BEFORE OUTPUT: Verify that every object's "type" field is one of {allowed_types_str}. If any object has a different type, correct it before returning.
-
+{f"""
+⚠️ CRITICAL LANGUAGE REQUIREMENT: Every single "text", "options" array element, "correct_answer", and "explanation" value MUST be written in {lang_name} using its native script. NOT in English. If any value is in English, rewrite it in {lang_name} before returning. Only JSON keys remain in English.""" if is_non_english else ""}
 Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""
 
         response = await self.chat([{"role": "user", "content": prompt}])
@@ -1684,13 +1702,24 @@ Return ONLY valid JSON, no markdown:
                 f"\n- Chapter topics should align with what {target} would study"
             )
 
+        language_name = self._LANGUAGE_NAMES.get(language, language.upper())
+
+        lang_instruction = ""
+        if language != "en":
+            lang_instruction = (
+                f"\n\nLANGUAGE REQUIREMENT (MANDATORY):"
+                f"\n- Write ALL chapter titles and descriptions in {language_name}."
+                f"\n- Do NOT use English for titles or descriptions."
+                f"\n- Every single word in the output must be in {language_name}."
+            )
+
         prompt = f"""You are an expert educational author. Create a chapter outline for an eBook.
 
 Title: {title}
 Topic: {topic}
 Subject: {subject or "General"}
 {grade_board_section}
-Language: {language}
+Language: {language_name}
 Number of chapters: between {min_ch} and {max_ch}
 Writing style: {tone_context}
 
@@ -1700,7 +1729,7 @@ Generate a logical, well-structured chapter outline where:
 - Chapter titles are concise and clear (4-8 words)
 - Descriptions are 1-2 sentences explaining what the chapter covers
 - Chapters flow naturally from foundational concepts to advanced ones
-- The tone/style "{tone}" is reflected in how chapters are framed{grade_board_instructions}
+- The tone/style "{tone}" is reflected in how chapters are framed{grade_board_instructions}{lang_instruction}
 
 Return ONLY valid JSON in this exact structure:
 {{

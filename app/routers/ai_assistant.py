@@ -598,14 +598,14 @@ async def send_message_stream(
         cost_override=total_cost, xp_override=total_xp, org_id=org_id,
     )
 
-    # Get chat history
+    # Get chat history — fetch most recent messages so follow-ups have context
     history_result = await db.execute(
         select(AiChatMessage)
         .where(AiChatMessage.chat_id == chat_id)
-        .order_by(AiChatMessage.created_at.asc())
+        .order_by(AiChatMessage.created_at.desc())
         .limit(20)
     )
-    history = history_result.scalars().all()
+    history = list(reversed(history_result.scalars().all()))  # reverse to chronological order
     messages = [{"role": m.role, "content": m.content} for m in history]
 
     ai = AIService()
@@ -813,13 +813,14 @@ async def send_message(
     db.add(user_msg)
     await db.flush()
 
+    # Fetch most recent messages so follow-ups have context
     history_result = await db.execute(
         select(AiChatMessage)
         .where(AiChatMessage.chat_id == chat_id)
-        .order_by(AiChatMessage.created_at.asc())
+        .order_by(AiChatMessage.created_at.desc())
         .limit(20)
     )
-    history = history_result.scalars().all()
+    history = list(reversed(history_result.scalars().all()))
     messages = [{"role": m.role, "content": m.content} for m in history]
 
     ai = AIService()
@@ -1254,6 +1255,7 @@ async def generate_practice_assessment_preview(
         topic_weightage=payload.topic_weightage,
         negative_marking=payload.negative_marking,
         source_text=resolved_source_text,
+        language=payload.language,
     )
 
     import uuid as _uuid
@@ -1376,6 +1378,7 @@ async def generate_practice_assessment_stream(
         "topic_weightage": payload.topic_weightage,
         "negative_marking": payload.negative_marking,
         "source_text": resolved_source_text,
+        "language": payload.language,
         "allowed_types": list(allowed_types),
         "user_id": str(current_user.id),
         "org_id": str(org_id) if org_id else None,
@@ -1466,6 +1469,7 @@ async def generate_practice_assessment_stream(
                     topic_weightage=payload.topic_weightage,
                     negative_marking=payload.negative_marking,
                     source_text=resolved_source_text,
+                    language=payload.language,
                 )
 
                 yield f"data: {json.dumps({'stage': 'processing', 'progress': 80, 'message': 'Processing and validating questions...'})}\n\n"
