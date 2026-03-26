@@ -3,7 +3,7 @@ import secrets
 from datetime import date, datetime, timezone, timedelta
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import DBSession, CurrentUser
@@ -249,6 +249,15 @@ async def invite_member(
 ):
     await _require_org_admin(current_user.id, org_id, db)
 
+    # Validate mandatory fields for students
+    if payload.role == "student":
+        missing = _validate_student_mandatory_fields(payload.model_dump())
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Missing mandatory fields for student: {', '.join(missing)}",
+            )
+
     # Fetch org name and admin name for the email
     org_result = await db.execute(select(Organization).where(Organization.id == org_id))
     org = org_result.scalar_one_or_none()
@@ -325,8 +334,9 @@ async def bulk_invite(
 
     invitations = []
     skipped = []
+    validation_errors = []
     profile_fields = [
-        "name", "phone", "grade", "board_preference", "subjects",
+        "name", "phone", "grade", "section", "board_preference", "subjects",
         "date_of_birth", "gender", "blood_group", "city", "state", "pincode",
         "roll_number", "parent_name", "parent_phone",
         "employee_id", "department", "qualification",
@@ -334,6 +344,15 @@ async def bulk_invite(
         "emergency_contact_relation", "address",
     ]
     for item in payload.members:
+        # Validate mandatory fields for students
+        if item.role == "student":
+            missing = _validate_student_mandatory_fields(item.model_dump())
+            if missing:
+                validation_errors.append({
+                    "email": item.email,
+                    "missing_fields": missing,
+                })
+                continue
         # Check if user already exists
         user_result = await db.execute(select(User).where(User.email == item.email))
         existing_user = user_result.scalar_one_or_none()
@@ -393,7 +412,13 @@ async def bulk_invite(
 
         invitations.append({"email": item.email, "role": item.role})
     await db.commit()
-    return {"invited": len(invitations), "skipped": len(skipped), "skipped_members": skipped, "members": invitations}
+    return {
+        "invited": len(invitations),
+        "skipped": len(skipped),
+        "skipped_members": skipped,
+        "validation_errors": validation_errors,
+        "members": invitations,
+    }
 
 
 @router.post("/{org_id}/members/add-direct", response_model=OrgMemberResponse)
@@ -485,6 +510,7 @@ class AdminUpdateMemberProfile(BaseModel):
     phone: str | None = None
     address: str | None = None
     grade: int | None = None
+    section: str | None = None
     subjects: list[str] | None = None
     language: str | None = None
     board_preference: str | None = None
@@ -531,6 +557,7 @@ async def get_member_profile(
         "phone": user.phone,
         "address": user.address,
         "grade": user.grade,
+        "section": user.section,
         "subjects": user.subjects,
         "board_preference": user.board_preference,
         "date_of_birth": str(user.date_of_birth) if user.date_of_birth else None,
@@ -851,6 +878,278 @@ async def accept_invitation(token: str, current_user: CurrentUser, db: DBSession
         )
         db.add(member)
 
+    # Ensure the user has the corresponding UserRole (e.g. "org_admin", "teacher")
+    from app.models.user import UserRole
+    role_check = await db.execute(
+        select(UserRole).where(UserRole.user_id == current_user.id, UserRole.role == invitation.role)
+    )
+    if not role_check.scalar_one_or_none():
+        db.add(UserRole(user_id=current_user.id, role=invitation.role))
+
     invitation.status = "accepted"
     await db.commit()
     return {"message": "Invitation accepted", "org_id": str(invitation.org_id), "role": invitation.role}
+
+
+# ---- Academic Year ----
+
+class AcademicYearRequest(BaseModel):
+    academic_year: str  # e.g. "2025-2026"
+
+
+@router.get("/{org_id}/academic-year")
+async def get_academic_year(org_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise NotFoundException("Organization not found")
+    return {"academic_year": org.current_academic_year}
+
+
+@router.patch("/{org_id}/academic-year")
+async def set_academic_year(
+    org_id: uuid.UUID, payload: AcademicYearRequest, current_user: CurrentUser, db: DBSession
+):
+    await _require_org_admin(current_user.id, org_id, db)
+    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise NotFoundException("Organization not found")
+    org.current_academic_year = payload.academic_year
+    await db.commit()
+    return {"academic_year": org.current_academic_year}
+
+
+@router.get("/{org_id}/academic-years")
+async def list_academic_years(org_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    """Get all academic years that have data (classes or class teachers) for this org."""
+    from app.models.classes import Class, GradeSectionTeacher
+
+    # Get distinct years from classes
+    class_years = await db.execute(
+        select(Class.academic_year).where(
+            Class.org_id == org_id,
+            Class.academic_year.isnot(None),
+        ).distinct()
+    )
+    # Get distinct years from class teacher assignments
+    ct_years = await db.execute(
+        select(GradeSectionTeacher.academic_year).where(
+            GradeSectionTeacher.org_id == org_id,
+        ).distinct()
+    )
+
+    years = set()
+    for r in class_years.scalars().all():
+        if r:
+            years.add(r)
+    for r in ct_years.scalars().all():
+        if r:
+            years.add(r)
+
+    # Also include the current academic year from org settings
+    org_result = await db.execute(select(Organization.current_academic_year).where(Organization.id == org_id))
+    current = org_result.scalar_one_or_none()
+    if current:
+        years.add(current)
+
+    return {"years": sorted(years, reverse=True), "current": current}
+
+
+# ---- Board usage check ----
+
+@router.get("/{org_id}/board-usage")
+async def check_board_usage(org_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    """Check which boards are in use by classes and students in this org."""
+    await _require_org_admin(current_user.id, org_id, db)
+
+    from app.models.classes import Class
+
+    # Get board usage in classes
+    class_result = await db.execute(
+        select(Class.board, func.count(Class.id))
+        .where(Class.org_id == org_id, Class.is_active == True)
+        .group_by(Class.board)
+    )
+    class_usage = {row[0]: row[1] for row in class_result.all()}
+
+    # Get board usage in student profiles
+    student_result = await db.execute(
+        select(User.board_preference, func.count(User.id))
+        .join(OrgMember, OrgMember.user_id == User.id)
+        .where(
+            OrgMember.org_id == org_id,
+            OrgMember.role == "student",
+            OrgMember.status == "active",
+            User.board_preference.isnot(None),
+        )
+        .group_by(User.board_preference)
+    )
+    student_usage = {row[0]: row[1] for row in student_result.all()}
+
+    # Combine all boards that are in use
+    all_boards = set(class_usage.keys()) | set(student_usage.keys())
+    usage = {}
+    for board in all_boards:
+        usage[board] = {
+            "classes": class_usage.get(board, 0),
+            "students": student_usage.get(board, 0),
+        }
+
+    return usage
+
+
+# ---- Students by grade+section ----
+
+@router.get("/{org_id}/students-by-grade")
+async def get_students_by_grade(
+    org_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+    grade: int = Query(...),
+    section: str = Query(None),
+):
+    """Get students in the org filtered by grade and optionally section."""
+    await _require_org_admin(current_user.id, org_id, db)
+    q = (
+        select(User, OrgMember)
+        .join(OrgMember, OrgMember.user_id == User.id)
+        .where(
+            OrgMember.org_id == org_id,
+            OrgMember.role == "student",
+            OrgMember.status == "active",
+            User.grade == grade,
+            User.is_active == True,
+        )
+    )
+    if section:
+        q = q.where(User.section == section)
+    result = await db.execute(q)
+    rows = result.all()
+    return [
+        {
+            "user_id": str(user.id),
+            "user_name": user.name,
+            "user_email": user.email,
+            "roll_number": user.roll_number,
+            "grade": user.grade,
+            "section": user.section,
+            "board_preference": user.board_preference,
+        }
+        for user, member in rows
+    ]
+
+
+# ---- Student mandatory field validation helper ----
+
+def _validate_student_mandatory_fields(data: dict) -> list[str]:
+    """Return list of missing mandatory fields for a student."""
+    required = [
+        "grade", "section", "board_preference", "roll_number",
+        "emergency_contact_name", "emergency_contact_phone", "emergency_contact_relation",
+    ]
+    missing = [f for f in required if not data.get(f)]
+    return missing
+
+
+# ---- Grade Promotion ----
+
+class GradePromotionRequest(BaseModel):
+    from_grade: int
+    to_grade: int
+    section: str | None = None
+    new_section: str | None = None
+    exclude_student_ids: list[str] = []
+
+
+@router.post("/{org_id}/promote")
+async def promote_students(
+    org_id: uuid.UUID, payload: GradePromotionRequest, current_user: CurrentUser, db: DBSession
+):
+    """Promote students from one grade to the next. Org admin only."""
+    await _require_org_admin(current_user.id, org_id, db)
+
+    from app.models.classes import ClassStudent, Class, GradePromotion
+
+    # Get org for academic year
+    org_result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = org_result.scalar_one_or_none()
+    if not org:
+        raise NotFoundException("Organization not found")
+
+    # Find all students in the org with matching grade (and optionally section)
+    q = (
+        select(User)
+        .join(OrgMember, OrgMember.user_id == User.id)
+        .where(
+            OrgMember.org_id == org_id,
+            OrgMember.role == "student",
+            OrgMember.status == "active",
+            User.grade == payload.from_grade,
+        )
+    )
+    if payload.section:
+        q = q.where(User.section == payload.section)
+
+    result = await db.execute(q)
+    students = result.scalars().all()
+
+    exclude_set = set(payload.exclude_student_ids)
+    promoted = []
+    excluded = []
+
+    for student in students:
+        if str(student.id) in exclude_set:
+            excluded.append({"id": str(student.id), "name": student.name, "email": student.email})
+            continue
+
+        old_grade = student.grade
+        old_section = student.section
+
+        # Update student grade and section
+        student.grade = payload.to_grade
+        if payload.new_section is not None:
+            student.section = payload.new_section
+
+        # Remove from all current class enrollments (classes in this org)
+        class_ids_result = await db.execute(
+            select(Class.id).where(Class.org_id == org_id, Class.is_active == True)
+        )
+        org_class_ids = [r[0] for r in class_ids_result.all()]
+        if org_class_ids:
+            enrollments_result = await db.execute(
+                select(ClassStudent).where(
+                    ClassStudent.student_id == student.id,
+                    ClassStudent.class_id.in_(org_class_ids),
+                )
+            )
+            for enrollment in enrollments_result.scalars().all():
+                await db.delete(enrollment)
+
+        # Create audit record
+        db.add(GradePromotion(
+            org_id=org_id,
+            student_id=student.id,
+            from_grade=old_grade,
+            to_grade=payload.to_grade,
+            from_section=old_section,
+            to_section=payload.new_section or old_section,
+            academic_year=org.current_academic_year,
+            promoted_by=current_user.id,
+        ))
+
+        promoted.append({
+            "id": str(student.id),
+            "name": student.name,
+            "email": student.email,
+            "from_grade": old_grade,
+            "to_grade": payload.to_grade,
+        })
+
+    await db.commit()
+    return {
+        "promoted_count": len(promoted),
+        "excluded_count": len(excluded),
+        "promoted": promoted,
+        "excluded": excluded,
+    }

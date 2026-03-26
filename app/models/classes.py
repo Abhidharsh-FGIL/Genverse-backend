@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Boolean, Integer, DateTime, Text, Float, func, ForeignKey, Enum as SAEnum
+from sqlalchemy import String, Boolean, Integer, DateTime, Text, Float, func, ForeignKey, Enum as SAEnum, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -25,6 +25,7 @@ class Class(Base):
     join_code: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
     teacher_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False, index=True)
     color: Mapped[str | None] = mapped_column(String(20))
+    academic_year: Mapped[str | None] = mapped_column(String(20))
     description: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -75,6 +76,7 @@ class Assignment(Base):
     points: Mapped[int] = mapped_column(Integer, default=100)
     rubric_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("rubrics.id"))
     lesson_plan_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("lesson_plans.id"), nullable=True)
+    assignment_type: Mapped[str] = mapped_column(String(20), default="assignment")  # "assignment" or "manual_exam"
     status: Mapped[str] = mapped_column(ASSIGNMENT_STATUS, default="draft")
     questions: Mapped[dict | None] = mapped_column(JSONB)  # Array of Question objects
     attachments: Mapped[dict | None] = mapped_column(JSONB)  # Array of {name, url, type}
@@ -219,3 +221,40 @@ class PendingClassEnrollment(Base):
     roll_no: Mapped[str | None] = mapped_column(String(20))
     invited_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GradeSectionTeacher(Base):
+    """Maps a teacher as the class teacher (homeroom teacher) for a specific grade+section.
+    One class teacher per grade+section per org per academic year."""
+    __tablename__ = "grade_section_teachers"
+    __table_args__ = (
+        UniqueConstraint("org_id", "grade", "section", "academic_year", name="uq_grade_section_teacher"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    teacher_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    grade: Mapped[int] = mapped_column(Integer, nullable=False)
+    section: Mapped[str] = mapped_column(String(50), nullable=False)
+    board: Mapped[str | None] = mapped_column(String(50))
+    academic_year: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    teacher: Mapped["User"] = relationship()  # noqa: F821
+    organization: Mapped["Organization"] = relationship()  # noqa: F821
+
+
+class GradePromotion(Base):
+    """Audit trail for student grade promotions."""
+    __tablename__ = "grade_promotions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    student_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    from_grade: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_grade: Mapped[int] = mapped_column(Integer, nullable=False)
+    from_section: Mapped[str | None] = mapped_column(String(50))
+    to_section: Mapped[str | None] = mapped_column(String(50))
+    academic_year: Mapped[str | None] = mapped_column(String(20))
+    promoted_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
+    promoted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

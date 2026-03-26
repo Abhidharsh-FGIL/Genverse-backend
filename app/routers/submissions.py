@@ -5,6 +5,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, status, UploadFile, File, Query
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.classes import Submission, Assignment
@@ -23,6 +24,7 @@ router = APIRouter()
 class SubmissionPatchRequest(BaseModel):
     grade: Optional[Any] = None
     status: Optional[str] = None
+    files: Optional[Any] = None
     remediation_plan: Optional[Any] = None
 
 
@@ -66,6 +68,44 @@ async def create_submission(payload: SubmissionCreate, current_user: CurrentUser
     return submission
 
 
+class TeacherCreateSubmissionRequest(BaseModel):
+    assignment_id: str
+    student_id: str
+
+
+@router.post("/teacher-create", status_code=status.HTTP_201_CREATED)
+async def teacher_create_submission(payload: TeacherCreateSubmissionRequest, current_user: CurrentUser, db: DBSession):
+    """Teacher creates a submission record for a student (used for manual exams)."""
+    assignment_result = await db.execute(
+        select(Assignment).where(Assignment.id == uuid.UUID(payload.assignment_id))
+    )
+    assignment = assignment_result.scalar_one_or_none()
+    if not assignment:
+        raise NotFoundException("Assignment not found")
+
+    student_id = uuid.UUID(payload.student_id)
+
+    existing = await db.execute(
+        select(Submission).where(
+            Submission.assignment_id == assignment.id,
+            Submission.student_id == student_id,
+        )
+    )
+    existing_sub = existing.scalar_one_or_none()
+    if existing_sub:
+        return {"id": str(existing_sub.id), "student_id": str(existing_sub.student_id), "status": existing_sub.status}
+
+    submission = Submission(
+        assignment_id=assignment.id,
+        student_id=student_id,
+        status="pending",
+    )
+    db.add(submission)
+    await db.commit()
+    await db.refresh(submission)
+    return {"id": str(submission.id), "student_id": str(submission.student_id), "status": submission.status}
+
+
 @router.post("/{submission_id}/files")
 async def upload_submission_file(
     submission_id: uuid.UUID,
@@ -77,8 +117,32 @@ async def upload_submission_file(
     submission = result.scalar_one_or_none()
     if not submission:
         raise NotFoundException("Submission not found")
+
+    # Allow the student, the class teacher, or org admin to upload files
     if submission.student_id != current_user.id:
-        raise ForbiddenException("Not your submission")
+        # Check if user is the teacher of this class or an org admin
+        from app.models.classes import Class
+        from app.models.organization import OrgMember
+        assignment_result = await db.execute(select(Assignment).where(Assignment.id == submission.assignment_id))
+        assignment = assignment_result.scalar_one_or_none()
+        is_teacher = assignment and assignment.class_id and False  # default
+        if assignment:
+            class_result = await db.execute(select(Class).where(Class.id == assignment.class_id))
+            cls = class_result.scalar_one_or_none()
+            if cls:
+                is_teacher = cls.teacher_id == current_user.id
+                if not is_teacher and cls.org_id:
+                    admin_check = await db.execute(
+                        select(OrgMember).where(
+                            OrgMember.org_id == cls.org_id,
+                            OrgMember.user_id == current_user.id,
+                            OrgMember.role == "org_admin",
+                            OrgMember.status == "active",
+                        )
+                    )
+                    is_teacher = admin_check.scalar_one_or_none() is not None
+        if not is_teacher:
+            raise ForbiddenException("Not authorized to upload files for this submission")
 
     storage = StorageService()
     file_info = await storage.upload_file(
@@ -86,9 +150,10 @@ async def upload_submission_file(
         bucket="assignment-files",
         prefix=str(submission_id),
     )
-    current_files = submission.files or []
+    current_files = list(submission.files or [])
     current_files.append(file_info)
     submission.files = current_files
+    flag_modified(submission, "files")
     await db.commit()
     return {"file": file_info, "message": "File uploaded"}
 
@@ -159,6 +224,9 @@ async def patch_submission(
         submission.graded_at = datetime.now(timezone.utc)
     if payload.status is not None:
         submission.status = payload.status
+    if payload.files is not None:
+        submission.files = payload.files
+        flag_modified(submission, "files")
     if payload.remediation_plan is not None:
         submission.remediation_plan = payload.remediation_plan
 

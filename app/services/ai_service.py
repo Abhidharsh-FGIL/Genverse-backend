@@ -4928,6 +4928,101 @@ Return ONLY valid JSON. No markdown fences."""
                 }
             ]
 
+    async def generate_student_performance_summary(self, student_data: dict) -> dict:
+        """Generate AI-powered detailed performance summary for a student across subjects."""
+        subject_lines = []
+        for subj in student_data.get("subjects", []):
+            assignments_info = []
+            for a in subj.get("assignments", []):
+                atype = "Manual Exam" if a.get("assignment_type") == "manual_exam" else "Assignment"
+                topic_str = f" [Topic: {a['topic']}]" if a.get("topic") else ""
+                score_str = f"{a['score']}/{a['max_score']} ({a['percentage']}%)" if a.get("score") is not None else a.get("status", "pending")
+                assignments_info.append(f"    - [{atype}]{topic_str} {a['title']}: {score_str}")
+            subject_lines.append(
+                f"  {subj['subject']} (Avg: {subj.get('average_percentage', 'N/A')}%, "
+                f"{subj.get('graded', 0)}/{subj.get('total_assignments', 0)} graded):\n" +
+                "\n".join(assignments_info)
+            )
+        subjects_text = "\n".join(subject_lines) or "No subject data available."
+
+        # Topic mastery data
+        mastery_lines = []
+        for m in student_data.get("topic_mastery", []):
+            mastery_lines.append(
+                f"  {m['subject']} > {m['topic']}: mastery={m['mastery_level']}%, "
+                f"attempts={m['attempts_count']}, correct={m['correct_count']}, trend={m['trend']}"
+            )
+        mastery_text = "\n".join(mastery_lines) if mastery_lines else "No topic mastery data available."
+
+        prompt = f"""You are an expert educational analyst. Provide a DETAILED and COMPREHENSIVE analysis of this student's academic performance.
+
+Student: {student_data.get('student_name', 'Unknown')}
+Grade: {student_data.get('grade', 'N/A')}, Section: {student_data.get('section', 'N/A')}
+Overall Percentage: {student_data.get('overall_percentage', 'N/A')}%
+
+Subject-wise Performance:
+{subjects_text}
+
+Topic Mastery Data:
+{mastery_text}
+
+Return a JSON object with this EXACT structure:
+{{
+  "summary": "3-4 sentence overall assessment of the student",
+  "momentum": "improving | steady | declining",
+  "subject_analysis": [
+    {{
+      "subject": "Mathematics",
+      "overall_grade": "A/B/C/D/F based on percentage",
+      "percentage": 85,
+      "summary": "2-3 sentence analysis of performance in this subject",
+      "strong_topics": [
+        {{"topic": "Algebra", "detail": "Why this is a strength"}}
+      ],
+      "weak_topics": [
+        {{"topic": "Trigonometry", "detail": "Specific struggles observed", "suggestion": "What to do to improve"}}
+      ],
+      "assignment_insights": [
+        {{"title": "Assessment 1", "observation": "Brief note on performance"}}
+      ]
+    }}
+  ],
+  "strengths": ["overall strength 1", "overall strength 2"],
+  "areas_to_improve": ["area 1", "area 2"],
+  "recommendations": [
+    {{"title": "Short title", "detail": "Specific actionable recommendation with reasoning"}},
+    {{"title": "Short title", "detail": "Another recommendation"}}
+  ],
+  "learning_style_note": "Brief observation about the student's learning patterns if detectable from the data"
+}}
+
+IMPORTANT RULES:
+- For subject_analysis, include EVERY subject the student is enrolled in.
+- Infer topics from assignment titles/topics when topic mastery data is unavailable.
+- Be specific — reference actual assignment names, scores, and percentages.
+- For weak_topics, always include a concrete suggestion.
+- Recommendations should be actionable and specific to this student's data, not generic advice.
+- If a subject has no graded work, still analyze it noting the lack of engagement.
+Return ONLY valid JSON. No markdown fences."""
+
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            return json.loads(cleaned)
+        except Exception:
+            return {
+                "summary": response[:500] if response else "Unable to generate summary.",
+                "strengths": [],
+                "areas_to_improve": [],
+                "recommendations": [],
+                "momentum": "steady",
+                "subject_analysis": [],
+            }
+
     async def generate_audiobook(
         self,
         ebook_json: dict | None,

@@ -22,6 +22,8 @@ from app.models.classes import (
     Quiz,
     QuizAttempt,
     PendingClassEnrollment,
+    GradeSectionTeacher,
+    GradePromotion,
 )
 from app.models.assessment import (
     PracticeAssessment,
@@ -71,7 +73,7 @@ __all__ = [
     "SubscriptionAddon", "FeatureLimit", "UsageCounter",
     "Class", "ClassStudent", "ClassTeacher", "Assignment", "Submission",
     "Rubric", "LessonPlan", "Announcement", "AnnouncementComment", "Quiz", "QuizAttempt",
-    "PendingClassEnrollment",
+    "PendingClassEnrollment", "GradeSectionTeacher", "GradePromotion",
     "PracticeAssessment", "AssessmentAttempt", "PersonalAssessmentHistory",
     "TopicMastery", "IntegrityLog",
     "EvaluationQuestionPaper", "EvaluationPaperSubject", "EvaluationPaperChapter",

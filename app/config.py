@@ -102,7 +102,7 @@ class Settings(BaseSettings):
         return "https://api-preprod.phonepe.com/apis/pg-sandbox"
 
     # Frontend / Backend URLs
-    FRONTEND_URL: str = "http://localhost:8080"
+    FRONTEND_URL: str = "http://localhost:4200"
     BACKEND_URL: str = "http://localhost:8000"
 
     # CORS

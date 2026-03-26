@@ -642,6 +642,94 @@ async def get_learning_curve(
     )
 
 
+@router.get("/student-ai-analysis/{student_id}")
+async def get_student_ai_analysis(
+    student_id: str,
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+):
+    """Fetch the saved AI analysis for a student. Returns null if none exists."""
+    from app.models.insights import StudentAiAnalysis
+
+    parsed_org = _parse_org_id(org_id)
+    sid = uuid.UUID(student_id)
+    q = select(StudentAiAnalysis).where(StudentAiAnalysis.student_id == sid)
+    if parsed_org:
+        q = q.where(StudentAiAnalysis.org_id == parsed_org)
+    else:
+        q = q.where(StudentAiAnalysis.org_id.is_(None))
+    row = (await db.execute(q)).scalars().first()
+    if not row:
+        return None
+    return {
+        "analysis": row.analysis_json,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+@router.post("/student-performance-summary")
+async def generate_student_performance_summary(
+    payload: dict,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Generate AI-powered detailed student performance summary and persist to DB."""
+    from app.models.assessment import TopicMastery
+    from app.models.insights import StudentAiAnalysis
+
+    student_id = payload.get("student_id")
+    org_id_raw = payload.get("org_id")
+    parsed_org = _parse_org_id(org_id_raw) if org_id_raw else (
+        current_user.org_id if hasattr(current_user, "org_id") else None
+    )
+
+    topic_mastery_data = []
+    if student_id:
+        rows = (await db.execute(
+            select(TopicMastery).where(TopicMastery.user_id == student_id)
+        )).scalars().all()
+        topic_mastery_data = [
+            {
+                "subject": m.subject,
+                "topic": m.topic,
+                "mastery_level": m.mastery_level,
+                "attempts_count": m.attempts_count,
+                "correct_count": m.correct_count,
+                "trend": m.trend,
+            }
+            for m in rows
+        ]
+
+    payload["topic_mastery"] = topic_mastery_data
+    ai = AIService()
+    result = await ai.generate_student_performance_summary(payload)
+
+    # Persist to DB (upsert — one per student per org)
+    if student_id:
+        sid = uuid.UUID(student_id)
+        q = select(StudentAiAnalysis).where(StudentAiAnalysis.student_id == sid)
+        if parsed_org:
+            q = q.where(StudentAiAnalysis.org_id == parsed_org)
+        else:
+            q = q.where(StudentAiAnalysis.org_id.is_(None))
+        existing = (await db.execute(q)).scalars().first()
+        if existing:
+            existing.analysis_json = result
+            existing.generated_by = current_user.id
+            existing.updated_at = datetime.now(timezone.utc)
+        else:
+            db.add(StudentAiAnalysis(
+                student_id=sid,
+                org_id=parsed_org,
+                analysis_json=result,
+                generated_by=current_user.id,
+            ))
+        await db.commit()
+
+    return result
+
+
 @router.post("/class-recommendations", response_model=list[ClassRecommendationItem])
 async def generate_class_recommendations(
     payload: ClassRecommendationRequest,

@@ -41,6 +41,7 @@ class User(Base):
     employee_id: Mapped[str | None] = mapped_column(String(50))
     department: Mapped[str | None] = mapped_column(String(100))
     qualification: Mapped[str | None] = mapped_column(String(255))
+    section: Mapped[str | None] = mapped_column(String(50))
     roll_number: Mapped[str | None] = mapped_column(String(50))
     parent_name: Mapped[str | None] = mapped_column(String(255))
     parent_phone: Mapped[str | None] = mapped_column(String(20))

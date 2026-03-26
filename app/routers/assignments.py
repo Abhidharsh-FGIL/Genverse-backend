@@ -36,6 +36,7 @@ async def create_assignment(payload: AssignmentCreate, current_user: CurrentUser
         questions=payload.questions,
         attachments=payload.attachments,
         target_student_ids=payload.target_student_ids,
+        assignment_type=payload.assignment_type,
         created_by=current_user.id,
     )
     db.add(assignment)

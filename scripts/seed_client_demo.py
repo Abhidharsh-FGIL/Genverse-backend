@@ -26,7 +26,7 @@ from app.core.security import hash_password
 
 PASSWORD = "Client@123"
 
-# ── Organization definitions ─────────────────────────────────────────────────
+# -- Organization definitions ------------------------------------------------─
 
 ORGS = [
     {
@@ -69,6 +69,10 @@ async def _create_user(db, email, password, name, now, period_end):
         hashed_password=hash_password(password),
         name=name,
         language="en",
+        auth_provider="email",
+        onboarding_completed=True,
+        xp=0,
+        streak=0,
         is_active=True,
     ))
     await db.flush()
@@ -210,7 +214,7 @@ async def _seed_org(db, data, now, period_end):
         ))
         print(f"  [insert] org '{data['org_name']}' + subscription ({data['plan']})")
 
-    # ── 2 Teachers ──
+    # -- 2 Teachers --
     for i in range(1, 3):
         await _ensure_org_member(
             db, org_id,
@@ -219,7 +223,7 @@ async def _seed_org(db, data, now, period_end):
             "teacher", now, period_end,
         )
 
-    # ── 5 Students ──
+    # -- 5 Students --
     for i in range(1, 6):
         await _ensure_org_member(
             db, org_id,
@@ -235,7 +239,7 @@ async def seed():
         period_end = now + timedelta(days=365)  # 1 year for demo
 
         for data in ORGS:
-            print(f"\n── {data['org_name']} ({data['plan']}) ──")
+            print(f"\n-- {data['org_name']} ({data['plan']}) --")
             await _seed_org(db, data, now, period_end)
 
         await db.commit()
@@ -246,7 +250,7 @@ async def seed():
             slug = data["slug"]
             plan_label = "Org Pro" if not data["has_evaluation"] else "Org Pro + Evaluation Hub"
             pts = data["points_balance"]
-            print(f"\n── {data['org_name']} ({plan_label}) ──")
+            print(f"\n-- {data['org_name']} ({plan_label}) --")
             print(f"  {data['admin_email']:<45} / {PASSWORD}  (Admin, {pts} pts)")
             for i in range(1, 3):
                 email = f"teacher{i}-{slug}@genverse.dev"

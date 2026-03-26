@@ -25,6 +25,7 @@ class ClassUpdate(BaseModel):
     color: Optional[str] = None
     description: Optional[str] = None
     is_active: Optional[bool] = None
+    teacher_id: Optional[str] = None
 
 
 class ClassResponse(BaseModel):
@@ -42,6 +43,8 @@ class ClassResponse(BaseModel):
     is_active: bool
     student_count: int = 0
     org_id: Optional[uuid.UUID] = None
+    academic_year: Optional[str] = None
+    is_class_teacher_view: bool = False
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -72,6 +75,7 @@ class AssignmentCreate(BaseModel):
     points: int = 100
     rubric_id: Optional[str] = None
     lesson_plan_id: Optional[str] = None
+    assignment_type: str = "assignment"  # "assignment" or "manual_exam"
     status: str = "draft"
     questions: Optional[List[Any]] = None
     attachments: Optional[List[Any]] = None
@@ -102,6 +106,7 @@ class AssignmentResponse(BaseModel):
     points: int
     rubric_id: Optional[uuid.UUID] = None
     lesson_plan_id: Optional[uuid.UUID] = None
+    assignment_type: str = "assignment"
     status: str
     questions: Optional[Any] = None
     attachments: Optional[Any] = None

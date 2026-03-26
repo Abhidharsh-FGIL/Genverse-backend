@@ -122,6 +122,89 @@ async def run_migrations() -> None:
                 await conn.execute(text(alter_sql))
                 await conn.execute(text(index_sql))
 
+        # Add section to profiles if missing
+        sec_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'profiles' AND column_name = 'section'"
+        ))
+        if not sec_exists.scalar():
+            await conn.execute(text(
+                "ALTER TABLE profiles ADD COLUMN section VARCHAR(50)"
+            ))
+
+        # Add current_academic_year to organizations if missing
+        cay_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'organizations' AND column_name = 'current_academic_year'"
+        ))
+        if not cay_exists.scalar():
+            await conn.execute(text(
+                "ALTER TABLE organizations ADD COLUMN current_academic_year VARCHAR(20)"
+            ))
+
+        # Add academic_year to classes if missing
+        clay_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'classes' AND column_name = 'academic_year'"
+        ))
+        if not clay_exists.scalar():
+            await conn.execute(text(
+                "ALTER TABLE classes ADD COLUMN academic_year VARCHAR(20)"
+            ))
+
+        # Create grade_section_teachers table if it doesn't exist
+        gst_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'grade_section_teachers'"
+        ))
+        if not gst_exists.scalar():
+            await conn.execute(text("""
+                CREATE TABLE grade_section_teachers (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                    teacher_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                    grade INTEGER NOT NULL,
+                    section VARCHAR(50) NOT NULL,
+                    board VARCHAR(50),
+                    academic_year VARCHAR(20) NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    CONSTRAINT uq_grade_section_teacher UNIQUE (org_id, grade, section, academic_year)
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gst_org ON grade_section_teachers(org_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gst_teacher ON grade_section_teachers(teacher_id)"))
+
+        # Create grade_promotions table if it doesn't exist
+        gp_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'grade_promotions'"
+        ))
+        if not gp_exists.scalar():
+            await conn.execute(text("""
+                CREATE TABLE grade_promotions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                    student_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                    from_grade INTEGER NOT NULL,
+                    to_grade INTEGER NOT NULL,
+                    from_section VARCHAR(50),
+                    to_section VARCHAR(50),
+                    academic_year VARCHAR(20),
+                    promoted_by UUID NOT NULL REFERENCES profiles(id),
+                    promoted_at TIMESTAMPTZ DEFAULT now()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gp_org ON grade_promotions(org_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gp_student ON grade_promotions(student_id)"))
+
+        # Add assignment_type to assignments if missing
+        at_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'assignments' AND column_name = 'assignment_type'"
+        ))
+        if not at_exists.scalar():
+            await conn.execute(text(
+                "ALTER TABLE assignments ADD COLUMN assignment_type VARCHAR(20) DEFAULT 'assignment'"
+            ))
+
         # Add max_file_size_mb to plan_definitions if missing
         mfs_exists = await conn.execute(text(
             "SELECT 1 FROM information_schema.columns "

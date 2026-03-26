@@ -24,6 +24,7 @@ class Organization(Base):
     locked_board: Mapped[str | None] = mapped_column(String(50))
     enforce_academic_context: Mapped[bool] = mapped_column(Boolean, default=False)
     default_theme: Mapped[str | None] = mapped_column(String(50))
+    current_academic_year: Mapped[str | None] = mapped_column(String(20))
     allowed_boards: Mapped[list | None] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

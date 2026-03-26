@@ -4,7 +4,7 @@ Run: python -m scripts.seed_badges
 """
 import asyncio
 from sqlalchemy import select
-from app.database import async_session
+from app.database import AsyncSessionLocal as async_session
 from app.models.gamification import Badge
 
 BADGES = [

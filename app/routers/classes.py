@@ -8,8 +8,9 @@ from typing import Optional
 from sqlalchemy import select, func, or_
 
 from app.dependencies import DBSession, CurrentUser
-from app.models.classes import Class, ClassStudent, ClassTeacher, Assignment, Submission, PendingClassEnrollment
+from app.models.classes import Class, ClassStudent, ClassTeacher, Assignment, Submission, PendingClassEnrollment, GradeSectionTeacher
 from app.models.user import User
+from app.models.organization import Organization, OrgMember
 from app.schemas.classes import (
     ClassCreate, ClassUpdate, ClassResponse, ClassStudentResponse, JoinClassRequest,
     AssignmentResponse, SubmissionResponse,
@@ -80,6 +81,13 @@ async def create_class(payload: ClassCreate, current_user: CurrentUser, db: DBSe
             )
         assigned_teacher_id = tid
 
+    # Resolve org and auto-set academic year
+    resolved_org_id = uuid.UUID(payload.org_id) if payload.org_id else None
+    academic_year = None
+    if resolved_org_id:
+        org_result = await db.execute(select(Organization.current_academic_year).where(Organization.id == resolved_org_id))
+        academic_year = org_result.scalar_one_or_none()
+
     class_ = Class(
         name=payload.name,
         board=payload.board,
@@ -90,7 +98,8 @@ async def create_class(payload: ClassCreate, current_user: CurrentUser, db: DBSe
         teacher_id=assigned_teacher_id,
         color=payload.color,
         description=payload.description,
-        org_id=uuid.UUID(payload.org_id) if payload.org_id else None,
+        org_id=resolved_org_id,
+        academic_year=academic_year,
     )
     db.add(class_)
     await db.commit()
@@ -167,9 +176,33 @@ async def list_classes(
     co_classes = co_result.scalars().all()
     all_classes = {c.id: c for c in list(classes) + list(co_classes)}
 
+    # Also include classes where the user is a class teacher for matching grade+section
+    class_teacher_view_ids = set()
+    gst_result = await db.execute(
+        select(GradeSectionTeacher).where(GradeSectionTeacher.teacher_id == current_user.id)
+    )
+    gst_assignments = gst_result.scalars().all()
+    for gst in gst_assignments:
+        gst_classes_q = select(Class).where(
+            Class.org_id == gst.org_id,
+            Class.grade == gst.grade,
+            Class.section == gst.section,
+            Class.is_active == True,
+        )
+        if gst.academic_year:
+            gst_classes_q = gst_classes_q.where(Class.academic_year == gst.academic_year)
+        gst_classes_result = await db.execute(gst_classes_q)
+        for c in gst_classes_result.scalars().all():
+            if c.id not in all_classes:
+                all_classes[c.id] = c
+                class_teacher_view_ids.add(c.id)
+
     responses = []
     for c in all_classes.values():
-        responses.append(await _build_class_response(c, db))
+        r = await _build_class_response(c, db)
+        if c.id in class_teacher_view_ids:
+            r.is_class_teacher_view = True
+        responses.append(r)
     return responses
 
 
@@ -360,6 +393,8 @@ async def update_class(
         raise ForbiddenException("Only an org admin can restore an archived class")
 
     for key, value in updates.items():
+        if key == "teacher_id" and value:
+            value = uuid.UUID(value)
         setattr(class_, key, value)
     await db.commit()
     await db.refresh(class_)
@@ -842,11 +877,14 @@ async def get_class_assignments(
     current_user: CurrentUser,
     db: DBSession,
     status_filter: str | None = Query(None, alias="status"),
+    type_filter: str | None = Query(None, alias="type"),
 ):
-    """Get all assignments for a specific class."""
+    """Get all assignments for a specific class. Optionally filter by type."""
     q = select(Assignment).where(Assignment.class_id == class_id)
     if status_filter:
         q = q.where(Assignment.status == status_filter)
+    if type_filter:
+        q = q.where(Assignment.assignment_type == type_filter)
     q = q.order_by(Assignment.created_at.desc())
     result = await db.execute(q)
     return result.scalars().all()
@@ -878,8 +916,132 @@ async def get_class_submissions(class_id: uuid.UUID, current_user: CurrentUser, 
             "student_email": user.email,
             "submitted_at": sub.submitted_at.isoformat() if sub.submitted_at else None,
             "status": sub.status,
+            "files": sub.files,
             "text_response": sub.text_response,
             "grade": sub.grade,
             "remediation_plan": sub.remediation_plan,
         })
     return submissions
+
+
+# ---- Auto-map: Suggest students matching class grade/section/board ----
+
+@router.get("/{class_id}/suggested-students")
+async def get_suggested_students(class_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    """Return org students whose grade, section, and board match the class, excluding already-enrolled."""
+    class_result = await db.execute(select(Class).where(Class.id == class_id))
+    class_ = class_result.scalar_one_or_none()
+    if not class_:
+        raise NotFoundException("Class not found")
+    if not class_.org_id:
+        return []
+
+    # Get already-enrolled student IDs
+    enrolled_result = await db.execute(
+        select(ClassStudent.student_id).where(ClassStudent.class_id == class_id)
+    )
+    enrolled_ids = {r[0] for r in enrolled_result.all()}
+
+    # Query org students matching grade + section + board
+    q = (
+        select(User)
+        .join(OrgMember, OrgMember.user_id == User.id)
+        .where(
+            OrgMember.org_id == class_.org_id,
+            OrgMember.role == "student",
+            OrgMember.status == "active",
+            User.grade == class_.grade,
+            User.is_active == True,
+        )
+    )
+    if class_.section:
+        q = q.where(User.section == class_.section)
+    if class_.board:
+        q = q.where(User.board_preference == class_.board)
+
+    result = await db.execute(q)
+    students = result.scalars().all()
+
+    return [
+        {
+            "id": str(s.id),
+            "name": s.name,
+            "email": s.email,
+            "roll_number": s.roll_number,
+            "grade": s.grade,
+            "section": s.section,
+            "board_preference": s.board_preference,
+        }
+        for s in students
+        if s.id not in enrolled_ids
+    ]
+
+
+class BulkAddStudentsRequest(BaseModel):
+    student_ids: list[str]
+
+
+@router.post("/{class_id}/students/bulk", status_code=status.HTTP_201_CREATED)
+async def bulk_add_students(
+    class_id: uuid.UUID, payload: BulkAddStudentsRequest, current_user: CurrentUser, db: DBSession
+):
+    """Bulk-add students to a class by their user IDs."""
+    class_result = await db.execute(select(Class).where(Class.id == class_id))
+    class_ = class_result.scalar_one_or_none()
+    if not class_:
+        raise NotFoundException("Class not found")
+    if not class_.is_active:
+        raise HTTPException(status_code=400, detail="Cannot add students to an archived class")
+
+    # Get already-enrolled student IDs
+    enrolled_result = await db.execute(
+        select(ClassStudent.student_id).where(ClassStudent.class_id == class_id)
+    )
+    enrolled_ids = {r[0] for r in enrolled_result.all()}
+
+    added = []
+    skipped = []
+    for sid_str in payload.student_ids:
+        try:
+            sid = uuid.UUID(sid_str)
+        except ValueError:
+            skipped.append({"id": sid_str, "reason": "invalid UUID"})
+            continue
+
+        if sid in enrolled_ids:
+            skipped.append({"id": sid_str, "reason": "already enrolled"})
+            continue
+
+        # Verify user exists
+        user_result = await db.execute(select(User).where(User.id == sid))
+        user = user_result.scalar_one_or_none()
+        if not user:
+            skipped.append({"id": sid_str, "reason": "user not found"})
+            continue
+
+        enrollment = ClassStudent(
+            class_id=class_id,
+            student_id=sid,
+            roll_no=user.roll_number,
+        )
+        db.add(enrollment)
+        enrolled_ids.add(sid)
+
+        # Ensure OrgMember record exists
+        if class_.org_id:
+            existing_member = await db.execute(
+                select(OrgMember).where(
+                    OrgMember.org_id == class_.org_id,
+                    OrgMember.user_id == sid,
+                )
+            )
+            member = existing_member.scalar_one_or_none()
+            if member:
+                member.status = "active"
+            else:
+                db.add(OrgMember(org_id=class_.org_id, user_id=sid, role="student", status="active"))
+
+        added.append({"id": sid_str, "name": user.name, "email": user.email})
+
+    await db.commit()
+    return {"added": len(added), "skipped": len(skipped), "added_students": added, "skipped_students": skipped}

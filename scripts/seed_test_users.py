@@ -21,7 +21,7 @@ from app.models.organization import Organization, OrgMember
 from app.core.security import hash_password
 
 
-# ── Individual test users ────────────────────────────────────────────────────
+# --Individual test users ----------------------------------------------------
 
 TEST_USERS = [
     {
@@ -54,7 +54,7 @@ TEST_USERS = [
 ]
 
 
-# ── Organization admin test users ────────────────────────────────────────────
+# --Organization admin test users --------------------------------------------
 
 ORG_ADMIN_USERS = [
     {
@@ -185,6 +185,10 @@ async def _seed_individual_user(db, data, now, period_end):
         hashed_password=hash_password(data["password"]),
         name=data["name"],
         language="en",
+        auth_provider="email",
+        onboarding_completed=True,
+        xp=0,
+        streak=0,
         is_active=True,
     ))
     await db.flush()
@@ -217,6 +221,10 @@ async def _create_user(db, email, password, name, now, period_end):
         hashed_password=hash_password(password),
         name=name,
         language="en",
+        auth_provider="email",
+        onboarding_completed=True,
+        xp=0,
+        streak=0,
         is_active=True,
     ))
     await db.flush()
@@ -461,38 +469,38 @@ async def seed():
         now = datetime.now(timezone.utc)
         period_end = now + timedelta(days=30)
 
-        print("── Individual users ──")
+        print("-- Individual users --")
         for data in TEST_USERS:
             await _seed_individual_user(db, data, now, period_end)
 
-        print("\n── Organization admins ──")
+        print("\n-- Organization admins --")
         for data in ORG_ADMIN_USERS:
             await _seed_org_admin(db, data, now, period_end)
 
         await db.commit()
 
         print("\nDone. Test users ready:")
-        print("\n── Personal workspace ──")
+        print("\n--Personal workspace --")
         print("  freeuser@genverse.dev          / Test@123  (Free plan, 100 pts)")
         print("  plususer@genverse.dev          / Test@123  (Plus plan, 800 pts)")
         print("  prouser@genverse.dev           / Test@123  (Pro plan, 2000 pts)")
-        print("\n── Org Basic (GenVerse only) ──")
+        print("\n--Org Basic (GenVerse only) --")
         print("  orgbasic@genverse.dev          / Test@123  (Admin, 5000 pts)")
         print("  teacher-basic@genverse.dev     / Test@123  (Teacher)")
         print("  student-basic@genverse.dev     / Test@123  (Student)")
-        print("\n── Org Pro (GenVerse only) ──")
+        print("\n--Org Pro (GenVerse only) --")
         print("  orgpro@genverse.dev            / Test@123  (Admin, 20000 pts)")
         print("  teacher-pro@genverse.dev       / Test@123  (Teacher)")
         print("  student-pro@genverse.dev       / Test@123  (Student)")
-        print("\n── Org Basic + Evaluation Hub ──")
+        print("\n--Org Basic + Evaluation Hub --")
         print("  orgbasiceval@genverse.dev      / Test@123  (Admin, 5000 pts)")
         print("  teacher-basiceval@genverse.dev / Test@123  (Teacher)")
         print("  student-basiceval@genverse.dev / Test@123  (Student)")
-        print("\n── Org Pro + Evaluation Hub ──")
+        print("\n--Org Pro + Evaluation Hub --")
         print("  orgproeval@genverse.dev        / Test@123  (Admin, 20000 pts)")
         print("  teacher-proeval@genverse.dev   / Test@123  (Teacher)")
         print("  student-proeval@genverse.dev   / Test@123  (Student)")
-        print("\n── Evaluation Hub Only (no teacher/student) ──")
+        print("\n--Evaluation Hub Only (no teacher/student) --")
         print("  orgeval@genverse.dev           / Test@123  (Admin, 3000 pts)")
 
 

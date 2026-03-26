@@ -38,6 +38,7 @@ class OrganizationResponse(BaseModel):
     enforce_academic_context: bool
     default_theme: Optional[str] = None
     allowed_boards: Optional[List[str]] = None
+    current_academic_year: Optional[str] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -77,6 +78,7 @@ class InviteMemberRequest(BaseModel):
     employee_id: Optional[str] = None
     department: Optional[str] = None
     qualification: Optional[str] = None
+    section: Optional[str] = None
     emergency_contact_name: Optional[str] = None
     emergency_contact_phone: Optional[str] = None
     emergency_contact_relation: Optional[str] = None
