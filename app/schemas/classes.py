@@ -25,6 +25,7 @@ class ClassUpdate(BaseModel):
     color: Optional[str] = None
     description: Optional[str] = None
     is_active: Optional[bool] = None
+    teacher_id: Optional[uuid.UUID] = None
 
 
 class ClassResponse(BaseModel):
