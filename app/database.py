@@ -72,6 +72,15 @@ async def run_migrations() -> None:
     ]
 
     async with engine.begin() as conn:
+        # Ensure board_type enum has all required values
+        for val in ("CBSE", "ICSE", "IGCSE", "IB", "Cambridge", "State Board"):
+            exists = await conn.execute(text(
+                "SELECT 1 FROM pg_enum JOIN pg_type ON pg_enum.enumtypid = pg_type.oid "
+                "WHERE pg_type.typname = 'board_type' AND pg_enum.enumlabel = :val"
+            ), {"val": val})
+            if not exists.scalar():
+                await conn.execute(text(f"ALTER TYPE board_type ADD VALUE '{val}'"))
+
         # Create new tables if they don't exist
         ws_gam_exists = await conn.execute(text(
             "SELECT 1 FROM information_schema.tables WHERE table_name = 'workspace_gamification'"
