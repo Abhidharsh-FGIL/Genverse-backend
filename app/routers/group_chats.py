@@ -16,12 +16,17 @@ router = APIRouter()
 
 
 async def _check_class_membership(class_id: uuid.UUID, user_id: uuid.UUID, db: AsyncSession) -> bool:
-    """Return True if user is the class teacher, a co-teacher, or an enrolled student."""
+    """Return True if user is the class teacher, a co-teacher, an enrolled student, or an org admin."""
     from app.models.classes import ClassStudent, ClassTeacher, Class
-    teacher_result = await db.execute(
-        select(Class).where(Class.id == class_id, Class.teacher_id == user_id, Class.is_active == True)
+    from app.models.organization import OrgMember
+
+    cls_result = await db.execute(
+        select(Class).where(Class.id == class_id, Class.is_active == True)
     )
-    if teacher_result.scalar_one_or_none():
+    cls = cls_result.scalar_one_or_none()
+    if not cls:
+        return False
+    if cls.teacher_id == user_id:
         return True
     co_result = await db.execute(
         select(ClassTeacher).where(ClassTeacher.class_id == class_id, ClassTeacher.teacher_id == user_id)
@@ -33,6 +38,18 @@ async def _check_class_membership(class_id: uuid.UUID, user_id: uuid.UUID, db: A
     )
     if student_result.scalar_one_or_none():
         return True
+    # Check org admin
+    if cls.org_id:
+        admin_result = await db.execute(
+            select(OrgMember).where(
+                OrgMember.org_id == cls.org_id,
+                OrgMember.user_id == user_id,
+                OrgMember.role == "org_admin",
+                OrgMember.status == "active",
+            )
+        )
+        if admin_result.scalar_one_or_none():
+            return True
     return False
 
 

@@ -2942,6 +2942,8 @@ Return ONLY valid JSON.
         true_false_count: int = 0,
         match_count: int = 0,
         difficulty: str = "medium",
+        blooms_level: str | None = None,
+        mcq_subtypes: list | None = None,
         lesson_plan_context: dict | None = None,
         rubric_criteria: list | None = None,
         source_text: str | None = None,
@@ -2955,7 +2957,17 @@ Return ONLY valid JSON.
         """
         parts = []
         if mcq_count:
-            parts.append(f"{mcq_count} MCQ (multiple choice)")
+            mcq_label = f"{mcq_count} MCQ (multiple choice)"
+            if mcq_subtypes and len(mcq_subtypes) > 0:
+                subtype_labels = {
+                    "standard": "Standard MCQ",
+                    "case": "Case-based MCQ (passage/scenario followed by questions)",
+                    "assertion_reason": "Assertion-Reason MCQ (Assertion + Reason with options like Both A and R are true and R is the correct explanation, etc.)",
+                    "higher_order": "Higher Order Thinking MCQ (requires analysis, evaluation, or application — not simple recall)",
+                }
+                sub_parts = [subtype_labels.get(s, s) for s in mcq_subtypes]
+                mcq_label += f" — include these subtypes: {', '.join(sub_parts)}"
+            parts.append(mcq_label)
         if fib_count:
             parts.append(f"{fib_count} Fill-in-the-blank")
         if short_answer_count:
@@ -2967,6 +2979,26 @@ Return ONLY valid JSON.
         if match_count:
             parts.append(f"{match_count} Match-the-following")
         types_str = ", ".join(parts) or "5 Short answer"
+
+        # Build difficulty & Bloom's level instruction
+        difficulty_instruction = f"Difficulty: {difficulty}"
+        if difficulty == "mixed":
+            difficulty_instruction = "Difficulty: Mixed — distribute questions across easy, medium, and hard levels"
+
+        blooms_section = ""
+        if blooms_level and blooms_level != "mixed":
+            blooms_map = {
+                "remember": "Remember (recall facts, terms, concepts)",
+                "understand": "Understand (explain ideas, interpret, summarize)",
+                "apply": "Apply (use knowledge in new situations, solve problems)",
+                "analyze": "Analyze (break down information, identify patterns, compare/contrast)",
+                "evaluate": "Evaluate (justify decisions, critique, assess)",
+                "create": "Create (design, construct, produce original work)",
+            }
+            blooms_desc = blooms_map.get(blooms_level, blooms_level.capitalize())
+            blooms_section = f"\nBloom's Taxonomy Level: {blooms_desc}\nAll questions MUST target the '{blooms_level}' cognitive level. Frame questions that require students to {blooms_level} rather than simply recall.\n"
+        elif blooms_level == "mixed" or not blooms_level:
+            blooms_section = "\nBloom's Taxonomy: Mixed — distribute questions across Remember, Understand, Apply, Analyze, Evaluate, and Create levels.\n"
 
         # Build optional context sections
         lesson_plan_section = ""
@@ -3044,8 +3076,8 @@ For example, if there are 10 questions total and Topic A has 60% weight, generat
 
         prompt = f"""Generate assignment questions for a Grade {grade} {subject} class.
 Topic: {topic}
-Difficulty: {difficulty}
-Question breakdown: {types_str}
+{difficulty_instruction}
+{blooms_section}Question breakdown: {types_str}
 {source_section}{lesson_plan_section}{rubric_section}{weightage_section}
 Return a JSON object with a "questions" array. Each question MUST follow this schema exactly:
 - type: one of "mcq", "fill-blank", "short-answer", "long-answer", "true-false", "match"

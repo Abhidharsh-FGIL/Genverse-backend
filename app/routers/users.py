@@ -192,6 +192,8 @@ async def get_workspaces(current_user: CurrentUser, db: DBSession):
                 type="organization",
                 role=member.role,
                 logo_url=org.logo_url,
+                theme_color=getattr(org, 'theme_color', None),
+                branding_enabled=getattr(org, 'branding_enabled', False),
                 has_genverse=org.has_genverse,
                 has_evaluation=org.has_evaluation,
             )

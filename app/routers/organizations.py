@@ -1,7 +1,7 @@
 import uuid
 import secrets
 from datetime import date, datetime, timezone, timedelta
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Query, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -142,6 +142,31 @@ async def update_organization(
         raise NotFoundException("Organization not found")
     for key, value in payload.model_dump(exclude_unset=True).items():
         setattr(org, key, value)
+    await db.commit()
+    await db.refresh(org)
+    return org
+
+
+@router.post("/{org_id}/logo", response_model=OrganizationResponse)
+async def upload_org_logo(
+    org_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+    file: UploadFile = File(...),
+):
+    """Upload or replace the organisation logo/icon."""
+    await _require_org_admin(current_user.id, org_id, db)
+    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise NotFoundException("Organization not found")
+
+    from app.services.storage_service import StorageService
+    storage = StorageService()
+    file_info = await storage.upload_file(
+        file=file, bucket="org-logos", prefix=str(org_id)
+    )
+    org.logo_url = file_info["url"]
     await db.commit()
     await db.refresh(org)
     return org

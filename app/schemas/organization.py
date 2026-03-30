@@ -23,7 +23,9 @@ class OrganizationUpdate(BaseModel):
     locked_board: Optional[str] = None
     enforce_academic_context: Optional[bool] = None
     default_theme: Optional[str] = None
+    theme_color: Optional[str] = None
     allowed_boards: Optional[List[str]] = None
+    branding_enabled: Optional[bool] = None
 
 
 class OrganizationResponse(BaseModel):
@@ -37,7 +39,9 @@ class OrganizationResponse(BaseModel):
     locked_board: Optional[str] = None
     enforce_academic_context: bool
     default_theme: Optional[str] = None
+    theme_color: Optional[str] = None
     allowed_boards: Optional[List[str]] = None
+    branding_enabled: bool = False
     current_academic_year: Optional[str] = None
     created_at: datetime
 
@@ -135,5 +139,7 @@ class WorkspaceItem(BaseModel):
     type: str  # 'personal' | 'organization'
     role: Optional[str] = None  # org role if type is 'organization'
     logo_url: Optional[str] = None
+    theme_color: Optional[str] = None
+    branding_enabled: bool = False
     has_genverse: bool = True
     has_evaluation: bool = False

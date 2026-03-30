@@ -22,6 +22,7 @@ class StorageService:
         "past-papers": "past-papers",
         "chat-attachments": "chat-attachments",
         "public-library": "public-library",
+        "org-logos": "org-logos",
     }
 
     def _get_bucket_path(self, bucket: str) -> Path:

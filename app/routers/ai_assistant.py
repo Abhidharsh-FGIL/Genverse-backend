@@ -1574,6 +1574,8 @@ class SuggestQuestionsRequest(BaseModel):
     trueFalseCount: int = 0
     matchCount: int = 0
     difficulty: Optional[str] = "medium"
+    blooms_level: Optional[str] = None  # e.g. "remember", "understand", "apply", "analyze", "evaluate", "create"
+    mcq_subtypes: Optional[list[str]] = None  # e.g. ["standard", "case", "assertion_reason", "higher_order"]
     lesson_plan_id: Optional[str] = None
     rubric_id: Optional[str] = None
     source_text: Optional[str] = None  # Full text from a vault file for document-grounded generation
@@ -1640,6 +1642,8 @@ async def suggest_questions_for_assignment(
         true_false_count=payload.trueFalseCount,
         match_count=payload.matchCount,
         difficulty=payload.difficulty or "medium",
+        blooms_level=payload.blooms_level,
+        mcq_subtypes=payload.mcq_subtypes,
         lesson_plan_context=lesson_plan_context,
         rubric_criteria=rubric_criteria,
         source_text=payload.source_text,
