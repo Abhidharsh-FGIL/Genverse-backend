@@ -80,7 +80,7 @@ def send_verification_otp(to_email: str, otp: str) -> bool:
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
         msg = MIMEMultipart('related')
-        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['From'] = settings.MAIL_FROM_NAME
         msg['To'] = to_email
         msg['Subject'] = f"Your verification code: {otp}"
         msg.attach(MIMEText(html_body, 'html'))
@@ -155,7 +155,7 @@ def send_password_reset_email(to_email: str, reset_link: str) -> bool:
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
         msg = MIMEMultipart('related')
-        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['From'] = settings.MAIL_FROM_NAME
         msg['To'] = to_email
         msg['Subject'] = "Reset your password"
         msg.attach(MIMEText(html_body, 'html'))
@@ -226,7 +226,7 @@ def send_renewal_reminder(to_email: str, plan_name: str, expiry_date: str, renew
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
         msg = MIMEMultipart('related')
-        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['From'] = settings.MAIL_FROM_NAME
         msg['To'] = to_email
         msg['Subject'] = f"Your {plan_name} plan expires soon — renew now"
         msg.attach(MIMEText(html_body, 'html'))
@@ -332,7 +332,7 @@ async def send_assessment_invitation(
                 '''
 
                 msg = MIMEMultipart('related')
-                msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+                msg['From'] = settings.MAIL_FROM_NAME
                 msg['To'] = email
                 msg['Subject'] = subject
                 msg.attach(MIMEText(html_body, 'html'))
@@ -513,7 +513,7 @@ def send_purchase_invoice_email(
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
         msg = MIMEMultipart('related')
-        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['From'] = settings.MAIL_FROM_NAME
         msg['To'] = to_email
         msg['Subject'] = subject
         msg.attach(MIMEText(html_body, 'html'))
@@ -661,29 +661,21 @@ def send_organization_invitation_email(
     subject = f"{admin_name} invited you to join {organization_name} on {settings.MAIL_FROM_NAME}"
 
     try:
-        smtp = smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT, timeout=15)
-        smtp.ehlo()
+        smtp = smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT)
         smtp.starttls()
-        smtp.ehlo()
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
         msg = MIMEMultipart('related')
-        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['From'] = settings.MAIL_FROM_NAME
         msg['To'] = to_email
         msg['Subject'] = subject
         msg.attach(MIMEText(html_body, 'html'))
         _attach_logo(msg)
 
-        result = smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string())
+        print(smtp.sendmail(settings.MAIL_FROM, to_email, msg.as_string()))
         smtp.quit()
-        if result:
-            print(f"[EmailService] SMTP sendmail partial failure for {to_email}: {result}", flush=True)
-        else:
-            print(f"[EmailService] Invitation email sent to {to_email} for org '{organization_name}'", flush=True)
+        print(f"[EmailService] Invitation email sent to {to_email} for org '{organization_name}'", flush=True)
         return True
-    except smtplib.SMTPRecipientsRefused as e:
-        print(f"[EmailService] RECIPIENT REFUSED for {to_email}: {e.recipients}", flush=True)
-        return False
     except Exception as e:
         import traceback
         print(f"[EmailService] INVITATION EMAIL FAILED for {to_email}: {type(e).__name__}: {e}", flush=True)
@@ -771,7 +763,7 @@ def send_class_invitation_email(
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
         msg = MIMEMultipart('related')
-        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['From'] = settings.MAIL_FROM_NAME
         msg['To'] = to_email
         msg['Subject'] = f"{teacher_name} invited you to join {class_name} on {settings.MAIL_FROM_NAME}"
         msg.attach(MIMEText(html_body, 'html'))
@@ -877,7 +869,7 @@ def send_feedback_notification_email(
         smtp.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
 
         msg = MIMEMultipart('related')
-        msg['From'] = f"{settings.MAIL_FROM_NAME} <{settings.MAIL_FROM}>"
+        msg['From'] = settings.MAIL_FROM_NAME
         msg['To'] = SUPPORT_EMAIL
         msg['Subject'] = f"[Feedback] {rating_label} ({rating}/5) from {user_name}"
         msg.attach(MIMEText(html_body, 'html'))

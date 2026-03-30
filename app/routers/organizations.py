@@ -30,6 +30,22 @@ from app.config import settings
 from app.core.exceptions import NotFoundException, ForbiddenException
 from app.services.email_service import send_organization_invitation_email
 
+import logging
+logger = logging.getLogger(__name__)
+
+
+def _send_invite_email_safe(**kwargs):
+    """Wrapper to catch and log any exception from the background email task."""
+    try:
+        logger.info(f"[BG-Email] Sending org invite email to {kwargs.get('to_email')}...")
+        result = send_organization_invitation_email(**kwargs)
+        logger.info(f"[BG-Email] Result for {kwargs.get('to_email')}: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"[BG-Email] FAILED for {kwargs.get('to_email')}: {type(e).__name__}: {e}", exc_info=True)
+        return False
+
+
 router = APIRouter()
 
 
@@ -226,7 +242,7 @@ async def add_member_by_user_id(
     # Send notification email in background
     if org:
         background_tasks.add_task(
-            send_organization_invitation_email,
+            _send_invite_email_safe,
             to_email=user.email,
             admin_name=admin_name,
             organization_name=org.name,
@@ -298,7 +314,7 @@ async def invite_member(
     # Send email in background (non-blocking)
     accept_url = f"{settings.FRONTEND_URL}/genverse/accept-invite?token={token}"
     background_tasks.add_task(
-        send_organization_invitation_email,
+        _send_invite_email_safe,
         to_email=payload.email,
         admin_name=admin_name,
         organization_name=org.name,
@@ -382,7 +398,7 @@ async def bulk_invite(
 
         accept_url = f"{settings.FRONTEND_URL}/genverse/accept-invite?token={token}"
         background_tasks.add_task(
-            send_organization_invitation_email,
+            _send_invite_email_safe,
             to_email=item.email,
             admin_name=admin_name,
             organization_name=org.name,
