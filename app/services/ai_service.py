@@ -634,21 +634,37 @@ class AIService:
 
         if chat_settings.get("explain_3ways"):
             parts.append(
-                "IMPORTANT — Explain in 3 Ways: Structure your response with these three clearly labelled sections "
-                "directly inside your answer (do NOT add a separate card or section after — include all three here):\n"
+                "IMPORTANT — Explain in 3 Ways (this is SEPARATE from the content length rule above):\n"
+                "First, answer the user's question normally following the LENGTH rule above.\n"
+                "Then, AFTER your main answer, add a divider line (---) and provide these three clearly labelled sections:\n"
                 "**Analogy:** A simple, relatable analogy or metaphor that makes the concept easy to grasp.\n"
                 "**Technical:** A precise, formal definition or technical explanation.\n"
-                "**Real-World Example:** A concrete, real-world application or example of the concept in action."
+                "**Real-World Example:** A concrete, real-world application or example of the concept in action.\n"
+                "Each of these three sections should always be 3-5 lines regardless of the content length setting. "
+                "The content length setting applies ONLY to the main answer above the divider, NOT to the 3-way explanation."
+            )
+        else:
+            parts.append(
+                "IMPORTANT: Do NOT use the 'Explain in 3 Ways' format. Do NOT include Analogy/Technical/Real-World Example sections. "
+                "Even if previous messages in this conversation used that format, it is now TURNED OFF. "
+                "Give a direct, normal response without splitting into those three sections."
             )
 
         if chat_settings.get("examples"):
             parts.append("Always include concrete, real-world examples to illustrate every concept you explain.")
+        else:
+            parts.append(
+                "Do NOT add extra examples unless the user specifically asks for them. "
+                "Even if previous messages included examples, the examples setting is currently OFF."
+            )
 
         output_mode = chat_settings.get("output_mode", "text")
         if output_mode == "structured":
             parts.append("Structure your response with clear headings (##) and logical sections.")
         elif output_mode == "bullets":
             parts.append("Present information primarily using bullet points and numbered lists.")
+        else:
+            parts.append("Use normal flowing text format. Do NOT force headings or bullet-point-only structure unless it naturally fits.")
 
         if chat_settings.get("student_mode"):
             parts.append(
