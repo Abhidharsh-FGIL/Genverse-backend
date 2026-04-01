@@ -1294,13 +1294,24 @@ class AIService:
 
     async def ask_document(self, query: str, context: str, ai_context: dict | None = None) -> str:
         """RAG query against extracted document text."""
-        prompt = f"""You are a document assistant. Answer based ONLY on the provided document context.
-If the answer is not found in the context, say so.
+        _DOC_CONTEXT_LIMIT = 60000
+        prompt = f"""You are a helpful study assistant. The user has uploaded a file and is asking questions about it.
 
-Document context:
-{context[:8000]}
+RULES — you MUST follow these without exception:
+1. Answer ONLY using information explicitly present in the file content below.
+2. Do NOT add any facts, explanations, or details from your general knowledge.
+3. If the answer is not found in the file, respond: "This information is not available in the uploaded file."
+4. Do NOT speculate, infer beyond what the text states, or fill in gaps with outside knowledge.
+5. When quoting or referencing, stay faithful to the file's wording.
+6. If the question is partially answerable, answer only the part supported by the file and clearly state what is not covered.
+7. Respond naturally and directly — do NOT say "based on the document", "according to the context", "from the excerpts", or similar phrases. Just answer as if you read the file.
 
-Question: {query}
+FILE CONTENT:
+---
+{context[:_DOC_CONTEXT_LIMIT]}
+---
+
+User's question: {query}
 
 Answer:"""
         messages = [{"role": "user", "content": prompt}]
@@ -1343,7 +1354,7 @@ Answer:"""
         language: str | None = None,
     ) -> List[dict]:
         """Generate practice assessment questions as JSON — respects all config options."""
-        print(f"[Assessment] language={language}, grade={grade}, board={board}, subject={subject}", flush=True)
+        print(f"[Assessment] language={language}, grade={grade}, board={board}, subject={subject}, subtypes={mcq_subtypes}, question_types={question_types}", flush=True)
         types = question_types or ["mcq"]
 
         # ── Compute exact counts per question type ──────────────────────────
@@ -1363,12 +1374,12 @@ Answer:"""
         subtypes = mcq_subtypes or ["standard"]
         mcq_count = type_counts.get("mcq", 0)
         mcq_subtype_counts: dict = {}
-        if mcq_count > 0 and len(subtypes) > 1:
-            mcq_subtype_counts = self._distribute_questions(
-                mcq_count, {s: 1 for s in subtypes}
-            )
-        elif mcq_count > 0:
-            mcq_subtype_counts = {subtypes[0]: mcq_count}
+        if mcq_count > 0:
+            # Equal distribution across all requested subtypes
+            base_per_subtype = mcq_count // len(subtypes)
+            remainder = mcq_count % len(subtypes)
+            for i, s in enumerate(subtypes):
+                mcq_subtype_counts[s] = base_per_subtype + (1 if i < remainder else 0)
 
         # ── Build distribution section for the prompt ───────────────────────
         type_labels = {
@@ -1385,7 +1396,7 @@ Answer:"""
             dist_lines.append(f"  - {label}: {cnt} question(s)")
             if t == "mcq" and mcq_subtype_counts:
                 for s, sc in mcq_subtype_counts.items():
-                    dist_lines.append(f"      • {subtype_labels.get(s, s)}: {sc}")
+                    dist_lines.append(f"      • {subtype_labels.get(s, s)}: EXACTLY {sc} question(s)")
 
         # ── Topic / chapter distribution ────────────────────────────────────
         topics_str = ", ".join(topics) if topics else subject
@@ -1398,16 +1409,28 @@ Answer:"""
                 "\n".join(f"  - {t}: {c} question(s)" for t, c in t_counts.items())
 
         # ── Source instruction ───────────────────────────────────────────────
+        _SOURCE_CHAR_LIMIT = 60000  # ~15k tokens — fits well within Gemini/GPT context
         if source_text and source_text.strip():
             import logging as _logging
             _logging.getLogger(__name__).info(
-                "Assessment prompt: using source_text (%d chars, truncating to 12000)",
-                len(source_text),
+                "Assessment prompt: using source_text (%d chars, limit %d)",
+                len(source_text), _SOURCE_CHAR_LIMIT,
             )
+            truncated = source_text[:_SOURCE_CHAR_LIMIT]
             source_section = (
-                "SOURCE TEXT (generate questions ONLY from this content, do not use outside knowledge):\n"
-                f"---\n{source_text[:12000]}\n---"
+                "⚠️ SOURCE-ONLY MODE — CRITICAL REQUIREMENT:\n"
+                "You MUST generate ALL questions STRICTLY and EXCLUSIVELY from the source text below.\n"
+                "RULES:\n"
+                "- Every question must be directly answerable from the source text.\n"
+                "- Every correct answer must be explicitly stated or directly derivable from the source text.\n"
+                "- Every explanation must reference content from the source text.\n"
+                "- Do NOT add any fact, concept, or detail that is not present in the source text.\n"
+                "- Do NOT use your general knowledge — treat the source text as the ONLY truth.\n"
+                "- Cover different sections/topics from the source text to ensure variety.\n\n"
+                f"SOURCE TEXT:\n---\n{truncated}\n---"
             )
+            if len(source_text) > _SOURCE_CHAR_LIMIT:
+                source_section += f"\n(Source truncated from {len(source_text)} to {_SOURCE_CHAR_LIMIT} chars)"
         else:
             source_section = f"Generate questions based on your educational knowledge of: {topics_str}"
 
@@ -1449,6 +1472,19 @@ Answer:"""
         else:
             lang_section = ""
 
+        # ── Build MCQ subtype constraint for prompt ──────────────────────────
+        mcq_subtype_constraint = ""
+        if mcq_subtype_counts and len(mcq_subtype_counts) > 0:
+            allowed_subtypes_str = " | ".join(f'"{s}"' for s in mcq_subtype_counts.keys())
+            mcq_subtype_constraint = f"""
+MCQ SUBTYPE DISTRIBUTION — THIS IS MANDATORY, NOT OPTIONAL:
+You MUST distribute MCQ questions across subtypes EXACTLY as specified below.
+The "subtype" field for every MCQ question MUST be one of: {allowed_subtypes_str}
+""" + "\n".join(
+                f"  - \"{s}\" subtype: EXACTLY {sc} MCQ question(s)"
+                for s, sc in mcq_subtype_counts.items()
+            )
+
         prompt = f"""You are an expert question paper setter. Generate exactly {question_count} questions for a {mode} assessment.
 
 SUBJECT: {subject or topics_str}
@@ -1464,19 +1500,23 @@ You MUST NOT generate any question with a "type" outside this list. Every single
 
 EXACT QUESTION DISTRIBUTION (generate exactly this many of each type — no more, no less, no substitutions):
 {chr(10).join(dist_lines)}
+{mcq_subtype_constraint}
 {topic_section}
 
 {source_section}
 
 QUESTION FORMAT RULES — follow exactly:
 1. MCQ (standard): 4 distinct options as a list. Exactly one correct.
+   "subtype": "standard"
    "options": ["option1", "option2", "option3", "option4"]
    "correct_answer": the exact correct option string.
 
 2. MCQ (case): Include a brief scenario/passage (2-4 sentences) in "text" above the question.
    Then ask a question about it. 4 options as above.
+   "subtype": "case"
 
 3. MCQ (assertion_reason): Two statements.
+   "subtype": "assertion_reason"
    "text": "Assertion (A): [statement A]\\nReason (R): [statement R]\\nChoose the correct option:"
    "options": [
      "Both A and R are true, and R is the correct explanation of A",
@@ -1488,6 +1528,7 @@ QUESTION FORMAT RULES — follow exactly:
 
 4. MCQ (higher_order): Requires analysis, application, or evaluation — NOT simple recall.
    Scenario-based or multi-step reasoning. 4 options.
+   "subtype": "higher_order"
 
 5. Fill in the Blank: "text" has ___ for the missing word/phrase.
    "correct_answer": the exact word/phrase that fills the blank. "options": null.
@@ -1510,7 +1551,7 @@ QUESTION FORMAT RULES — follow exactly:
 Return a JSON array of EXACTLY {question_count} objects. Each object MUST have ALL these fields:
 - "id": "q1", "q2", "q3" ... (sequential, no gaps)
 - "type": MUST be one of the ALLOWED TYPES ONLY: {allowed_types_str}
-- "subtype": for MCQ — one of "standard" | "case" | "assertion_reason" | "higher_order"; for all others — null
+- "subtype": for MCQ — MUST match the exact subtype distribution above; for all others — null
 - "text": the full question text (string)
 - "options": array of strings for mcq/true_false/match; null for fill/short/long
 - "pairs": array of {{"left":..., "right":...}} objects for match; null for all others
@@ -1519,7 +1560,10 @@ Return a JSON array of EXACTLY {question_count} objects. Each object MUST have A
 - "marks": 1 for mcq/fill/true_false; 2 for short/match; 4 for long
 - "blooms_level": one of "remember" | "understand" | "apply" | "analyze" | "evaluate" | "create"
 
-⚠️ FINAL CHECK BEFORE OUTPUT: Verify that every object's "type" field is one of {allowed_types_str}. If any object has a different type, correct it before returning.
+⚠️ FINAL CHECKS BEFORE OUTPUT:
+1. Verify every "type" field is one of {allowed_types_str}.
+2. Verify every MCQ "subtype" field matches the required distribution above.
+3. If source text was provided, verify every question is answerable ONLY from that text — remove any question that requires outside knowledge.
 {f"""
 ⚠️ CRITICAL LANGUAGE REQUIREMENT: Every single "text", "options" array element, "correct_answer", and "explanation" value MUST be written in {lang_name} using its native script. NOT in English. If any value is in English, rewrite it in {lang_name} before returning. Only JSON keys remain in English.""" if is_non_english else ""}
 Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""
@@ -4898,7 +4942,7 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
         "5. If images or diagrams exist, describe them briefly; otherwise don't add remarks.\n"
     )
 
-    _MAX_PDF_PAGES = 15
+    _MAX_PDF_PAGES = 50
     _PDF_PARALLEL_WORKERS = 4
 
     # ------------------------------------------------------------------
@@ -5012,14 +5056,21 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
                 page_count = len(reader.pages)
 
                 if page_count > self._MAX_PDF_PAGES:
-                    print(f"[OCR] PDF has {page_count} pages (limit {self._MAX_PDF_PAGES})")
-                    return (
-                        f"This file has {page_count} pages (limit is {self._MAX_PDF_PAGES}). "
-                        "Please upload a shorter PDF."
-                    )
+                    print(f"[OCR] PDF has {page_count} pages (limit {self._MAX_PDF_PAGES}), skipping")
+                    return ""
 
                 # Convert PDF pages to images
-                images = await asyncio.to_thread(convert_from_path, file_path)
+                # Always pass poppler_path so Celery workers find the binaries
+                # even if their PATH is stripped (e.g. systemd services)
+                import shutil
+                poppler_path = "/usr/bin"
+                for candidate in ["/usr/bin", "/usr/local/bin"]:
+                    if shutil.which("pdfinfo", path=candidate):
+                        poppler_path = candidate
+                        break
+                images = await asyncio.to_thread(
+                    convert_from_path, file_path, poppler_path=poppler_path
+                )
                 print(f"[OCR] PDF → {len(images)} page images")
 
                 # Detect language from first page

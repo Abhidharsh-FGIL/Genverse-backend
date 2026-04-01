@@ -70,9 +70,18 @@ async def _generate_assessment_async(params: dict, channel: str, r: sync_redis.R
 
 async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
     """Inner generation logic."""
+    import logging
     import uuid as _uuid
 
+    _log = logging.getLogger(__name__)
     question_count = params["question_count"]
+    source_text = params.get("source_text")
+    _log.info(
+        "[Assessment-Celery] Starting: %d questions, source_text=%s chars, types=%s",
+        question_count,
+        len(source_text) if source_text else 0,
+        params.get("allowed_types"),
+    )
 
     # Stage 1: Preparing prompt
     _publish(r, channel, {
@@ -106,6 +115,8 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
         language=params.get("language"),
     )
 
+    _log.info("[Assessment-Celery] LLM returned %d raw questions", len(raw))
+
     _publish(r, channel, {
         "stage": "processing",
         "progress": 80,
@@ -114,6 +125,7 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
 
     # Post-process: filter by allowed types, build question_json + answer_key_json
     allowed_types = set(params.get("allowed_types", ["mcq"]))
+    _log.info("[Assessment-Celery] Filtering by allowed_types=%s", allowed_types)
 
     question_json = []
     answer_key_json = []
@@ -143,6 +155,8 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
             "correctAnswer": q.get("correct_answer") or q.get("correctAnswer", ""),
             "explanation": q.get("explanation", ""),
         })
+
+    _log.info("[Assessment-Celery] After filtering: %d questions passed (from %d raw)", len(question_json), len(raw))
 
     # Stage 3: Complete
     _publish(r, channel, {
