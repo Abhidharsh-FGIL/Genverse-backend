@@ -3,7 +3,7 @@ import secrets
 from datetime import date, datetime, timezone, timedelta
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Query, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import DBSession, CurrentUser
@@ -813,6 +813,14 @@ async def set_module_override(
     else:
         override.enabled = payload.enabled
         override.access_role = payload.access_role
+    # Cascade: when disabling a parent module, disable all its sub-features
+    if not payload.enabled and '.' not in payload.feature_key:
+        await db.execute(
+            update(OrgModuleOverride)
+            .where(OrgModuleOverride.org_id == org_id)
+            .where(OrgModuleOverride.feature_key.like(f"{payload.feature_key}.%"))
+            .values(enabled=False)
+        )
     await db.commit()
     await db.refresh(override)
     return override
@@ -846,9 +854,45 @@ async def set_module_override_alias(
     else:
         override.enabled = payload.enabled
         override.access_role = payload.access_role
+    # Cascade: when disabling a parent module, disable all its sub-features
+    if not payload.enabled and '.' not in payload.feature_key:
+        await db.execute(
+            update(OrgModuleOverride)
+            .where(OrgModuleOverride.org_id == org_id)
+            .where(OrgModuleOverride.feature_key.like(f"{payload.feature_key}.%"))
+            .values(enabled=False)
+        )
     await db.commit()
     await db.refresh(override)
     return override
+
+
+@router.put("/{org_id}/module-overrides/bulk", response_model=list[ModuleOverrideResponse])
+async def set_module_overrides_bulk(
+    org_id: uuid.UUID, payloads: list[ModuleOverrideRequest], current_user: CurrentUser, db: DBSession
+):
+    """Bulk upsert module/feature overrides."""
+    await _require_org_admin(current_user.id, org_id, db)
+    results = []
+    for payload in payloads:
+        result = await db.execute(
+            select(OrgModuleOverride).where(
+                OrgModuleOverride.org_id == org_id,
+                OrgModuleOverride.feature_key == payload.feature_key,
+            )
+        )
+        override = result.scalar_one_or_none()
+        if not override:
+            override = OrgModuleOverride(org_id=org_id, **payload.model_dump())
+            db.add(override)
+        else:
+            override.enabled = payload.enabled
+            override.access_role = payload.access_role
+        results.append(override)
+    await db.commit()
+    for o in results:
+        await db.refresh(o)
+    return results
 
 
 # ---- Invitations ----
