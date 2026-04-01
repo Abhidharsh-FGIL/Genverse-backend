@@ -221,6 +221,7 @@ class PastPaperResponse(BaseModel):
     subject: Optional[str] = None
     year: Optional[int] = None
     exam_type: Optional[str] = None
+    storage_path: Optional[str] = None
     file_url: Optional[str] = None
     is_public: bool
     created_at: datetime

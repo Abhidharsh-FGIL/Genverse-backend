@@ -60,6 +60,30 @@ async def list_past_papers(
     return PastPaperListResponse(items=items, next_cursor=next_cursor, has_more=has_more, total=total)
 
 
+@router.get("/{paper_id}/signed-url")
+async def get_past_paper_signed_url(paper_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    """Return a serving URL for viewing/downloading a past paper file."""
+    from pathlib import Path as _Path
+    from app.config import settings as _settings
+
+    result = await db.execute(select(PastPaper).where(PastPaper.id == paper_id))
+    paper = result.scalar_one_or_none()
+    if not paper or (not paper.is_public and paper.uploaded_by != current_user.id):
+        raise NotFoundException("Past paper not found")
+
+    if not paper.storage_path:
+        return {"url": paper.file_url}
+
+    try:
+        storage_root = _Path(_settings.STORAGE_ROOT).resolve()
+        abs_path = _Path(paper.storage_path).resolve()
+        rel = abs_path.relative_to(storage_root)
+        url = f"/uploads/{rel.as_posix()}"
+    except Exception:
+        url = paper.file_url
+    return {"url": url}
+
+
 @router.get("/{paper_id}", response_model=PastPaperResponse)
 async def get_past_paper(paper_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
     result = await db.execute(select(PastPaper).where(PastPaper.id == paper_id))
