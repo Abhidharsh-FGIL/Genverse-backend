@@ -114,6 +114,8 @@ class AssignmentResponse(BaseModel):
     created_by: uuid.UUID
     created_at: datetime
     updated_at: datetime
+    class_name: Optional[str] = None
+    class_color: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

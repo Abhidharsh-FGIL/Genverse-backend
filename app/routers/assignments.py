@@ -119,7 +119,14 @@ async def get_assignment(assignment_id: uuid.UUID, current_user: CurrentUser, db
     assignment = result.scalar_one_or_none()
     if not assignment:
         raise NotFoundException("Assignment not found")
-    return assignment
+    # Build response with class name
+    resp = AssignmentResponse.model_validate(assignment)
+    class_result = await db.execute(select(Class).where(Class.id == assignment.class_id))
+    class_ = class_result.scalar_one_or_none()
+    if class_:
+        resp.class_name = class_.name
+        resp.class_color = class_.color
+    return resp
 
 
 @router.patch("/{assignment_id}", response_model=AssignmentResponse)
