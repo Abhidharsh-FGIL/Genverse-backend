@@ -4851,7 +4851,17 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
                     return ""
 
                 # Convert PDF pages to images
-                images = await asyncio.to_thread(convert_from_path, file_path)
+                # Always pass poppler_path so Celery workers find the binaries
+                # even if their PATH is stripped (e.g. systemd services)
+                import shutil
+                poppler_path = "/usr/bin"
+                for candidate in ["/usr/bin", "/usr/local/bin"]:
+                    if shutil.which("pdfinfo", path=candidate):
+                        poppler_path = candidate
+                        break
+                images = await asyncio.to_thread(
+                    convert_from_path, file_path, poppler_path=poppler_path
+                )
                 print(f"[OCR] PDF → {len(images)} page images")
 
                 # Detect language from first page
