@@ -15,6 +15,7 @@ class LibraryItemResponse(BaseModel):
     tags: Optional[Any] = None
     extracted_text_ref: Optional[str] = None
     is_processed: bool
+    processing_status: str = "ready"
     created_at: datetime
 
     model_config = {"from_attributes": True}

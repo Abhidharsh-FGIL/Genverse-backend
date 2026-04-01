@@ -1194,6 +1194,8 @@ async def generate_practice_assessment_preview(
         topics = None
 
     # Resolve source text: fetch vault file chunks when source_ref_id is provided
+    import logging as _logging
+    _alog = _logging.getLogger(__name__)
     resolved_source_text = payload.source_text
     if payload.source_ref_id and not resolved_source_text:
         try:
@@ -1208,10 +1210,16 @@ async def generate_practice_assessment_preview(
                 .order_by(DocChunk.chunk_order)
             )
             chunks = chunks_result.scalars().all()
+            _alog.info("[Assessment] Vault source_ref_id=%s → %d chunks found", payload.source_ref_id, len(chunks))
             if chunks:
-                resolved_source_text = " ".join(c.chunk_text for c in chunks)
-        except Exception:
-            pass  # fall back to topic-based generation if fetch fails
+                resolved_source_text = "\n\n".join(
+                    f"[Section {i+1}]\n{c.chunk_text}" for i, c in enumerate(chunks)
+                )
+                _alog.info("[Assessment] Resolved source_text: %d chars from %d chunks", len(resolved_source_text), len(chunks))
+            else:
+                _alog.warning("[Assessment] No chunks found for vault file %s", payload.source_ref_id)
+        except Exception as exc:
+            _alog.exception("[Assessment] Failed to fetch vault chunks for %s: %s", payload.source_ref_id, exc)
 
     # Resolve library file content via FAISS RAG (takes priority when library_file_ids are provided)
     import logging
@@ -1341,10 +1349,16 @@ async def generate_practice_assessment_stream(
                 .order_by(DocChunk.chunk_order)
             )
             chunks = chunks_result.scalars().all()
+            logger.info("[Assessment-Stream] Vault source_ref_id=%s → %d chunks found", payload.source_ref_id, len(chunks))
             if chunks:
-                resolved_source_text = " ".join(c.chunk_text for c in chunks)
-        except Exception:
-            pass
+                resolved_source_text = "\n\n".join(
+                    f"[Section {i+1}]\n{c.chunk_text}" for i, c in enumerate(chunks)
+                )
+                logger.info("[Assessment-Stream] Resolved source_text: %d chars from %d chunks", len(resolved_source_text), len(chunks))
+            else:
+                logger.warning("[Assessment-Stream] No chunks found for vault file %s", payload.source_ref_id)
+        except Exception as exc:
+            logger.exception("[Assessment-Stream] Failed to fetch vault chunks: %s", exc)
 
     # Resolve library file content via FAISS RAG
     if payload.library_file_ids:

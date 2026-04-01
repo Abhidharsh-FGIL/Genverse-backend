@@ -1,10 +1,11 @@
 """
-Celery tasks for Public Library embedding processing.
+Celery tasks for embedding processing (Public Library & Knowledge Vault).
 
 These run in a separate worker process, so we use synchronous DB access
 and asyncio.run() for the async AI service calls.
 """
 import asyncio
+import logging
 import uuid
 
 from sqlalchemy import create_engine
@@ -13,8 +14,11 @@ from sqlalchemy.orm import sessionmaker, Session
 from app.celery_app import celery
 from app.config import settings
 from app.models.public_library import PublicFile, PublicFileChunk
+from app.models.content import UserLibraryItem, DocChunk
 from app.services.ai_service import AIService
 from app.services.faiss_service import FAISSService
+
+logger = logging.getLogger(__name__)
 
 FAISS_KEY = "public_library"
 
@@ -103,6 +107,108 @@ def process_library_file_embeddings(self, file_id: str):
     except Exception as exc:
         db.rollback()
         # Retry with exponential backoff (10s, 30s)
+        raise self.retry(exc=exc, countdown=10 * (self.request.retries + 1))
+    finally:
+        db.close()
+
+
+@celery.task(bind=True, name="process_vault_embeddings", max_retries=2)
+def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = ""):
+    """
+    Extract text from an uploaded Knowledge Vault file, chunk it,
+    generate embeddings, and store them in the user's FAISS index.
+
+    Called asynchronously after a file is uploaded via POST /library/upload.
+    The UserLibraryItem already exists with processing_status='processing'.
+    """
+    logger.info("[Vault] Starting processing for '%s' (item=%s, user=%s)", filename, item_id, user_id)
+    db: Session = SyncSessionLocal()
+    try:
+        item = db.get(UserLibraryItem, uuid.UUID(item_id))
+        if not item:
+            logger.error("[Vault] Item %s ('%s') not found in DB", item_id, filename)
+            return {"status": "error", "detail": "Item not found"}
+
+        if item.processing_status == "ready":
+            logger.info("[Vault] '%s' already processed, skipping", filename)
+            return {"status": "skipped", "detail": "Already processed"}
+
+        ai = AIService()
+        faiss_svc = FAISSService(settings.STORAGE_ROOT)
+
+        # 1. Extract text from the stored file
+        logger.info("[Vault] Extracting text from '%s' (path: %s)", filename, item.storage_path)
+        extracted_text = _run_async(ai.extract_text_from_file(item.storage_path))
+        if not extracted_text:
+            item.processing_status = "failed"
+            db.commit()
+            logger.warning("[Vault] No text extracted from '%s'", filename)
+            return {"status": "error", "detail": "No text extracted"}
+
+        # Log extracted text (truncated to 2000 chars for readability)
+        preview = extracted_text[:2000]
+        logger.info("[Vault] Extracted text from '%s' (%d chars):\n%s%s",
+                     filename, len(extracted_text), preview,
+                     "..." if len(extracted_text) > 2000 else "")
+
+        # 2. Semantic chunking
+        chunks = ai.semantic_chunk_text(extracted_text)
+        logger.info("[Vault] '%s' → %d chunks", filename, len(chunks))
+
+        # 3. Create chunk records + generate embeddings
+        chunk_ids: list[str] = []
+        embeddings: list[list[float]] = []
+
+        for i, chunk_text in enumerate(chunks):
+            doc_chunk = DocChunk(
+                library_item_id=item.id,
+                chunk_text=chunk_text,
+                chunk_order=i,
+            )
+            db.add(doc_chunk)
+            db.flush()  # get the assigned id
+
+            embedding = _run_async(ai.generate_embedding(chunk_text))
+            if embedding:
+                chunk_ids.append(str(doc_chunk.id))
+                embeddings.append(embedding)
+
+        # 4. Batch-add to user's FAISS index
+        if chunk_ids:
+            faiss_svc.add_batch(
+                user_id=user_id,
+                chunk_ids=chunk_ids,
+                embeddings=embeddings,
+            )
+
+        # 5. Mark item as ready
+        item.is_processed = True
+        item.extracted_text_ref = "processed"
+        item.processing_status = "ready"
+        db.commit()
+
+        logger.info(
+            "[Vault] '%s' processed successfully: %d chunks, %d embeddings",
+            filename, len(chunks), len(chunk_ids),
+        )
+        return {
+            "status": "success",
+            "item_id": item_id,
+            "chunks_embedded": len(chunk_ids),
+        }
+
+    except Exception as exc:
+        db.rollback()
+        # Mark as failed on final retry
+        if self.request.retries >= self.max_retries:
+            try:
+                item = db.get(UserLibraryItem, uuid.UUID(item_id))
+                if item:
+                    item.processing_status = "failed"
+                    db.commit()
+            except Exception:
+                db.rollback()
+        logger.exception("[Vault] Failed processing '%s' (item=%s)", filename, item_id)
         raise self.retry(exc=exc, countdown=10 * (self.request.retries + 1))
     finally:
         db.close()

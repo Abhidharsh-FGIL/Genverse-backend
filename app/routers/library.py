@@ -15,6 +15,7 @@ from app.services.storage_service import StorageService
 from app.services.ai_service import AIService
 from app.services.faiss_service import FAISSService
 from app.services.points_service import PointsService
+from app.tasks.library_tasks import process_vault_embeddings
 from app.config import settings
 
 router = APIRouter()
@@ -128,50 +129,16 @@ async def upload_document(
         folder=folder,
         tags=tag_list,
         is_processed=False,
+        processing_status="processing",
     )
     db.add(item)
     await db.commit()
     await db.refresh(item)
 
-    # Text extraction → semantic chunking → FAISS embedding
-    ai = AIService()
-    logger.info("Starting text extraction for item %s (file: %s)", item.id, file_info["path"])
-    try:
-        extracted_text = await ai.extract_text_from_file(file_info["path"])
-        if extracted_text:
-            chunks = ai.semantic_chunk_text(extracted_text)
-            chunk_ids: list[str] = []
-            embeddings: list[list[float]] = []
+    # Dispatch text extraction + embedding to Celery worker
+    process_vault_embeddings.delay(str(item.id), str(current_user.id), item.title)
+    logger.info("Dispatched embedding task for vault item %s (%s)", item.id, item.title)
 
-            for i, chunk_text in enumerate(chunks):
-                doc_chunk = DocChunk(
-                    library_item_id=item.id,
-                    chunk_text=chunk_text,
-                    chunk_order=i,
-                )
-                db.add(doc_chunk)
-                await db.flush()  # assigns doc_chunk.id
-
-                embedding = await ai.generate_embedding(chunk_text)
-                if embedding:
-                    chunk_ids.append(str(doc_chunk.id))
-                    embeddings.append(embedding)
-
-            if chunk_ids:
-                _faiss().add_batch(
-                    user_id=str(current_user.id),
-                    chunk_ids=chunk_ids,
-                    embeddings=embeddings,
-                )
-
-            item.is_processed = True
-            item.extracted_text_ref = "processed"
-            logger.info("Successfully processed item %s: %d chunks, %d embeddings", item.id, len(chunks), len(chunk_ids))
-    except Exception:
-        logger.exception("Text extraction/embedding failed for item %s", item.id)
-
-    await db.commit()
-    await db.refresh(item)
     return item
 
 
@@ -187,7 +154,10 @@ async def list_library_items(
     from datetime import datetime as dt
     from sqlalchemy import func as sa_func
 
-    base = select(UserLibraryItem).where(UserLibraryItem.user_id == current_user.id)
+    base = select(UserLibraryItem).where(
+        UserLibraryItem.user_id == current_user.id,
+        UserLibraryItem.processing_status == "ready",
+    )
     if org_id is not None:
         base = _apply_org_filter(base, UserLibraryItem.org_id, org_id)
     if folder:
@@ -285,7 +255,10 @@ async def list_library_items_by_fields(
     org_id: str | None = Query(None),
 ):
     """Alias for GET / that accepts an optional ?fields= param (ignored server-side)."""
-    q = select(UserLibraryItem).where(UserLibraryItem.user_id == current_user.id)
+    q = select(UserLibraryItem).where(
+        UserLibraryItem.user_id == current_user.id,
+        UserLibraryItem.processing_status == "ready",
+    )
     if org_id is not None:
         q = _apply_org_filter(q, UserLibraryItem.org_id, org_id)
     if folder:
@@ -298,6 +271,30 @@ async def list_library_items_by_fields(
     q = q.order_by(UserLibraryItem.created_at.desc())
     result = await db.execute(q)
     return result.scalars().all()
+
+
+@router.get("/{item_id}/status")
+async def get_library_item_status(item_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    """Poll processing status of an uploaded vault item."""
+    result = await db.execute(
+        select(
+            UserLibraryItem.processing_status,
+            UserLibraryItem.is_processed,
+            UserLibraryItem.title,
+        ).where(
+            UserLibraryItem.id == item_id,
+            UserLibraryItem.user_id == current_user.id,
+        )
+    )
+    row = result.one_or_none()
+    if not row:
+        raise NotFoundException("Library item not found")
+    return {
+        "id": str(item_id),
+        "processing_status": row.processing_status,
+        "is_processed": row.is_processed,
+        "title": row.title,
+    }
 
 
 @router.get("/{item_id}", response_model=LibraryItemResponse)

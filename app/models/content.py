@@ -21,6 +21,7 @@ class UserLibraryItem(Base):
     tags: Mapped[dict | None] = mapped_column(JSONB)  # string[]
     extracted_text_ref: Mapped[str | None] = mapped_column(String(1000))
     is_processed: Mapped[bool] = mapped_column(Boolean, default=False)
+    processing_status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | processing | ready | failed
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
