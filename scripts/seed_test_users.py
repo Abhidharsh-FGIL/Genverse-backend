@@ -174,6 +174,7 @@ async def _seed_individual_user(db, data, now, period_end):
                 max_seats=None,
                 current_period_start=now,
                 current_period_end=period_end,
+                auto_renew=False,
             ))
             print(f"  [insert] subscription -> {data['plan']}")
         return
@@ -208,6 +209,7 @@ async def _seed_individual_user(db, data, now, period_end):
         max_seats=None,
         current_period_start=now,
         current_period_end=period_end,
+        auto_renew=False,
     ))
     print(f"  [insert] user + subscription: {data['email']} ({data['plan']})")
 
@@ -245,6 +247,7 @@ async def _create_user(db, email, password, name, now, period_end):
         max_seats=None,
         current_period_start=now,
         current_period_end=period_end,
+        auto_renew=False,
     ))
     print(f"  [insert] user: {email} ({name})")
     return user_id
@@ -389,6 +392,7 @@ async def _seed_org_admin(db, data, now, period_end):
                     max_seats=data["max_seats"],
                     current_period_start=now,
                     current_period_end=period_end,
+                    auto_renew=False,
                 ))
                 print(f"  [insert] org subscription -> {data['plan']}")
 
@@ -446,6 +450,7 @@ async def _seed_org_admin(db, data, now, period_end):
         max_seats=data["max_seats"],
         current_period_start=now,
         current_period_end=period_end,
+        auto_renew=False,
     ))
     print(f"  [insert] org '{data['org_name']}' + admin + subscription: {data['email']} ({data['plan']})")
 

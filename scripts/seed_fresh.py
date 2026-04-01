@@ -101,8 +101,8 @@ async def _insert_user(conn, uid, email, pw, name, role, now, pe, **extra):
         "INSERT INTO org_members (id, org_id, user_id, role, status, joined_at) VALUES (:id, :oid, :uid, :role, 'active', :now)"
     ), {"id": str(uuid.uuid4()), "oid": ORG_ID, "uid": uid, "role": role, "now": now})
     await conn.execute(text(
-        "INSERT INTO subscriptions (id, user_id, plan, status, workspace_type, points_balance, points_monthly_quota, storage_limit_mb, current_period_start, current_period_end) "
-        "VALUES (:id, :uid, 'free', 'active', 'individual', 100, 100, 100, :s, :e)"
+        "INSERT INTO subscriptions (id, user_id, plan, status, workspace_type, points_balance, points_monthly_quota, storage_limit_mb, current_period_start, current_period_end, auto_renew) "
+        "VALUES (:id, :uid, 'free', 'active', 'individual', 100, 100, 100, :s, :e, false)"
     ), {"id": str(uuid.uuid4()), "uid": uid, "s": now, "e": pe})
 
 
@@ -122,8 +122,8 @@ async def run():
             "VALUES (:id, 'GenVerse Academy', 'genverse_evaluation', true, true, false, 'classic', :ay, '[\"CBSE\",\"ICSE\",\"IGCSE\",\"IB\",\"Cambridge\",\"State Board\"]', :now, :now)"
         ), {"id": ORG_ID, "ay": AY, "now": now})
         await conn.execute(text(
-            "INSERT INTO subscriptions (id, org_id, plan, status, workspace_type, points_balance, points_monthly_quota, storage_limit_mb, max_seats, current_period_start, current_period_end) "
-            "VALUES (:id, :oid, 'org_pro', 'active', 'organization', 50000, 50000, 51200, 1000, :s, :e)"
+            "INSERT INTO subscriptions (id, org_id, plan, status, workspace_type, points_balance, points_monthly_quota, storage_limit_mb, max_seats, current_period_start, current_period_end, auto_renew) "
+            "VALUES (:id, :oid, 'org_pro', 'active', 'organization', 50000, 50000, 51200, 1000, :s, :e, false)"
         ), {"id": str(uuid.uuid4()), "oid": ORG_ID, "s": now, "e": pe})
         print("  GenVerse Academy (org_pro, 50k pts)")
 

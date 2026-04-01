@@ -93,6 +93,7 @@ async def _create_user(db, email, password, name, now, period_end):
         max_seats=None,
         current_period_start=now,
         current_period_end=period_end,
+        auto_renew=False,
     ))
     return user_id
 
@@ -211,6 +212,7 @@ async def _seed_org(db, data, now, period_end):
             max_seats=data["max_seats"],
             current_period_start=now,
             current_period_end=period_end,
+            auto_renew=False,
         ))
         print(f"  [insert] org '{data['org_name']}' + subscription ({data['plan']})")
 
