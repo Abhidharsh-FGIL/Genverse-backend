@@ -135,6 +135,7 @@ async def upload_document(
 
     # Text extraction → semantic chunking → FAISS embedding
     ai = AIService()
+    logger.info("Starting text extraction for item %s (file: %s)", item.id, file_info["path"])
     try:
         extracted_text = await ai.extract_text_from_file(file_info["path"])
         if extracted_text:
@@ -165,8 +166,9 @@ async def upload_document(
 
             item.is_processed = True
             item.extracted_text_ref = "processed"
+            logger.info("Successfully processed item %s: %d chunks, %d embeddings", item.id, len(chunks), len(chunk_ids))
     except Exception:
-        pass  # Non-blocking — extraction can be retried
+        logger.exception("Text extraction/embedding failed for item %s", item.id)
 
     await db.commit()
     await db.refresh(item)
