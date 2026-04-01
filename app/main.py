@@ -14,6 +14,26 @@ from app.services.notification_scheduler import run_notification_scheduler
 from app.services.stale_attempt_scheduler import run_stale_attempt_scheduler
 
 
+async def _backfill_study_time_if_needed():
+    """One-time backfill of study_time_daily from historical data. Runs on startup if table is empty."""
+    from sqlalchemy import text
+    from app.database import AsyncSessionLocal
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(text("SELECT 1 FROM study_time_daily LIMIT 1"))
+            if result.scalar() is not None:
+                print("[StudyTimeBackfill] Table already has data, skipping backfill", flush=True)
+                return
+        # Table is empty — run backfill
+        async with AsyncSessionLocal() as db:
+            from app.services.study_time_aggregator import backfill_study_time
+            count = await backfill_study_time(db, days_back=90)
+            await db.commit()
+            print(f"[StudyTimeBackfill] Done: {count} user-days processed", flush=True)
+    except Exception as e:
+        print(f"[StudyTimeBackfill] Error: {e}", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(settings.STORAGE_ROOT, exist_ok=True)
@@ -22,10 +42,13 @@ async def lifespan(app: FastAPI):
     renewal_task = asyncio.create_task(run_renewal_scheduler())
     notification_task = asyncio.create_task(run_notification_scheduler())
     stale_attempt_task = asyncio.create_task(run_stale_attempt_scheduler())
+    # One-time backfill of study time data (runs in background, doesn't block startup)
+    backfill_task = asyncio.create_task(_backfill_study_time_if_needed())
     yield
     renewal_task.cancel()
     notification_task.cancel()
     stale_attempt_task.cancel()
+    backfill_task.cancel()
     await close_db()
 
 

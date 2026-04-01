@@ -402,7 +402,7 @@ async def get_assessment_summary(
             pass
 
     ai = AIService()
-    summary = await ai.generate_assessment_summary(user_id=str(current_user.id), db=db)
+    summary = await ai.generate_assessment_summary(user_id=str(current_user.id), db=db, org_id=org_id)
 
     # Cache for 30 minutes
     try:
@@ -467,7 +467,7 @@ async def get_recommendations(
         # Auto-generate on first load — same logic as /recommendations/generate
         ai = AIService()
         recs_data = await ai.generate_assessment_recommendations(
-            user_id=str(current_user.id), db=db
+            user_id=str(current_user.id), db=db, org_id=org_id
         )
         new_recs = []
         for item in recs_data:
@@ -531,7 +531,7 @@ async def generate_recommendations(
 
     ai = AIService()
     recs_data = await ai.generate_assessment_recommendations(
-        user_id=str(current_user.id), db=db
+        user_id=str(current_user.id), db=db, org_id=org_id
     )
 
     new_recs = []
@@ -599,6 +599,40 @@ async def get_learning_curve(
         }
         for a in attempts
     ]
+
+    # Include graded class submissions for org workspace
+    if parsed_oid:
+        try:
+            from app.models.classes import Submission, Assignment, Class
+            sub_q = (
+                select(Submission, Assignment)
+                .join(Assignment, Submission.assignment_id == Assignment.id)
+                .join(Class, Assignment.class_id == Class.id)
+                .where(
+                    Submission.student_id == current_user.id,
+                    Submission.status.in_(["graded", "returned"]),
+                    Class.org_id == parsed_oid,
+                    Submission.submitted_at.isnot(None),
+                )
+                .order_by(Submission.submitted_at.asc())
+                .limit(30)
+            )
+            sub_result = await db.execute(sub_q)
+            for sub, assign in sub_result.all():
+                grade_data = sub.grade or {}
+                total = grade_data.get("totalScore", 0)
+                max_s = grade_data.get("maxScore", assign.points or 1)
+                pct = round((total / max_s * 100) if max_s else 0, 1)
+                assessment_scores.append({
+                    "date": sub.submitted_at.isoformat() if sub.submitted_at else None,
+                    "score": total,
+                    "max_score": max_s,
+                    "percentage": pct,
+                })
+            # Re-sort by date
+            assessment_scores.sort(key=lambda x: x["date"] or "")
+        except Exception:
+            pass
 
     # Topic mastery (filtered by workspace)
     mastery_q = (

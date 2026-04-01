@@ -746,15 +746,41 @@ async def get_monthly_comparison(
             )
         return round((await db.execute(q)).scalar_one() or 0, 1)
 
+    # Count graded class submissions for org workspace
+    async def count_submissions(start, end):
+        if not parsed_oid:
+            return 0
+        try:
+            r = await db.execute(
+                select(func.count(Submission.id))
+                .join(Assignment, Submission.assignment_id == Assignment.id)
+                .join(Class, Assignment.class_id == Class.id)
+                .where(
+                    Submission.student_id == current_user.id,
+                    Submission.status.in_(["graded", "returned"]),
+                    Class.org_id == parsed_oid,
+                    Submission.submitted_at >= start,
+                    Submission.submitted_at < end,
+                )
+            )
+            return r.scalar_one()
+        except Exception:
+            return 0
+
+    this_assessments = await count_attempts(first_this, now)
+    last_assessments = await count_attempts(first_last, first_this)
+    this_subs = await count_submissions(first_this, now)
+    last_subs = await count_submissions(first_last, first_this)
+
     return {
         "thisMonth": {
-            "assessments": await count_attempts(first_this, now),
+            "assessments": this_assessments + this_subs,
             "documents":   await count_rows(UserLibraryItem, UserLibraryItem.created_at, first_this, now),
             "chats":       await count_rows(AiChat, AiChat.created_at, first_this, now),
             "avgScore":    await avg_pct(first_this, now),
         },
         "lastMonth": {
-            "assessments": await count_attempts(first_last, first_this),
+            "assessments": last_assessments + last_subs,
             "documents":   await count_rows(UserLibraryItem, UserLibraryItem.created_at, first_last, first_this),
             "chats":       await count_rows(AiChat, AiChat.created_at, first_last, first_this),
             "avgScore":    await avg_pct(first_last, first_this),
@@ -788,14 +814,56 @@ async def get_score_trend(
     q = q.order_by(AssessmentAttempt.submitted_at.desc()).limit(limit)
     rows = (await db.execute(q)).all()
 
-    return [
+    entries = [
         {
             "date":    attempt.submitted_at.strftime("%b %d"),
             "score":   round(attempt.percentage or 0, 1),
             "subject": subject or "General",
+            "source":  "practice",
+            "_sort":   attempt.submitted_at,
         }
-        for attempt, subject in reversed(rows)
+        for attempt, subject in rows
     ]
+
+    # Include graded class submissions for org workspace
+    if parsed_oid:
+        try:
+            sub_q = (
+                select(Submission, Assignment, Class)
+                .join(Assignment, Submission.assignment_id == Assignment.id)
+                .join(Class, Assignment.class_id == Class.id)
+                .where(
+                    Submission.student_id == current_user.id,
+                    Submission.status.in_(["graded", "returned"]),
+                    Class.org_id == parsed_oid,
+                    Submission.submitted_at.isnot(None),
+                )
+                .order_by(Submission.submitted_at.desc())
+                .limit(limit)
+            )
+            sub_rows = (await db.execute(sub_q)).all()
+            for sub, assign, cls in sub_rows:
+                grade_data = sub.grade or {}
+                total = grade_data.get("totalScore", 0)
+                max_s = grade_data.get("maxScore", assign.points or 1)
+                pct = round((total / max_s * 100) if max_s else 0, 1)
+                entries.append({
+                    "date":    sub.submitted_at.strftime("%b %d"),
+                    "score":   pct,
+                    "subject": cls.subject or "General",
+                    "source":  "assignment",
+                    "_sort":   sub.submitted_at,
+                })
+        except Exception:
+            pass
+
+    # Sort by date ascending, take last N, remove internal sort key
+    entries.sort(key=lambda e: e["_sort"])
+    entries = entries[-limit:]
+    for e in entries:
+        del e["_sort"]
+
+    return entries
 
 
 @router.get("/user/study-time")
@@ -1126,3 +1194,378 @@ async def get_recent_activity(
          "time": human_time(e["ts"]), "user_name": e.get("user_name", "")}
         for e in events[:limit]
     ]
+
+
+# ── Study Time Detailed Endpoints ──────────────────────────────────────────
+
+
+@router.post("/study-time/backfill")
+async def trigger_study_time_backfill(
+    current_user: CurrentUser,
+    db: DBSession,
+    days: int = Query(90, le=365),
+):
+    """Backfill study_time_daily from historical AI interactions and assessment attempts.
+    Run once after deploying the study time feature to populate existing data."""
+    from app.services.study_time_aggregator import backfill_study_time
+    count = await backfill_study_time(db, days_back=days)
+    await db.commit()
+    return {"status": "ok", "user_days_processed": count, "days_back": days}
+
+
+@router.get("/user/study-time-detailed")
+async def get_study_time_detailed(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+    period: str = Query("30d", pattern="^(7d|30d|90d)$"),
+):
+    """Detailed study time analytics for the current user."""
+    from datetime import datetime, timezone, timedelta, date
+    from app.models.study_time import StudyTimeDaily
+    from app.services.study_time_aggregator import compute_realtime_study_minutes
+
+    days = {"7d": 7, "30d": 30, "90d": 90}[period]
+    today = date.today()
+    start_date = today - timedelta(days=days)
+    prev_start = start_date - timedelta(days=days)
+    parsed_oid = _parse_org_id(org_id)
+
+    # Base filter
+    def _base_filter():
+        filters = [
+            StudyTimeDaily.user_id == current_user.id,
+            StudyTimeDaily.date >= start_date,
+            StudyTimeDaily.date <= today,
+        ]
+        if parsed_oid:
+            filters.append(StudyTimeDaily.org_id == parsed_oid)
+        return filters
+
+    # Current period totals from pre-aggregated data
+    rows = (await db.execute(
+        select(StudyTimeDaily).where(*_base_filter())
+    )).scalars().all()
+
+    # Add today's real-time data (not yet aggregated)
+    today_realtime = await compute_realtime_study_minutes(current_user.id, today, db)
+    today_stored = sum(r.total_minutes for r in rows if r.date == today)
+    # Use the larger of stored vs realtime for today (avoid double counting)
+    today_extra = max(0, today_realtime["total_minutes"] - today_stored)
+
+    total_minutes = sum(r.total_minutes for r in rows) + today_extra
+    daily_average = round(total_minutes / max(days, 1))
+
+    # Previous period for trend
+    prev_filters = [
+        StudyTimeDaily.user_id == current_user.id,
+        StudyTimeDaily.date >= prev_start,
+        StudyTimeDaily.date < start_date,
+    ]
+    if parsed_oid:
+        prev_filters.append(StudyTimeDaily.org_id == parsed_oid)
+
+    prev_total = (await db.execute(
+        select(func.coalesce(func.sum(StudyTimeDaily.total_minutes), 0)).where(*prev_filters)
+    )).scalar_one()
+    trend_percent = round(((total_minutes - prev_total) / max(prev_total, 1)) * 100) if prev_total > 0 else 0
+
+    # By date
+    date_map: dict[str, int] = {}
+    for r in rows:
+        d = str(r.date)
+        date_map[d] = date_map.get(d, 0) + r.total_minutes
+    # Override today with realtime if higher
+    today_str = str(today)
+    if today_realtime["total_minutes"] > date_map.get(today_str, 0):
+        date_map[today_str] = today_realtime["total_minutes"]
+    by_date = [
+        {"date": str(today - timedelta(days=i)), "minutes": date_map.get(str(today - timedelta(days=i)), 0)}
+        for i in range(days - 1, -1, -1)
+    ]
+
+    # By subject (from stored rows, excluding today if we have realtime)
+    subject_map: dict[str, int] = {}
+    for r in rows:
+        if r.date == today and today_extra > 0:
+            continue  # skip stored today data, use realtime instead
+        subject_map[r.subject] = subject_map.get(r.subject, 0) + r.total_minutes
+    # Add today's realtime subjects
+    for subj, mins in today_realtime.get("subjects", {}).items():
+        subject_map[subj] = subject_map.get(subj, 0) + mins
+    by_subject = sorted(
+        [{"subject": s, "minutes": m} for s, m in subject_map.items()],
+        key=lambda x: -x["minutes"],
+    )[:10]
+
+    # Peak hours
+    hour_map: dict[int, int] = {}
+    for r in rows:
+        if r.peak_hour is not None:
+            hour_map[r.peak_hour] = hour_map.get(r.peak_hour, 0) + r.total_minutes
+    peak_hours = sorted(
+        [{"hour": h, "minutes": m} for h, m in hour_map.items()],
+        key=lambda x: -x["minutes"],
+    )[:24]
+
+    # Consistency score: % of days in period with >= 15 min study
+    active_dates = {str(r.date) for r in rows if r.total_minutes >= 15}
+    if today_realtime["total_minutes"] >= 15:
+        active_dates.add(today_str)
+    consistency_score = round((len(active_dates) / max(days, 1)) * 100)
+
+    # Class average (if in org context)
+    class_average_minutes = None
+    if parsed_oid:
+        org_total = (await db.execute(
+            select(
+                func.coalesce(func.sum(StudyTimeDaily.total_minutes), 0),
+                func.count(func.distinct(StudyTimeDaily.user_id)),
+            ).where(
+                StudyTimeDaily.org_id == parsed_oid,
+                StudyTimeDaily.date >= start_date,
+                StudyTimeDaily.date <= today,
+            )
+        )).first()
+        if org_total and org_total[1] > 0:
+            class_average_minutes = round(org_total[0] / org_total[1] / max(days, 1))
+
+    return {
+        "total_minutes": total_minutes,
+        "daily_average": daily_average,
+        "trend_percent": trend_percent,
+        "by_date": by_date,
+        "by_subject": by_subject,
+        "peak_hours": peak_hours,
+        "consistency_score": consistency_score,
+        "class_average_minutes": class_average_minutes,
+    }
+
+
+@router.get("/org/{org_id}/study-time")
+async def get_org_study_time(
+    org_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+    period: str = Query("30d", pattern="^(7d|30d|90d)$"),
+    class_id: uuid.UUID | None = Query(None),
+):
+    """Organization-wide study time analytics for admins/teachers."""
+    from datetime import datetime, timezone, timedelta, date
+    from app.models.study_time import StudyTimeDaily
+
+    days = {"7d": 7, "30d": 30, "90d": 90}[period]
+    today = date.today()
+    start_date = today - timedelta(days=days)
+
+    # Get org member IDs (optionally filtered by class)
+    if class_id:
+        member_ids_result = await db.execute(
+            select(ClassStudent.student_id).where(ClassStudent.class_id == class_id)
+        )
+    else:
+        member_ids_result = await db.execute(
+            select(OrgMember.user_id).where(OrgMember.org_id == org_id, OrgMember.status == "active")
+        )
+    member_ids = [r[0] for r in member_ids_result.all()]
+
+    if not member_ids:
+        return {
+            "org_total_minutes": 0, "avg_per_student_daily": 0,
+            "active_students": 0, "by_date": [], "by_subject": [],
+            "top_students": [], "at_risk_students": [],
+        }
+
+    # Fetch all study time rows for these members in the period
+    rows = (await db.execute(
+        select(StudyTimeDaily).where(
+            StudyTimeDaily.user_id.in_(member_ids),
+            StudyTimeDaily.org_id == org_id,
+            StudyTimeDaily.date >= start_date,
+            StudyTimeDaily.date <= today,
+        )
+    )).scalars().all()
+
+    org_total = sum(r.total_minutes for r in rows)
+    active_user_ids = {r.user_id for r in rows if r.total_minutes > 0}
+    active_students = len(active_user_ids)
+    avg_per_student_daily = round(org_total / max(len(member_ids), 1) / max(days, 1))
+
+    # By date
+    date_map: dict[str, int] = {}
+    date_active: dict[str, set] = {}
+    for r in rows:
+        d = str(r.date)
+        date_map[d] = date_map.get(d, 0) + r.total_minutes
+        date_active.setdefault(d, set()).add(r.user_id)
+    by_date = [
+        {
+            "date": str(today - timedelta(days=i)),
+            "total_minutes": date_map.get(str(today - timedelta(days=i)), 0),
+            "active_students": len(date_active.get(str(today - timedelta(days=i)), set())),
+        }
+        for i in range(days - 1, -1, -1)
+    ]
+
+    # By subject
+    subject_map: dict[str, int] = {}
+    for r in rows:
+        subject_map[r.subject] = subject_map.get(r.subject, 0) + r.total_minutes
+    by_subject = sorted(
+        [{"subject": s, "total_minutes": m} for s, m in subject_map.items()],
+        key=lambda x: -x["total_minutes"],
+    )[:10]
+
+    # Per-student totals
+    student_totals: dict[uuid.UUID, int] = {}
+    for r in rows:
+        student_totals[r.user_id] = student_totals.get(r.user_id, 0) + r.total_minutes
+
+    # Get names
+    name_result = await db.execute(
+        select(User.id, User.name, User.email).where(User.id.in_(member_ids))
+    )
+    name_map = {r.id: r.name or r.email or "Unknown" for r in name_result.all()}
+
+    # Top students
+    top_students = sorted(
+        [
+            {"user_id": str(uid), "name": name_map.get(uid, "Unknown"), "total_minutes": mins}
+            for uid, mins in student_totals.items()
+        ],
+        key=lambda x: -x["total_minutes"],
+    )[:10]
+
+    # At-risk students: < 15 min/day average or no activity in last 3 days
+    three_days_ago = today - timedelta(days=3)
+    recent_active = set()
+    for r in rows:
+        if r.date >= three_days_ago:
+            recent_active.add(r.user_id)
+
+    at_risk_students = []
+    for uid in member_ids:
+        total = student_totals.get(uid, 0)
+        daily_avg = round(total / max(days, 1))
+        inactive_recently = uid not in recent_active
+
+        if daily_avg < 15 or inactive_recently:
+            days_inactive = 0
+            if inactive_recently:
+                # Calculate actual days inactive
+                user_dates = sorted([r.date for r in rows if r.user_id == uid], reverse=True)
+                if user_dates:
+                    days_inactive = (today - user_dates[0]).days
+                else:
+                    days_inactive = days  # no activity in entire period
+
+            at_risk_students.append({
+                "user_id": str(uid),
+                "name": name_map.get(uid, "Unknown"),
+                "total_minutes": total,
+                "daily_avg": daily_avg,
+                "days_inactive": days_inactive,
+            })
+
+    at_risk_students.sort(key=lambda x: x["total_minutes"])
+
+    return {
+        "org_total_minutes": org_total,
+        "avg_per_student_daily": avg_per_student_daily,
+        "active_students": active_students,
+        "by_date": by_date,
+        "by_subject": by_subject,
+        "top_students": top_students,
+        "at_risk_students": at_risk_students[:20],
+    }
+
+
+@router.get("/org/{org_id}/student/{student_id}/study-time")
+async def get_student_study_time_for_admin(
+    org_id: uuid.UUID,
+    student_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+    period: str = Query("30d", pattern="^(7d|30d|90d)$"),
+):
+    """Individual student study time — accessed by teacher or org admin."""
+    from datetime import datetime, timezone, timedelta, date
+    from app.models.study_time import StudyTimeDaily
+
+    days = {"7d": 7, "30d": 30, "90d": 90}[period]
+    today = date.today()
+    start_date = today - timedelta(days=days)
+    prev_start = start_date - timedelta(days=days)
+
+    rows = (await db.execute(
+        select(StudyTimeDaily).where(
+            StudyTimeDaily.user_id == student_id,
+            StudyTimeDaily.org_id == org_id,
+            StudyTimeDaily.date >= start_date,
+            StudyTimeDaily.date <= today,
+        )
+    )).scalars().all()
+
+    total_minutes = sum(r.total_minutes for r in rows)
+    daily_average = round(total_minutes / max(days, 1))
+
+    # Trend
+    prev_total = (await db.execute(
+        select(func.coalesce(func.sum(StudyTimeDaily.total_minutes), 0)).where(
+            StudyTimeDaily.user_id == student_id,
+            StudyTimeDaily.org_id == org_id,
+            StudyTimeDaily.date >= prev_start,
+            StudyTimeDaily.date < start_date,
+        )
+    )).scalar_one()
+    trend_percent = round(((total_minutes - prev_total) / max(prev_total, 1)) * 100) if prev_total > 0 else 0
+
+    # By date
+    date_map: dict[str, int] = {}
+    for r in rows:
+        d = str(r.date)
+        date_map[d] = date_map.get(d, 0) + r.total_minutes
+    by_date = [
+        {"date": str(today - timedelta(days=i)), "minutes": date_map.get(str(today - timedelta(days=i)), 0)}
+        for i in range(days - 1, -1, -1)
+    ]
+
+    # By subject
+    subject_map: dict[str, int] = {}
+    for r in rows:
+        subject_map[r.subject] = subject_map.get(r.subject, 0) + r.total_minutes
+    by_subject = sorted(
+        [{"subject": s, "minutes": m} for s, m in subject_map.items()],
+        key=lambda x: -x["minutes"],
+    )[:10]
+
+    # Peak hours
+    hour_map: dict[int, int] = {}
+    for r in rows:
+        if r.peak_hour is not None:
+            hour_map[r.peak_hour] = hour_map.get(r.peak_hour, 0) + r.total_minutes
+    peak_hours = sorted(
+        [{"hour": h, "minutes": m} for h, m in hour_map.items()],
+        key=lambda x: -x["minutes"],
+    )[:24]
+
+    # Consistency
+    active_days = len({str(r.date) for r in rows if r.total_minutes >= 15})
+    consistency_score = round((active_days / max(days, 1)) * 100)
+
+    # Student name
+    student = (await db.execute(
+        select(User.name, User.email).where(User.id == student_id)
+    )).first()
+    student_name = (student.name or student.email or "Unknown") if student else "Unknown"
+
+    return {
+        "student_name": student_name,
+        "total_minutes": total_minutes,
+        "daily_average": daily_average,
+        "trend_percent": trend_percent,
+        "by_date": by_date,
+        "by_subject": by_subject,
+        "peak_hours": peak_hours,
+        "consistency_score": consistency_score,
+    }

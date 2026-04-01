@@ -65,6 +65,7 @@ from app.models.ai import (
     AiInteractionHistory,
     IntelligenceCache,
 )
+from app.models.study_time import StudyTimeDaily
 
 __all__ = [
     "User", "UserRole",
@@ -88,4 +89,5 @@ __all__ = [
     "PublicFolder", "PublicFile", "PublicFileChunk",
     "Feedback",
     "PromoCode", "PromoUsage",
+    "StudyTimeDaily",
 ]

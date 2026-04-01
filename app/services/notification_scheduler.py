@@ -254,6 +254,213 @@ async def _check_score_improvement(user: User, db: AsyncSession):
         )
 
 
+# ── Study Time Checks ──────────────────────────────────────────────────────
+
+STUDY_TIME_MILESTONES = [30, 60, 120, 180]
+STUDY_CONSISTENCY_MILESTONES = {5, 10, 20, 30, 50, 100}
+
+
+async def _check_study_time_milestone(user: User, db: AsyncSession):
+    """Celebrate when today's study time crosses 30/60/120/180 minutes."""
+    from app.models.study_time import StudyTimeDaily
+    today = datetime.now(timezone.utc).date()
+
+    result = await db.execute(
+        select(func.coalesce(func.sum(StudyTimeDaily.total_minutes), 0)).where(
+            StudyTimeDaily.user_id == user.id,
+            StudyTimeDaily.date == today,
+        )
+    )
+    total_today = result.scalar_one()
+    if total_today <= 0:
+        return
+
+    # Find highest crossed milestone
+    reached = [m for m in STUDY_TIME_MILESTONES if total_today >= m]
+    if not reached:
+        return
+
+    top = max(reached)
+    hours = top // 60
+    mins = top % 60
+    label = f"{hours}h {mins}m" if hours else f"{mins} min"
+
+    await create_notification(
+        db,
+        user_id=user.id,
+        notification_type=NotificationType.STUDY_TIME_MILESTONE,
+        category="personalized",
+        title=f"You studied {label} today!",
+        body=f"Great focus! You've logged {total_today} minutes of study time today. Keep it up!",
+        icon="clock",
+        data_json={"minutes_today": total_today, "milestone": top, "link": "/u/learning-curve"},
+        dedup_hours=24,
+    )
+
+
+async def _check_study_time_inactive(user: User, db: AsyncSession):
+    """Alert students who haven't studied for 3+ consecutive days."""
+    from app.models.study_time import StudyTimeDaily
+    today = datetime.now(timezone.utc).date()
+    three_days_ago = today - timedelta(days=3)
+
+    # Check if user has any study time in the last 3 days
+    recent = await db.execute(
+        select(func.coalesce(func.sum(StudyTimeDaily.total_minutes), 0)).where(
+            StudyTimeDaily.user_id == user.id,
+            StudyTimeDaily.date >= three_days_ago,
+            StudyTimeDaily.date <= today,
+        )
+    )
+    recent_minutes = recent.scalar_one()
+    if recent_minutes > 0:
+        return
+
+    # Only alert if user was previously active (at least 5 days of recorded study time)
+    history_count = (await db.execute(
+        select(func.count(func.distinct(StudyTimeDaily.date))).where(
+            StudyTimeDaily.user_id == user.id,
+        )
+    )).scalar_one()
+    if history_count < 5:
+        return
+
+    await create_notification(
+        db,
+        user_id=user.id,
+        notification_type=NotificationType.STUDY_TIME_INACTIVE,
+        category="personalized",
+        title="We miss you!",
+        body="You haven't studied in 3 days. Even 15 minutes can make a difference — jump back in!",
+        icon="book-open",
+        data_json={"days_inactive": 3, "link": "/u/ask"},
+        priority="high",
+        dedup_hours=72,
+    )
+
+
+async def _check_study_time_weekly_summary(user: User, db: AsyncSession):
+    """Send a weekly study time summary on Sundays."""
+    from app.models.study_time import StudyTimeDaily
+    today = datetime.now(timezone.utc).date()
+
+    # Only run on Sundays (weekday 6)
+    if today.weekday() != 6:
+        return
+
+    week_start = today - timedelta(days=7)
+    prev_week_start = today - timedelta(days=14)
+
+    # This week
+    this_week = (await db.execute(
+        select(func.coalesce(func.sum(StudyTimeDaily.total_minutes), 0)).where(
+            StudyTimeDaily.user_id == user.id,
+            StudyTimeDaily.date >= week_start,
+            StudyTimeDaily.date < today,
+        )
+    )).scalar_one()
+
+    if this_week <= 0:
+        return
+
+    # Previous week
+    prev_week = (await db.execute(
+        select(func.coalesce(func.sum(StudyTimeDaily.total_minutes), 0)).where(
+            StudyTimeDaily.user_id == user.id,
+            StudyTimeDaily.date >= prev_week_start,
+            StudyTimeDaily.date < week_start,
+        )
+    )).scalar_one()
+
+    # Top subject this week
+    top_subject_row = (await db.execute(
+        select(StudyTimeDaily.subject, func.sum(StudyTimeDaily.total_minutes).label("mins"))
+        .where(
+            StudyTimeDaily.user_id == user.id,
+            StudyTimeDaily.date >= week_start,
+            StudyTimeDaily.date < today,
+        )
+        .group_by(StudyTimeDaily.subject)
+        .order_by(func.sum(StudyTimeDaily.total_minutes).desc())
+        .limit(1)
+    )).first()
+    top_subject = top_subject_row[0] if top_subject_row else "General"
+
+    hours = this_week // 60
+    mins = this_week % 60
+    time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+
+    trend = ""
+    if prev_week > 0:
+        change = round(((this_week - prev_week) / prev_week) * 100)
+        trend = f" {'📈' if change >= 0 else '📉'} {abs(change)}% vs last week."
+
+    await create_notification(
+        db,
+        user_id=user.id,
+        notification_type=NotificationType.STUDY_TIME_WEEKLY_SUMMARY,
+        category="personalized",
+        title=f"Weekly Study Recap: {time_str}",
+        body=f"You studied {time_str} this week. Top subject: {top_subject}.{trend}",
+        icon="bar-chart-2",
+        data_json={
+            "this_week_minutes": this_week,
+            "prev_week_minutes": prev_week,
+            "top_subject": top_subject,
+            "link": "/u/learning-curve",
+        },
+        dedup_hours=168,
+    )
+
+
+async def _check_study_time_consistency(user: User, db: AsyncSession):
+    """Celebrate consecutive days of studying (5, 10, 20, 30, 50, 100)."""
+    from app.models.study_time import StudyTimeDaily
+    today = datetime.now(timezone.utc).date()
+
+    # Get distinct study dates in descending order (minimum 15 min to count)
+    study_dates = (await db.execute(
+        select(StudyTimeDaily.date, func.sum(StudyTimeDaily.total_minutes).label("mins"))
+        .where(StudyTimeDaily.user_id == user.id)
+        .group_by(StudyTimeDaily.date)
+        .having(func.sum(StudyTimeDaily.total_minutes) >= 15)
+        .order_by(StudyTimeDaily.date.desc())
+        .limit(110)  # enough to detect up to 100-day streak
+    )).all()
+
+    if not study_dates:
+        return
+
+    # Count consecutive days ending at the most recent study day
+    consecutive = 0
+    expected_date = study_dates[0][0]
+    for row_date, _ in study_dates:
+        if row_date == expected_date:
+            consecutive += 1
+            expected_date = row_date - timedelta(days=1)
+        else:
+            break
+
+    # Find the highest milestone reached
+    reached = [m for m in STUDY_CONSISTENCY_MILESTONES if consecutive >= m]
+    if not reached:
+        return
+
+    top = max(reached)
+    await create_notification(
+        db,
+        user_id=user.id,
+        notification_type=NotificationType.STUDY_TIME_CONSISTENCY,
+        category="personalized",
+        title=f"{top}-Day Study Streak!",
+        body=f"You've studied for {consecutive} consecutive days. Consistency is the key to mastery!",
+        icon="flame",
+        data_json={"consecutive_days": consecutive, "milestone": top, "link": "/u/learning-curve"},
+        priority="high" if top >= 30 else "normal",
+        dedup_hours=72,
+    )
+
+
 # ── System Checks (run every 30 minutes) ────────────────────────────────────
 
 async def _check_plan_expiry(db: AsyncSession):
@@ -369,6 +576,16 @@ async def _run_personalized_checks():
     """Run personalized notification checks for all active users."""
     async with AsyncSessionLocal() as db:
         try:
+            # Aggregate yesterday's study time before running checks
+            from app.services.study_time_aggregator import aggregate_all_users_yesterday
+            await aggregate_all_users_yesterday(db)
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            print(f"[NotificationScheduler] Study time aggregation error: {e}", flush=True)
+
+    async with AsyncSessionLocal() as db:
+        try:
             users = (await db.execute(
                 select(User).where(User.is_active == True)  # noqa: E712
             )).scalars().all()
@@ -382,6 +599,10 @@ async def _run_personalized_checks():
                     await _check_study_continuation(user, db)
                     await _check_feature_discovery(user, db)
                     await _check_score_improvement(user, db)
+                    await _check_study_time_milestone(user, db)
+                    await _check_study_time_inactive(user, db)
+                    await _check_study_time_weekly_summary(user, db)
+                    await _check_study_time_consistency(user, db)
                 except Exception as e:
                     logger.warning("Notification check failed for user %s: %s", user.id, e)
 

@@ -67,7 +67,7 @@ async def get_career_profile(
             pass
 
     ai = AIService()
-    profile = await ai.generate_career_profile(user_id=str(current_user.id), db=db)
+    profile = await ai.generate_career_profile(user_id=str(current_user.id), db=db, org_id=org_id)
 
     # Cache for 60 minutes
     try:

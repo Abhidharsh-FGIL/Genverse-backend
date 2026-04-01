@@ -50,6 +50,21 @@ def _apply_org_filter(q, column, org_id_param: str | None):
 @router.post("/generate", response_model=AssessmentResponse, status_code=status.HTTP_201_CREATED)
 async def generate_assessment(payload: GenerateAssessmentRequest, current_user: CurrentUser, db: DBSession):
     """Use AI to generate practice assessment questions and save them."""
+
+    # For daily challenges, reuse today's existing one if available
+    is_daily = payload.title and payload.title.lower().startswith("daily challenge")
+    if is_daily:
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        existing = (await db.execute(
+            select(PracticeAssessment).where(
+                PracticeAssessment.created_by == current_user.id,
+                PracticeAssessment.title == payload.title,
+                PracticeAssessment.created_at >= today_start,
+            ).order_by(PracticeAssessment.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if existing:
+            return existing
+
     # Check feature access + usage, then deduct points
     points_service = PointsService()
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="create_assessment", db=db, org_id=_parse_org_id(payload.org_id))
@@ -93,6 +108,38 @@ async def generate_assessment(payload: GenerateAssessmentRequest, current_user: 
     await db.commit()
     await db.refresh(assessment)
     return assessment
+
+
+@router.get("/daily-challenge-status")
+async def daily_challenge_status(current_user: CurrentUser, db: DBSession):
+    """Check if user has a daily challenge today and its completion status."""
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Find today's daily challenge
+    result = await db.execute(
+        select(PracticeAssessment).where(
+            PracticeAssessment.created_by == current_user.id,
+            func.lower(PracticeAssessment.title).like("daily challenge%"),
+            PracticeAssessment.created_at >= today_start,
+        ).order_by(PracticeAssessment.created_at.desc()).limit(1)
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        return {"status": "not_started", "quiz_id": None}
+
+    # Check if there's a submitted attempt
+    attempt_result = await db.execute(
+        select(AssessmentAttempt).where(
+            AssessmentAttempt.assessment_id == assessment.id,
+            AssessmentAttempt.user_id == current_user.id,
+            AssessmentAttempt.status == "evaluated",
+        ).limit(1)
+    )
+    attempt = attempt_result.scalar_one_or_none()
+    if attempt:
+        return {"status": "completed", "quiz_id": str(assessment.id), "score": attempt.percentage, "xp_earned": attempt.xp_earned}
+
+    return {"status": "in_progress", "quiz_id": str(assessment.id)}
 
 
 @router.post("/", response_model=AssessmentResponse, status_code=status.HTTP_201_CREATED)
@@ -426,7 +473,8 @@ async def submit_attempt_by_id(
     attempt.feedback_json = evaluation.get("feedback")
     attempt.submitted_at = datetime.now(timezone.utc)
     attempt.status = "evaluated"
-    attempt.xp_earned = 20
+    is_daily = assessment.title and assessment.title.lower().startswith("daily challenge")
+    attempt.xp_earned = 5 if is_daily else 20
 
     await _update_topic_mastery(current_user.id, assessment, evaluation, db)
     current_user.xp = (current_user.xp or 0) + attempt.xp_earned
@@ -576,7 +624,8 @@ async def submit_attempt(
     attempt.feedback_json = evaluation.get("feedback")
     attempt.submitted_at = datetime.now(timezone.utc)
     attempt.status = "evaluated"
-    attempt.xp_earned = 20
+    is_daily = assessment.title and assessment.title.lower().startswith("daily challenge")
+    attempt.xp_earned = 5 if is_daily else 20
 
     # Update topic mastery
     await _update_topic_mastery(current_user.id, assessment, evaluation, db)

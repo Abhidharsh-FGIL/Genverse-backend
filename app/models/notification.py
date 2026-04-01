@@ -56,3 +56,9 @@ class NotificationType:
     TITLE_EARNED = "title_earned"
     ASSIGNMENT_POSTED = "assignment_posted"
     SUBMISSION_GRADED = "submission_graded"
+
+    # Study time
+    STUDY_TIME_MILESTONE = "study_time_milestone"
+    STUDY_TIME_INACTIVE = "study_time_inactive"
+    STUDY_TIME_WEEKLY_SUMMARY = "study_time_weekly_summary"
+    STUDY_TIME_CONSISTENCY = "study_time_consistency"

@@ -3165,7 +3165,196 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
             chunks.append(chunk)
         return "".join(chunks)
 
-    async def generate_career_profile(self, user_id: str, db) -> dict:
+    async def _fetch_org_enrichment_data(self, user_id: str, org_id: str | None, db) -> dict:
+        """
+        Fetch org-specific data (class submissions, evaluation attempts, engagement)
+        to enrich AI analytics. Returns empty dict for personal workspace.
+        """
+        import uuid as _uuid
+        if not org_id or org_id == "personal":
+            return {}
+
+        try:
+            parsed_org = _uuid.UUID(org_id)
+        except (ValueError, TypeError):
+            return {}
+
+        from sqlalchemy import select, func as sqlfunc
+        from app.models.classes import Submission, Assignment, Class
+        from app.models.evaluation import EvaluationAttempt, EvaluationAssessment
+        from app.models.gamification import WorkspaceGamification, StudentBadge
+        from app.models.content import UserLibraryItem, Ebook
+
+        result = {}
+
+        # ── 1. Graded class submissions ──────────────────────────────────────
+        try:
+            sub_result = await db.execute(
+                select(Submission, Assignment, Class)
+                .join(Assignment, Submission.assignment_id == Assignment.id)
+                .join(Class, Assignment.class_id == Class.id)
+                .where(
+                    Submission.student_id == user_id,
+                    Submission.status.in_(["graded", "returned"]),
+                    Class.org_id == parsed_org,
+                )
+                .order_by(Submission.submitted_at.desc())
+                .limit(30)
+            )
+            sub_rows = sub_result.all()
+
+            submissions_text_lines = []
+            sub_subject_scores = {}  # subject -> list of percentages
+            for sub, assign, cls in sub_rows:
+                grade_data = sub.grade or {}
+                total = grade_data.get("totalScore", 0)
+                max_s = grade_data.get("maxScore", assign.points or 1)
+                pct = round((total / max_s * 100) if max_s else 0)
+                feedback = grade_data.get("overallComment", "")
+                subject = cls.subject or "General"
+
+                submissions_text_lines.append(
+                    f"- {assign.title} ({subject}): {total}/{max_s} ({pct}%)"
+                    + (f" — Feedback: {feedback[:120]}" if feedback else "")
+                )
+                sub_subject_scores.setdefault(subject, []).append(pct)
+
+            if submissions_text_lines:
+                result["submissions_text"] = "\n".join(submissions_text_lines)
+                result["submissions_count"] = len(sub_rows)
+                # Per-subject aggregates from submissions
+                sub_subject_lines = []
+                for subj, scores in sub_subject_scores.items():
+                    avg_s = round(sum(scores) / len(scores))
+                    best_s = max(scores)
+                    sub_subject_lines.append(
+                        f"- {subj}: {len(scores)} assignments, avg {avg_s}%, best {best_s}%"
+                    )
+                result["submissions_subject_text"] = "\n".join(sub_subject_lines)
+                # For combining stats
+                all_pcts = [p for scores in sub_subject_scores.values() for p in scores]
+                result["submissions_avg"] = round(sum(all_pcts) / len(all_pcts)) if all_pcts else 0
+                result["submissions_best"] = max(all_pcts) if all_pcts else 0
+        except Exception:
+            pass
+
+        # ── 2. Evaluation attempts ───────────────────────────────────────────
+        try:
+            eval_result = await db.execute(
+                select(EvaluationAttempt, EvaluationAssessment)
+                .join(EvaluationAssessment, EvaluationAttempt.assessment_id == EvaluationAssessment.id)
+                .where(
+                    EvaluationAttempt.student_id == user_id,
+                    EvaluationAttempt.status == "evaluated",
+                    EvaluationAssessment.org_id == parsed_org,
+                )
+                .order_by(EvaluationAttempt.submitted_at.desc())
+                .limit(20)
+            )
+            eval_rows = eval_result.all()
+            if eval_rows:
+                eval_lines = []
+                for attempt, assessment in eval_rows:
+                    pct = round(attempt.percentage or 0)
+                    eval_lines.append(
+                        f"- {assessment.title} (Difficulty: {assessment.difficulty or 'N/A'}): "
+                        f"{attempt.score or 0}/{attempt.max_score or 0} ({pct}%)"
+                    )
+                result["evaluations_text"] = "\n".join(eval_lines)
+                result["evaluations_count"] = len(eval_rows)
+                eval_pcts = [round(a.percentage or 0) for a, _ in eval_rows]
+                result["evaluations_avg"] = round(sum(eval_pcts) / len(eval_pcts)) if eval_pcts else 0
+        except Exception:
+            pass
+
+        # ── 3. Org engagement data ───────────────────────────────────────────
+        try:
+            ws_gam_result = await db.execute(
+                select(WorkspaceGamification).where(
+                    WorkspaceGamification.user_id == user_id,
+                    WorkspaceGamification.org_id == parsed_org,
+                )
+            )
+            ws_gam = ws_gam_result.scalar_one_or_none()
+            if ws_gam:
+                result["org_xp"] = ws_gam.xp
+                result["org_streak"] = ws_gam.streak
+        except Exception:
+            pass
+
+        try:
+            doc_result = await db.execute(
+                select(sqlfunc.count(UserLibraryItem.id)).where(
+                    UserLibraryItem.user_id == user_id,
+                    UserLibraryItem.org_id == parsed_org,
+                )
+            )
+            result["doc_count"] = doc_result.scalar() or 0
+        except Exception:
+            pass
+
+        try:
+            ebook_result = await db.execute(
+                select(sqlfunc.count(Ebook.id)).where(
+                    Ebook.user_id == user_id,
+                    Ebook.org_id == parsed_org,
+                )
+            )
+            result["ebook_count"] = ebook_result.scalar() or 0
+        except Exception:
+            pass
+
+        try:
+            badge_result = await db.execute(
+                select(sqlfunc.count(StudentBadge.id)).where(
+                    StudentBadge.student_id == user_id,
+                )
+            )
+            result["badge_count"] = badge_result.scalar() or 0
+        except Exception:
+            pass
+
+        return result
+
+    def _build_org_context_text(self, org_data: dict) -> str:
+        """Build prompt text from org enrichment data."""
+        if not org_data:
+            return ""
+
+        sections = []
+
+        if org_data.get("submissions_text"):
+            sections.append(
+                f"CLASS ASSIGNMENT PERFORMANCE ({org_data.get('submissions_count', 0)} graded assignments):\n"
+                f"{org_data['submissions_text']}"
+            )
+        if org_data.get("submissions_subject_text"):
+            sections.append(
+                f"CLASS SUBJECT AVERAGES:\n{org_data['submissions_subject_text']}"
+            )
+        if org_data.get("evaluations_text"):
+            sections.append(
+                f"ORGANIZATION EXAM RESULTS ({org_data.get('evaluations_count', 0)} evaluations):\n"
+                f"{org_data['evaluations_text']}"
+            )
+
+        engagement_parts = []
+        if org_data.get("org_xp"):
+            engagement_parts.append(f"Organization XP: {org_data['org_xp']}")
+        if org_data.get("org_streak"):
+            engagement_parts.append(f"Current streak: {org_data['org_streak']} days")
+        if org_data.get("doc_count"):
+            engagement_parts.append(f"Documents uploaded: {org_data['doc_count']}")
+        if org_data.get("ebook_count"):
+            engagement_parts.append(f"eBooks created: {org_data['ebook_count']}")
+        if org_data.get("badge_count"):
+            engagement_parts.append(f"Badges earned: {org_data['badge_count']}")
+        if engagement_parts:
+            sections.append(f"ORGANIZATION ENGAGEMENT:\n" + "\n".join(f"- {p}" for p in engagement_parts))
+
+        return "\n\n".join(sections)
+
+    async def generate_career_profile(self, user_id: str, db, org_id: str | None = None) -> dict:
         """
         Agentic career profile builder.
         Reads assessment scores, topic mastery, recent AI chat messages, and past career
@@ -3233,8 +3422,12 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
         )
         past_sessions = sessions_result.scalars().all()
 
+        # ── 6. Org-specific data (class submissions, evaluations, engagement) ─
+        org_data = await self._fetch_org_enrichment_data(user_id, org_id, db)
+        org_context = self._build_org_context_text(org_data)
+
         # ── Build prompt context ──────────────────────────────────────────────
-        has_data = bool(attempt_rows or mastery_data or user_messages)
+        has_data = bool(attempt_rows or mastery_data or user_messages or org_data.get("submissions_count"))
 
         subject_text = "\n".join(
             f"- {row.subject or 'General'}: {int(row.attempt_count)} attempts, "
@@ -3273,7 +3466,7 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
 
         prompt = f"""You are an expert AI career counsellor. Analyse this student's platform usage data and generate a comprehensive, personalised career profile. Everything must be grounded in the specific data provided.
 
-SUBJECT PERFORMANCE (from assessments):
+SUBJECT PERFORMANCE (from practice assessments):
 {subject_text}
 
 TOPIC MASTERY:
@@ -3284,6 +3477,7 @@ RECENT AI CHAT TOPICS (user's questions — use to infer interests):
 
 PAST CAREER GUIDANCE SESSIONS:
 {past_sessions_text}
+{f'{chr(10)}{org_context}' if org_context else ''}
 
 Generate a career profile with this exact JSON structure:
 
@@ -3471,7 +3665,7 @@ Return ONLY valid JSON array. No markdown fences."""
         except Exception:
             return [{"type": "content_recommendation", "title": "Start Your Journey", "content": response, "data": {}}]
 
-    async def generate_assessment_recommendations(self, user_id: str, db) -> List[dict]:
+    async def generate_assessment_recommendations(self, user_id: str, db, org_id: str | None = None) -> List[dict]:
         """Generate actionable recommendations based on the user's assessment history."""
         from sqlalchemy import select
         from app.models.assessment import AssessmentAttempt, TopicMastery, PracticeAssessment
@@ -3495,6 +3689,10 @@ Return ONLY valid JSON array. No markdown fences."""
         )
         mastery_data = mastery_result.scalars().all()
 
+        # Org-specific data
+        org_data = await self._fetch_org_enrichment_data(user_id, org_id, db)
+        org_context = self._build_org_context_text(org_data)
+
         attempts_summary = "\n".join(
             f"- Subject: {assessment.subject} | Topics: {', '.join(assessment.topics or [])} | "
             f"Difficulty: {assessment.difficulty} | Score: {attempt.percentage:.0f}% | "
@@ -3509,11 +3707,12 @@ Return ONLY valid JSON array. No markdown fences."""
 
         prompt = f"""You are an AI learning coach. Analyze this student's assessment data and generate 6 specific, actionable recommendations.
 
-RECENT ASSESSMENT ATTEMPTS (most recent first):
+RECENT PRACTICE ASSESSMENT ATTEMPTS (most recent first):
 {attempts_summary}
 
 TOPIC MASTERY (weakest first):
 {mastery_summary}
+{f'{chr(10)}{org_context}' if org_context else ''}
 
 Generate exactly 6 recommendations using these types:
 - "retry": Student scored < 60% on a topic/assessment — suggest retrying it
@@ -3557,7 +3756,7 @@ Return ONLY the JSON array. No markdown fences, no extra text."""
         except Exception:
             return []
 
-    async def generate_assessment_summary(self, user_id: str, db) -> dict:
+    async def generate_assessment_summary(self, user_id: str, db, org_id: str | None = None) -> dict:
         """
         Agentic AI method — analyses the user's full Assessment Hub history
         and returns a structured coach-style summary with strengths, weak areas, goals and momentum.
@@ -3598,9 +3797,18 @@ Return ONLY the JSON array. No markdown fences, no extra text."""
         )
         subject_stats = stats_result.all()
 
-        total_attempts = len(rows)
-        overall_avg = round(sum(r[0].percentage or 0 for r in rows) / total_attempts, 1) if rows else 0
-        best_overall = round(max((r[0].percentage or 0 for r in rows), default=0), 1)
+        # ── Org-specific data ────────────────────────────────────────────────
+        org_data = await self._fetch_org_enrichment_data(user_id, org_id, db)
+        org_context = self._build_org_context_text(org_data)
+
+        total_attempts = len(rows) + org_data.get("submissions_count", 0) + org_data.get("evaluations_count", 0)
+        all_pcts = [r[0].percentage or 0 for r in rows]
+        if org_data.get("submissions_avg"):
+            all_pcts.append(org_data["submissions_avg"])
+        if org_data.get("evaluations_avg"):
+            all_pcts.append(org_data["evaluations_avg"])
+        overall_avg = round(sum(all_pcts) / len(all_pcts), 1) if all_pcts else 0
+        best_overall = round(max(all_pcts, default=0), 1)
 
         # ── Build text context for the AI prompt ────────────────────────────
         attempts_text = "\n".join(
@@ -3638,20 +3846,21 @@ Return ONLY the JSON array. No markdown fences, no extra text."""
                 "best_score": 0,
             }
 
-        prompt = f"""You are an expert AI learning coach. Analyse this student's complete Assessment Hub usage data and produce a personalised coaching summary.
+        prompt = f"""You are an expert AI learning coach. Analyse this student's complete assessment and learning data and produce a personalised coaching summary.
 
-TOTAL ASSESSMENTS TAKEN: {total_attempts}
+TOTAL ASSESSMENTS & ASSIGNMENTS: {total_attempts}
 OVERALL AVERAGE SCORE: {overall_avg}%
 PERSONAL BEST SCORE: {best_overall}%
 
-PER-SUBJECT STATS:
+PER-SUBJECT STATS (practice assessments):
 {subject_text}
 
-RECENT ATTEMPTS (most recent first):
+RECENT PRACTICE ATTEMPTS (most recent first):
 {attempts_text}
 
 TOPIC MASTERY (strongest first):
 {mastery_text}
+{f'{chr(10)}{org_context}' if org_context else ''}
 
 Based on ALL this data, generate a coaching summary with this exact JSON structure:
 

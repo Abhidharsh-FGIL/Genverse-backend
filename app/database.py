@@ -282,6 +282,31 @@ async def run_migrations() -> None:
                 "ALTER TABLE subscriptions ADD COLUMN phonepe_subscription_id VARCHAR(255)"
             ))
 
+        # Create study_time_daily table if it doesn't exist
+        std_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'study_time_daily'"
+        ))
+        if not std_exists.scalar():
+            await conn.execute(text("""
+                CREATE TABLE study_time_daily (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                    org_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
+                    date DATE NOT NULL,
+                    subject VARCHAR(100) NOT NULL DEFAULT 'General',
+                    total_minutes INTEGER NOT NULL DEFAULT 0,
+                    interaction_count INTEGER NOT NULL DEFAULT 0,
+                    assessment_count INTEGER NOT NULL DEFAULT 0,
+                    assessment_minutes INTEGER NOT NULL DEFAULT 0,
+                    peak_hour INTEGER,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ DEFAULT now(),
+                    CONSTRAINT uq_study_time_daily UNIQUE (user_id, org_id, date, subject)
+                )
+            """))
+            await conn.execute(text("CREATE INDEX idx_study_time_user_date ON study_time_daily(user_id, date)"))
+            await conn.execute(text("CREATE INDEX idx_study_time_org_date ON study_time_daily(org_id, date)"))
+
         # Change rubrics.board from board_type enum to varchar so all board names (including 'State Board') work
         rb_type = await conn.execute(text(
             "SELECT data_type FROM information_schema.columns "
