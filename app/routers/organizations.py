@@ -346,7 +346,7 @@ async def invite_member(
     await db.refresh(invitation)
 
     # Send email in background (non-blocking)
-    accept_url = f"{settings.FRONTEND_URL}/genverse/accept-invite?token={token}"
+    accept_url = f"{settings.FRONTEND_URL}/accept-invite?token={token}"
     background_tasks.add_task(
         _send_invite_email_safe,
         to_email=payload.email,
@@ -440,7 +440,7 @@ async def bulk_invite(
         )
         db.add(inv)
 
-        accept_url = f"{settings.FRONTEND_URL}/genverse/accept-invite?token={token}"
+        accept_url = f"{settings.FRONTEND_URL}/accept-invite?token={token}"
         background_tasks.add_task(
             _send_invite_email_safe,
             to_email=item.email,

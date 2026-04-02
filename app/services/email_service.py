@@ -280,7 +280,7 @@ async def send_assessment_invitation(
 
         for email, token in email_token_pairs:
             try:
-                assessment_link = f"{settings.FRONTEND_URL}/genverse/take-assessment?token={token}"
+                assessment_link = f"{settings.FRONTEND_URL}/take-assessment?token={token}"
 
                 html_body = f'''
                 <!DOCTYPE html>
@@ -564,7 +564,7 @@ def send_organization_invitation_email(
             </p>
         """
         button_text = "Open Workspace"
-        button_url = f"{settings.FRONTEND_URL}/genverse/dashboard"
+        button_url = f"{settings.FRONTEND_URL}/dashboard"
     else:
         headline = "You're Invited!"
         intro = f"""
@@ -698,7 +698,7 @@ def send_class_invitation_email(
         return False
 
     org_line = f" at <strong>{organization_name}</strong>" if organization_name else ""
-    signup_url = f"{settings.FRONTEND_URL}/genverse/get-started"
+    signup_url = f"{settings.FRONTEND_URL}/get-started"
 
     html_body = f'''
     <!DOCTYPE html>
