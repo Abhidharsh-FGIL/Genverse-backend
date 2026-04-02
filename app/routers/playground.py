@@ -367,3 +367,79 @@ async def playground_imagine_evaluate(
         payload.max_points, role, grade
     )
     return {"evaluation": evaluation}
+
+
+# ── Myth Busters — /mythbusters ─────────────────────────────────────────────
+
+@router.post("/mythbusters")
+async def playground_mythbusters(
+    payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
+):
+    """Generate a myth + 8 evidence cards for Myth Busters. Cost: 2 pts."""
+    org_id = _parse_org_id(payload.org_id)
+    points_service = PointsService()
+    await points_service.deduct_custom(
+        user_id=current_user.id, action="playground_explore", db=db,
+        cost_override=2, xp_override=5, org_id=org_id,
+    )
+    role, grade = _resolve_role_grade(payload, current_user)
+    ai = AIService()
+    result = await ai.playground_mythbusters(payload.topic, role, grade)
+    return result
+
+
+# ── Cascade Quiz — /cascade-quiz ────────────────────────────────────────────
+
+@router.post("/cascade-quiz")
+async def playground_cascade_quiz(
+    payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
+):
+    """Generate a branching knowledge tree (depth 3, 7 questions). Cost: 2 pts."""
+    org_id = _parse_org_id(payload.org_id)
+    points_service = PointsService()
+    await points_service.deduct_custom(
+        user_id=current_user.id, action="playground_explore", db=db,
+        cost_override=2, xp_override=5, org_id=org_id,
+    )
+    role, grade = _resolve_role_grade(payload, current_user)
+    ai = AIService()
+    result = await ai.playground_cascade_quiz(payload.topic, role, grade)
+    return result
+
+
+# ── Time Warp — /timeline ───────────────────────────────────────────────────
+
+@router.post("/timeline")
+async def playground_timeline(
+    payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
+):
+    """Generate a timeline with 6-8 events + challenges. Cost: 2 pts."""
+    org_id = _parse_org_id(payload.org_id)
+    points_service = PointsService()
+    await points_service.deduct_custom(
+        user_id=current_user.id, action="playground_explore", db=db,
+        cost_override=2, xp_override=5, org_id=org_id,
+    )
+    role, grade = _resolve_role_grade(payload, current_user)
+    ai = AIService()
+    result = await ai.playground_timeline(payload.topic, role, grade)
+    return result
+
+
+# ── Build-a-Diagram — /diagram ──────────────────────────────────────────────
+
+@router.post("/diagram")
+async def playground_diagram(
+    payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
+):
+    """Generate a concept diagram with nodes, connections, and zones. Cost: 2 pts."""
+    org_id = _parse_org_id(payload.org_id)
+    points_service = PointsService()
+    await points_service.deduct_custom(
+        user_id=current_user.id, action="playground_explore", db=db,
+        cost_override=2, xp_override=5, org_id=org_id,
+    )
+    role, grade = _resolve_role_grade(payload, current_user)
+    ai = AIService()
+    result = await ai.playground_diagram(payload.topic, role, grade)
+    return result

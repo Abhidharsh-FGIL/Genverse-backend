@@ -5853,3 +5853,147 @@ Return ONLY valid JSON."""
             return self._parse_json_object(response)
         except Exception:
             return {"score": max_points // 2, "max_score": max_points, "feedback": "Good effort!", "highlight": ""}
+
+    # ── Myth Busters ─────────────────────────────────────────────────────────
+
+    async def playground_mythbusters(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+        """Generate a common myth/misconception + 8 evidence cards for sorting."""
+        audience = self._audience_context(role, grade)
+        prompt = (
+            f"{audience}\n\n"
+            f"Pick a common myth or misconception related to '{topic}'.\n"
+            "Return a JSON object with:\n"
+            '1. "myth": the myth statement (1 sentence, stated as if it were true)\n'
+            '2. "is_myth": boolean — true if it really IS a myth (false/incorrect), false if it is actually a fact\n'
+            '3. "explanation": 2-3 sentence explanation of the truth\n'
+            '4. "evidence": array of exactly 8 evidence cards. Each card:\n'
+            '   - "id": integer 1-8\n'
+            '   - "text": a piece of evidence or claim (1-2 sentences)\n'
+            '   - "category": one of "busts" | "supports" | "red_herring"\n'
+            '   - "explanation": why this evidence belongs in that category (1 sentence)\n\n'
+            "Distribution: approximately 3 busts, 3 supports, 2 red_herring.\n"
+            '"busts" = evidence that disproves the myth.\n'
+            '"supports" = evidence that seems to confirm the myth.\n'
+            '"red_herring" = sounds relevant but is actually irrelevant or misleading.\n\n'
+            "Make evidence cards plausible and thought-provoking.\n"
+            "Return ONLY the JSON object — no markdown, no extra text."
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            data = self._parse_json_object(response)
+            if "evidence" in data:
+                data["evidence"] = data["evidence"][:8]
+            return data
+        except Exception:
+            return {
+                "myth": f"Common belief about {topic}",
+                "is_myth": True,
+                "explanation": "This is a common misconception.",
+                "evidence": [],
+            }
+
+    # ── Cascade Quiz ─────────────────────────────────────────────────────────
+
+    async def playground_cascade_quiz(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+        """Generate a branching quiz tree (depth 3, 7 questions total)."""
+        audience = self._audience_context(role, grade)
+        prompt = (
+            f"{audience}\n\n"
+            f"Create a branching quiz tree about '{topic}'.\n"
+            "The tree has 3 levels:\n"
+            "- Level 0: 1 root question\n"
+            "- Level 1: 2 questions (children of root)\n"
+            "- Level 2: 4 questions (2 children per level-1 node)\n"
+            "Total: 7 questions forming a binary tree.\n\n"
+            "Each question should relate to its parent — when a student answers the parent,\n"
+            "the children dive deeper into related sub-topics.\n\n"
+            "Return a JSON object with a single key \"tree\" containing the root node.\n"
+            "Each node has:\n"
+            '- "id": unique string (e.g. "root", "l1a", "l1b", "l2a", "l2b", "l2c", "l2d")\n'
+            '- "question": the question text\n'
+            '- "options": array of exactly 4 answer options\n'
+            '- "correct": 0-based index of the correct option\n'
+            '- "explanation": 1-sentence explanation of the correct answer\n'
+            '- "children": array of exactly 2 child nodes (omit for leaf nodes at level 2)\n\n'
+            "Start broad at the root, get more specific at each level.\n"
+            "Return ONLY the JSON object — no markdown, no extra text."
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            data = self._parse_json_object(response)
+            return data
+        except Exception:
+            return {"tree": None}
+
+    # ── Time Warp (Timeline) ─────────────────────────────────────────────────
+
+    async def playground_timeline(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+        """Generate a timeline of events + ordering/prediction challenges."""
+        audience = self._audience_context(role, grade)
+        prompt = (
+            f"{audience}\n\n"
+            f"Create an educational timeline about '{topic}'.\n\n"
+            "Return a JSON object with:\n"
+            '1. "title": timeline title (3-6 words)\n'
+            '2. "events": array of 6-8 events in chronological order. Each event:\n'
+            '   - "id": integer starting from 1\n'
+            '   - "date": the date/period (e.g. "1687", "350 BC", "1900s")\n'
+            '   - "title": event title (3-8 words)\n'
+            '   - "description": 2-3 sentence description of the event and its significance\n'
+            '   - "emoji": a single emoji representing this event\n\n'
+            '3. "challenges": array of 2-3 challenges:\n'
+            '   For ordering challenges (type "order"):\n'
+            '   - "type": "order"\n'
+            '   - "scrambled": array of 4 event titles in scrambled order\n'
+            '   - "correct_order": the same 4 titles in correct chronological order\n\n'
+            '   For prediction challenges (type "predict"):\n'
+            '   - "type": "predict"\n'
+            '   - "after_event": title of the event this question follows\n'
+            '   - "question": "What happened next?" style question\n'
+            '   - "options": array of 4 options\n'
+            '   - "correct": 0-based index of correct option\n\n'
+            "Include at least 1 order challenge and 1 predict challenge.\n"
+            "Events MUST be in correct chronological order.\n"
+            "Return ONLY the JSON object — no markdown, no extra text."
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            data = self._parse_json_object(response)
+            return data
+        except Exception:
+            return {"title": f"Timeline of {topic}", "events": [], "challenges": []}
+
+    # ── Build-a-Diagram ──────────────────────────────────────────────────────
+
+    async def playground_diagram(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+        """Generate a concept diagram with nodes, connections, and zones."""
+        audience = self._audience_context(role, grade)
+        prompt = (
+            f"{audience}\n\n"
+            f"Create a concept diagram about '{topic}' that a student can build.\n\n"
+            "Return a JSON object with:\n"
+            '1. "title": diagram title (3-6 words)\n'
+            '2. "zones": array of 2-4 logical groupings/categories. Each zone:\n'
+            '   - "id": short identifier (e.g. "inputs", "process", "outputs")\n'
+            '   - "label": display label (e.g. "Inputs", "Process", "Outputs")\n\n'
+            '3. "nodes": array of 6-10 concept nodes. Each node:\n'
+            '   - "id": unique short identifier (e.g. "n1", "n2")\n'
+            '   - "label": the concept name (or "???" for mystery nodes)\n'
+            '   - "type": "normal" or "mystery"\n'
+            '   - "zone": which zone id this node correctly belongs to\n'
+            '   - "hint": (mystery nodes only) a hint about what this node should be labeled\n'
+            '   - "answer": (mystery nodes only) the correct label\n\n'
+            '4. "connections": array of 4-8 connections between nodes. Each:\n'
+            '   - "from": source node id\n'
+            '   - "to": target node id\n'
+            '   - "label": relationship description (2-4 words)\n\n'
+            "Include 1-2 mystery nodes that students must identify.\n"
+            "Nodes should form a logical flow or process diagram.\n"
+            "Return ONLY the JSON object — no markdown, no extra text."
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            data = self._parse_json_object(response)
+            return data
+        except Exception:
+            return {"title": f"{topic} Diagram", "zones": [], "nodes": [], "connections": []}

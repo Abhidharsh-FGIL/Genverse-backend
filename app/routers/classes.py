@@ -360,8 +360,26 @@ async def update_class(
     if not class_:
         raise NotFoundException("Class not found")
 
-    # Allow class teacher OR org admin
+    # Allow class teacher, co-teacher, grade-section teacher, or org admin
     is_owner = class_.teacher_id == current_user.id
+    if not is_owner:
+        co_result = await db.execute(
+            select(ClassTeacher).where(ClassTeacher.class_id == class_id, ClassTeacher.teacher_id == current_user.id)
+        )
+        if co_result.scalar_one_or_none():
+            is_owner = True
+    if not is_owner and class_.org_id and class_.grade and class_.section:
+        gst_q = select(GradeSectionTeacher).where(
+            GradeSectionTeacher.org_id == class_.org_id,
+            GradeSectionTeacher.teacher_id == current_user.id,
+            GradeSectionTeacher.grade == class_.grade,
+            GradeSectionTeacher.section == class_.section,
+        )
+        if class_.academic_year:
+            gst_q = gst_q.where(GradeSectionTeacher.academic_year == class_.academic_year)
+        gst_result = await db.execute(gst_q)
+        if gst_result.scalar_one_or_none():
+            is_owner = True
     is_org_admin = False
     if class_.org_id:
         # Check OrgMember table
@@ -414,6 +432,24 @@ async def delete_class(class_id: uuid.UUID, current_user: CurrentUser, db: DBSes
         raise NotFoundException("Class not found")
 
     is_owner = class_.teacher_id == current_user.id
+    if not is_owner:
+        co_result = await db.execute(
+            select(ClassTeacher).where(ClassTeacher.class_id == class_id, ClassTeacher.teacher_id == current_user.id)
+        )
+        if co_result.scalar_one_or_none():
+            is_owner = True
+    if not is_owner and class_.org_id and class_.grade and class_.section:
+        gst_q = select(GradeSectionTeacher).where(
+            GradeSectionTeacher.org_id == class_.org_id,
+            GradeSectionTeacher.teacher_id == current_user.id,
+            GradeSectionTeacher.grade == class_.grade,
+            GradeSectionTeacher.section == class_.section,
+        )
+        if class_.academic_year:
+            gst_q = gst_q.where(GradeSectionTeacher.academic_year == class_.academic_year)
+        gst_result = await db.execute(gst_q)
+        if gst_result.scalar_one_or_none():
+            is_owner = True
     is_org_admin = False
     if class_.org_id:
         admin_result = await db.execute(
@@ -786,8 +822,26 @@ async def add_co_teacher(
     if not class_:
         raise NotFoundException("Class not found")
 
-    # Allow class owner OR org admin to add co-teachers
+    # Allow class owner, co-teacher, grade-section teacher, or org admin to add co-teachers
     is_class_owner = class_.teacher_id == current_user.id
+    if not is_class_owner:
+        co_result = await db.execute(
+            select(ClassTeacher).where(ClassTeacher.class_id == class_id, ClassTeacher.teacher_id == current_user.id)
+        )
+        if co_result.scalar_one_or_none():
+            is_class_owner = True
+    if not is_class_owner and class_.org_id and class_.grade and class_.section:
+        gst_q = select(GradeSectionTeacher).where(
+            GradeSectionTeacher.org_id == class_.org_id,
+            GradeSectionTeacher.teacher_id == current_user.id,
+            GradeSectionTeacher.grade == class_.grade,
+            GradeSectionTeacher.section == class_.section,
+        )
+        if class_.academic_year:
+            gst_q = gst_q.where(GradeSectionTeacher.academic_year == class_.academic_year)
+        gst_result = await db.execute(gst_q)
+        if gst_result.scalar_one_or_none():
+            is_class_owner = True
     is_org_admin = False
     if class_.org_id:
         admin_result = await db.execute(

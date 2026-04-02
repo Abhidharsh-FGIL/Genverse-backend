@@ -66,6 +66,8 @@ class EvalQuestionCreate(BaseModel):
     tags: Optional[List[str]] = None
     source_type: Optional[str] = None
     blooms_level: Optional[str] = None
+    attachment_url: Optional[str] = None
+    attachment_name: Optional[str] = None
 
 
 class EvalQuestionUpdate(BaseModel):
@@ -75,6 +77,8 @@ class EvalQuestionUpdate(BaseModel):
     marks: Optional[float] = None
     explanation: Optional[str] = None
     tags: Optional[List[str]] = None
+    attachment_url: Optional[str] = None
+    attachment_name: Optional[str] = None
 
 
 class EvalQuestionResponse(BaseModel):
@@ -92,6 +96,10 @@ class EvalQuestionResponse(BaseModel):
     explanation: Optional[str] = None
     source_type: Optional[str] = None
     blooms_level: Optional[str] = None
+    attachment_url: Optional[str] = None
+    attachment_name: Optional[str] = None
+    grade: Optional[int] = None
+    board: Optional[str] = None
     is_ai_generated: bool
     order_index: int
 

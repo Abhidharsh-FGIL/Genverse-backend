@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.models.ai import AiInteractionHistory
 from app.models.assessment import AssessmentAttempt, PracticeAssessment
 from app.models.study_time import StudyTimeDaily
+from app.models.organization import OrgMember
 
 logger = logging.getLogger(__name__)
 
@@ -209,9 +210,23 @@ async def aggregate_all_users_yesterday(db: AsyncSession):
 
     all_users = set(user_rows) | set(attempt_users)
 
+    # Look up org memberships for all active users so we can store org_id
+    org_memberships: dict = {}
+    if all_users:
+        om_rows = (await db.execute(
+            select(OrgMember.user_id, OrgMember.org_id).where(
+                OrgMember.user_id.in_(list(all_users)),
+                OrgMember.status == "active",
+            )
+        )).all()
+        for uid, oid in om_rows:
+            org_memberships.setdefault(uid, []).append(oid)
+
     for uid in all_users:
         try:
-            await aggregate_user_study_time(uid, yesterday, db)
+            org_ids = org_memberships.get(uid, [None])
+            for oid in org_ids:
+                await aggregate_user_study_time(uid, yesterday, db, org_id=oid)
         except Exception as e:
             logger.warning("Study time aggregation failed for user %s: %s", uid, e)
 
@@ -261,10 +276,25 @@ async def backfill_study_time(db: AsyncSession, days_back: int = 90):
         if day:
             pairs.add((uid, day))
 
+    # Look up org memberships for all users
+    all_user_ids = {uid for uid, _ in pairs}
+    org_memberships: dict = {}
+    if all_user_ids:
+        om_rows = (await db.execute(
+            select(OrgMember.user_id, OrgMember.org_id).where(
+                OrgMember.user_id.in_(list(all_user_ids)),
+                OrgMember.status == "active",
+            )
+        )).all()
+        for uid, oid in om_rows:
+            org_memberships.setdefault(uid, []).append(oid)
+
     count = 0
     for uid, day in pairs:
         try:
-            await aggregate_user_study_time(uid, day, db)
+            org_ids = org_memberships.get(uid, [None])
+            for oid in org_ids:
+                await aggregate_user_study_time(uid, day, db, org_id=oid)
             count += 1
         except Exception as e:
             logger.warning("Backfill failed for user %s date %s: %s", uid, day, e)

@@ -68,7 +68,8 @@ def _score_attempt(attempt, questions, responses, assessment):
         if student_answer and str(student_answer).strip().lower() == str(q.correct_answer or "").strip().lower():
             score += q.marks
         elif student_answer and assessment.negative_marking:
-            score -= q.negative_marks
+            penalty = q.negative_marks if q.negative_marks else (assessment.negative_mark_value or 0.25)
+            score -= penalty
     attempt.responses = responses
     attempt.score = max(0, score)
     attempt.max_score = max_score
@@ -440,7 +441,7 @@ async def get_paper(paper_id: uuid.UUID, current_user: CurrentUser, db: DBSessio
 
 # ---- Questions ----
 
-@router.get("/questions", response_model=list[EvalQuestionResponse])
+@router.get("/questions")
 async def list_all_questions(
     org_id: str = Query(...),
     current_user: CurrentUser = None,
@@ -449,12 +450,15 @@ async def list_all_questions(
     question_type: str | None = Query(None, alias="type"),
     difficulty: str | None = Query(None),
     source_type: str | None = Query(None, alias="source"),
+    grade: int | None = Query(None),
+    board: str | None = Query(None),
+    blooms_level: str | None = Query(None),
     paper_id: str | None = Query(None),
     limit: int = Query(200, le=500),
 ):
     """Get questions across all papers in the org, with optional filters."""
     q = (
-        select(EvaluationQuestion)
+        select(EvaluationQuestion, EvaluationQuestionPaper.grade, EvaluationQuestionPaper.board)
         .join(EvaluationQuestionPaper, EvaluationQuestion.paper_id == EvaluationQuestionPaper.id)
         .where(EvaluationQuestionPaper.org_id == uuid.UUID(org_id))
     )
@@ -468,9 +472,23 @@ async def list_all_questions(
         q = q.where(EvaluationQuestion.difficulty == difficulty)
     if source_type:
         q = q.where(EvaluationQuestion.source_type == source_type)
+    if grade:
+        q = q.where(EvaluationQuestionPaper.grade == grade)
+    if board:
+        q = q.where(EvaluationQuestionPaper.board == board)
+    if blooms_level:
+        q = q.where(EvaluationQuestion.blooms_level == blooms_level)
     q = q.order_by(EvaluationQuestion.created_at.desc()).limit(limit)
     result = await db.execute(q)
-    return result.scalars().all()
+    rows = result.all()
+    # Attach grade and board from paper to each question response
+    response = []
+    for question, paper_grade, paper_board in rows:
+        data = EvalQuestionResponse.model_validate(question)
+        data.grade = paper_grade
+        data.board = paper_board
+        response.append(data)
+    return response
 
 
 @router.get("/subjects")
@@ -1459,6 +1477,8 @@ async def public_start_attempt(token: str, payload: PublicStartAttemptRequest, d
             "chapter": q.chapter,
             "difficulty": q.difficulty,
             "order_index": q.order_index,
+            "attachment_url": q.attachment_url,
+            "attachment_name": q.attachment_name,
         }
         questions_data.append(q_dict)
 
@@ -1719,7 +1739,8 @@ async def get_attempt_detail(
         if student_answer and is_correct:
             marks_earned = q.marks
         elif student_answer and not is_correct and assessment.negative_marking:
-            marks_earned = -q.negative_marks
+            penalty = q.negative_marks if q.negative_marks else (assessment.negative_mark_value or 0.25)
+            marks_earned = -penalty
 
         questions_detail.append({
             "id": str(q.id),
@@ -1752,6 +1773,8 @@ async def get_attempt_detail(
         "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
         "submitted_at": attempt.submitted_at.isoformat() if attempt.submitted_at else None,
         "attempt_metadata": attempt.attempt_metadata,
+        "negative_marking": assessment.negative_marking,
+        "negative_mark_value": assessment.negative_mark_value,
         "questions": questions_detail,
         "total_questions": len(questions),
         "correct_count": sum(1 for q in questions_detail if q["is_correct"]),

@@ -16,8 +16,8 @@ router = APIRouter()
 
 
 async def _check_class_membership(class_id: uuid.UUID, user_id: uuid.UUID, db: AsyncSession) -> bool:
-    """Return True if user is the class teacher, a co-teacher, an enrolled student, or an org admin."""
-    from app.models.classes import ClassStudent, ClassTeacher, Class
+    """Return True if user is the class teacher, a co-teacher, a grade-section teacher, an enrolled student, or an org admin."""
+    from app.models.classes import ClassStudent, ClassTeacher, Class, GradeSectionTeacher
     from app.models.organization import OrgMember
 
     cls_result = await db.execute(
@@ -38,6 +38,19 @@ async def _check_class_membership(class_id: uuid.UUID, user_id: uuid.UUID, db: A
     )
     if student_result.scalar_one_or_none():
         return True
+    # Check grade-section teacher assignment
+    if cls.org_id and cls.grade and cls.section:
+        gst_q = select(GradeSectionTeacher).where(
+            GradeSectionTeacher.org_id == cls.org_id,
+            GradeSectionTeacher.teacher_id == user_id,
+            GradeSectionTeacher.grade == cls.grade,
+            GradeSectionTeacher.section == cls.section,
+        )
+        if cls.academic_year:
+            gst_q = gst_q.where(GradeSectionTeacher.academic_year == cls.academic_year)
+        gst_result = await db.execute(gst_q)
+        if gst_result.scalar_one_or_none():
+            return True
     # Check org admin
     if cls.org_id:
         admin_result = await db.execute(
@@ -54,8 +67,8 @@ async def _check_class_membership(class_id: uuid.UUID, user_id: uuid.UUID, db: A
 
 
 async def _check_is_class_teacher(class_id: uuid.UUID, user_id: uuid.UUID, db: AsyncSession) -> bool:
-    """Return True if user is the main teacher, a co-teacher, or an org admin of the class's org."""
-    from app.models.classes import ClassTeacher, Class
+    """Return True if user is the main teacher, a co-teacher, a grade-section teacher, or an org admin of the class's org."""
+    from app.models.classes import ClassTeacher, Class, GradeSectionTeacher
     from app.models.organization import OrgMember
 
     # Check main teacher
@@ -74,6 +87,20 @@ async def _check_is_class_teacher(class_id: uuid.UUID, user_id: uuid.UUID, db: A
     )
     if co_result.scalar_one_or_none():
         return True
+
+    # Check grade-section teacher assignment
+    if cls.org_id and cls.grade and cls.section:
+        gst_q = select(GradeSectionTeacher).where(
+            GradeSectionTeacher.org_id == cls.org_id,
+            GradeSectionTeacher.teacher_id == user_id,
+            GradeSectionTeacher.grade == cls.grade,
+            GradeSectionTeacher.section == cls.section,
+        )
+        if cls.academic_year:
+            gst_q = gst_q.where(GradeSectionTeacher.academic_year == cls.academic_year)
+        gst_result = await db.execute(gst_q)
+        if gst_result.scalar_one_or_none():
+            return True
 
     # Check org admin
     if cls.org_id:

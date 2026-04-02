@@ -1072,8 +1072,10 @@ async def get_recent_activity(
 
     # --- Library uploads ---
     lib_q = select(UserLibraryItem).where(_user_filter(UserLibraryItem.user_id))
-    if parsed_oid:
+    if parsed_oid and not show_user:
         lib_q = lib_q.where(UserLibraryItem.org_id == parsed_oid)
+    elif not parsed_oid and org_id is not None:
+        lib_q = lib_q.where(UserLibraryItem.org_id.is_(None))
     lib_rows = (await db.execute(
         lib_q.order_by(UserLibraryItem.created_at.desc()).limit(limit)
     )).scalars().all()
@@ -1085,8 +1087,12 @@ async def get_recent_activity(
 
     # --- AI Chats ---
     chat_q = select(AiChat).where(_user_filter(AiChat.user_id))
-    if parsed_oid:
+    if parsed_oid and not show_user:
+        # Personal view within an org — filter by org_id
         chat_q = chat_q.where(AiChat.org_id == parsed_oid)
+    elif not parsed_oid and org_id is not None:
+        chat_q = chat_q.where(AiChat.org_id.is_(None))
+    # For org admin view, _user_filter already restricts to org members
     chat_rows = (await db.execute(
         chat_q.order_by(AiChat.created_at.desc()).limit(limit)
     )).scalars().all()
@@ -1098,8 +1104,10 @@ async def get_recent_activity(
 
     # --- eBooks ---
     ebook_q = select(Ebook).where(_user_filter(Ebook.user_id))
-    if parsed_oid:
+    if parsed_oid and not show_user:
         ebook_q = ebook_q.where(Ebook.org_id == parsed_oid)
+    elif not parsed_oid and org_id is not None:
+        ebook_q = ebook_q.where(Ebook.org_id.is_(None))
     ebook_rows = (await db.execute(
         ebook_q.order_by(Ebook.created_at.desc()).limit(limit)
     )).scalars().all()
@@ -1365,7 +1373,7 @@ async def get_org_study_time(
         )
     else:
         member_ids_result = await db.execute(
-            select(OrgMember.user_id).where(OrgMember.org_id == org_id, OrgMember.status == "active")
+            select(OrgMember.user_id).where(OrgMember.org_id == org_id, OrgMember.status == "active", OrgMember.role == "student")
         )
     member_ids = [r[0] for r in member_ids_result.all()]
 

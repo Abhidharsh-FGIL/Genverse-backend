@@ -78,6 +78,8 @@ class EvaluationQuestion(Base):
     tags: Mapped[dict | None] = mapped_column(JSONB)
     source_type: Mapped[str | None] = mapped_column(String(20))  # online | text | file
     blooms_level: Mapped[str | None] = mapped_column(String(30))
+    attachment_url: Mapped[str | None] = mapped_column(Text)
+    attachment_name: Mapped[str | None] = mapped_column(String(255))
     is_ai_generated: Mapped[bool] = mapped_column(Boolean, default=False)
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

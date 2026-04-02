@@ -90,7 +90,7 @@ async def list_assignments(
         q = q.where(Assignment.class_id == uuid.UUID(class_id))
     else:
         # No class filter — scope to classes the user has access to (enrolled or teaches)
-        from app.models.classes import ClassStudent, ClassTeacher
+        from app.models.classes import ClassStudent, ClassTeacher, GradeSectionTeacher
         enrolled_q = select(ClassStudent.class_id).where(ClassStudent.student_id == current_user.id)
         teaching_q = select(Class.id).where(Class.teacher_id == current_user.id)
         co_teaching_q = select(ClassTeacher.class_id).where(ClassTeacher.teacher_id == current_user.id)
@@ -102,6 +102,22 @@ async def list_assignments(
             [r[0] for r in teaching_result.all()] +
             [r[0] for r in co_teaching_result.all()]
         )
+        # Also include classes from GradeSectionTeacher assignments
+        gst_result = await db.execute(
+            select(GradeSectionTeacher).where(GradeSectionTeacher.teacher_id == current_user.id)
+        )
+        for gst in gst_result.scalars().all():
+            gst_classes_q = select(Class.id).where(
+                Class.org_id == gst.org_id,
+                Class.grade == gst.grade,
+                Class.section == gst.section,
+                Class.is_active == True,
+            )
+            if gst.academic_year:
+                gst_classes_q = gst_classes_q.where(Class.academic_year == gst.academic_year)
+            gst_classes_result = await db.execute(gst_classes_q)
+            for r in gst_classes_result.all():
+                allowed_ids.add(r[0])
         if not allowed_ids:
             return []
         q = q.where(Assignment.class_id.in_(list(allowed_ids)))
