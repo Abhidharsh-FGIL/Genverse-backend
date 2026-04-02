@@ -75,6 +75,7 @@ async def extract_text(
         file_size_mb=file_info.get("size_mb"),
         folder="ocr",
         is_processed=bool(extracted_text),
+        processing_status="ready",
         org_id=_parse_org_id(org_id),
     )
     db.add(item)
