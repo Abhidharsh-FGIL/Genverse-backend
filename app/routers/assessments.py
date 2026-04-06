@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date as date_cls
 from fastapi import APIRouter, status, Query
 from sqlalchemy import select, func
 
@@ -51,19 +51,30 @@ def _apply_org_filter(q, column, org_id_param: str | None):
 async def generate_assessment(payload: GenerateAssessmentRequest, current_user: CurrentUser, db: DBSession):
     """Use AI to generate practice assessment questions and save them."""
 
-    # For daily challenges, reuse today's existing one if available
+    # For daily challenges, reuse today's existing one if available — but only
+    # if it actually has questions. If a prior generation produced an empty
+    # assessment (AI failure), drop it so the user can regenerate cleanly.
     is_daily = payload.title and payload.title.lower().startswith("daily challenge")
     if is_daily:
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        existing = (await db.execute(
+        existing_rows = (await db.execute(
             select(PracticeAssessment).where(
                 PracticeAssessment.created_by == current_user.id,
-                PracticeAssessment.title == payload.title,
+                func.lower(PracticeAssessment.title).like("daily challenge%"),
                 PracticeAssessment.created_at >= today_start,
-            ).order_by(PracticeAssessment.created_at.desc()).limit(1)
-        )).scalar_one_or_none()
-        if existing:
-            return existing
+            ).order_by(PracticeAssessment.created_at.desc())
+        )).scalars().all()
+        usable = next(
+            (r for r in existing_rows if r.question_json and (not isinstance(r.question_json, list) or len(r.question_json) > 0)),
+            None,
+        )
+        if usable:
+            return usable
+        # Delete any empty/broken rows so they don't pollute history/status checks
+        for row in existing_rows:
+            await db.delete(row)
+        if existing_rows:
+            await db.commit()
 
     # Check feature access + usage, then deduct points
     points_service = PointsService()
@@ -85,6 +96,12 @@ async def generate_assessment(payload: GenerateAssessmentRequest, current_user: 
         question_types=payload.question_types,
         mode=payload.mode,
     )
+
+    if not questions or (isinstance(questions, list) and len(questions) == 0):
+        raise HTTPException(
+            status_code=502,
+            detail="The AI couldn't generate questions right now. Please try again in a moment.",
+        )
 
     assessment = PracticeAssessment(
         created_by=current_user.id,
@@ -127,6 +144,12 @@ async def daily_challenge_status(current_user: CurrentUser, db: DBSession):
     if not assessment:
         return {"status": "not_started", "quiz_id": None}
 
+    # If the assessment row exists but has no usable questions, treat it as
+    # not_started so the user can generate a fresh one instead of getting stuck.
+    qjson = assessment.question_json
+    if not qjson or (isinstance(qjson, list) and len(qjson) == 0):
+        return {"status": "not_started", "quiz_id": None}
+
     # Check if there's a submitted attempt
     attempt_result = await db.execute(
         select(AssessmentAttempt).where(
@@ -140,6 +163,174 @@ async def daily_challenge_status(current_user: CurrentUser, db: DBSession):
         return {"status": "completed", "quiz_id": str(assessment.id), "score": attempt.percentage, "xp_earned": attempt.xp_earned}
 
     return {"status": "in_progress", "quiz_id": str(assessment.id)}
+
+
+@router.get("/daily-challenge-history")
+async def daily_challenge_history(
+    current_user: CurrentUser,
+    db: DBSession,
+    org_id: str | None = Query(None),
+    days: int = Query(60, ge=1, le=365),
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = Query(None, alias="to"),
+):
+    """Return daily-challenge attempts for the current user with missed days synthesized.
+
+    Window defaults to the last `days` days but can be overridden via from/to (YYYY-MM-DD).
+    Used by the student "Daily Challenge History" page.
+    """
+    # Resolve window
+    today = datetime.now(timezone.utc).date()
+    try:
+        end_date = date_cls.fromisoformat(to) if to else today
+        start_date = date_cls.fromisoformat(from_) if from_ else (end_date - timedelta(days=days - 1))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid from/to date; expected YYYY-MM-DD")
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+    end_dt = datetime.combine(end_date, datetime.max.time(), tzinfo=timezone.utc)
+
+    # Pull all daily challenge assessments + attempts in window for this user
+    q = (
+        select(PracticeAssessment, AssessmentAttempt)
+        .join(AssessmentAttempt, AssessmentAttempt.assessment_id == PracticeAssessment.id, isouter=True)
+        .where(
+            PracticeAssessment.created_by == current_user.id,
+            func.lower(PracticeAssessment.title).like("daily challenge%"),
+            PracticeAssessment.created_at >= start_dt,
+            PracticeAssessment.created_at <= end_dt,
+        )
+    )
+    if org_id is not None:
+        q = _apply_org_filter(q, PracticeAssessment.org_id, org_id)
+    q = q.order_by(PracticeAssessment.created_at.asc())
+    result = await db.execute(q)
+    rows = result.all()
+
+    # Bucket by date — keep the latest evaluated attempt per day, else any in_progress
+    by_date: dict[str, dict] = {}
+    for assessment, attempt in rows:
+        d = assessment.created_at.astimezone(timezone.utc).date().isoformat()
+        existing = by_date.get(d)
+        is_eval = bool(attempt and attempt.status == "evaluated")
+        if existing and existing.get("is_eval") and not is_eval:
+            continue
+        questions_payload = []
+        if attempt and attempt.status == "evaluated":
+            qjson = assessment.question_json or []
+            responses = attempt.responses_json or {}
+            feedback = attempt.feedback_json or {}
+            if isinstance(qjson, list):
+                for q_obj in qjson:
+                    qid = str(q_obj.get("id", ""))
+                    fb = feedback.get(qid) or {}
+                    is_correct = bool(fb.get("correct", False))
+                    questions_payload.append({
+                        "id": qid,
+                        "prompt": q_obj.get("text") or q_obj.get("question") or q_obj.get("prompt") or "",
+                        "topic": q_obj.get("topic"),
+                        "studentAnswer": responses.get(qid),
+                        "correctAnswer": q_obj.get("correctAnswer") or q_obj.get("correct_answer") or q_obj.get("answer") or "",
+                        "isCorrect": is_correct,
+                        "explanation": fb.get("explanation") or q_obj.get("explanation"),
+                    })
+        by_date[d] = {
+            "is_eval": is_eval,
+            "payload": {
+                "date": d,
+                "status": "completed" if is_eval else ("in_progress" if attempt else "in_progress"),
+                "assessmentId": str(assessment.id),
+                "attemptId": str(attempt.id) if attempt else None,
+                "score": float(attempt.percentage) if (attempt and attempt.percentage is not None) else None,
+                "maxScore": float(attempt.max_score) if (attempt and attempt.max_score is not None) else None,
+                "xpEarned": int(attempt.xp_earned) if attempt else 0,
+                "subject": assessment.subject,
+                "topics": assessment.topics if isinstance(assessment.topics, list) else None,
+                "questions": questions_payload,
+            },
+        }
+
+    # Synthesize the full date range with missed/future
+    attempts_out: list[dict] = []
+    cursor = start_date
+    while cursor <= end_date:
+        ds = cursor.isoformat()
+        if ds in by_date:
+            attempts_out.append(by_date[ds]["payload"])
+        else:
+            attempts_out.append({
+                "date": ds,
+                "status": "future" if cursor > today else "missed",
+                "assessmentId": None,
+                "attemptId": None,
+                "score": None,
+                "xpEarned": 0,
+                "questions": [],
+            })
+        cursor += timedelta(days=1)
+
+    # Stats
+    completed = [a for a in attempts_out if a["status"] == "completed"]
+    past_days = [a for a in attempts_out if a["status"] != "future"]
+    missed = [a for a in past_days if a["status"] == "missed"]
+    total_past = len(past_days)
+    completion_rate = round((len(completed) / total_past) * 100) if total_past else 0
+    avg_score = round(sum((a.get("score") or 0) for a in completed) / len(completed)) if completed else 0
+    total_xp = sum(int(a.get("xpEarned") or 0) for a in completed)
+
+    # Streaks (computed over past_days only, chronological)
+    best = cur = 0
+    for a in past_days:
+        if a["status"] == "completed":
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    # Current streak counts back from today (or most recent past day)
+    current_streak = 0
+    for a in reversed(past_days):
+        if a["status"] == "completed":
+            current_streak += 1
+        else:
+            break
+
+    # Topic breakdown across question-level data
+    topic_agg: dict[str, dict] = {}
+    for a in completed:
+        for q_item in a.get("questions") or []:
+            topic = (q_item.get("topic") or "Other").strip() or "Other"
+            t = topic_agg.setdefault(topic, {"correct": 0, "total": 0})
+            t["total"] += 1
+            if q_item.get("isCorrect"):
+                t["correct"] += 1
+    topic_breakdown = [
+        {
+            "topic": k,
+            "correct": v["correct"],
+            "total": v["total"],
+            "accuracy": round((v["correct"] / v["total"]) * 100) if v["total"] else 0,
+        }
+        for k, v in sorted(topic_agg.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    ]
+
+    return {
+        "from": start_date.isoformat(),
+        "to": end_date.isoformat(),
+        "attempts": attempts_out,
+        "stats": {
+            "totalDays": total_past,
+            "completedDays": len(completed),
+            "missedDays": len(missed),
+            "completionRate": completion_rate,
+            "currentStreak": current_streak,
+            "bestStreak": best,
+            "avgScore": avg_score,
+            "totalXp": total_xp,
+        },
+        "topicBreakdown": topic_breakdown,
+    }
 
 
 @router.post("/", response_model=AssessmentResponse, status_code=status.HTTP_201_CREATED)

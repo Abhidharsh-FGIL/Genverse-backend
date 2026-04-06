@@ -5064,9 +5064,8 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
 
         ext = path.suffix.lower()
         try:
-            # ── PDF: convert pages to images → parallel vision OCR ──
+            # ── PDF: try fast text-layer extraction first, OCR only as fallback ──
             if ext == ".pdf":
-                from pdf2image import convert_from_path
                 from PyPDF2 import PdfReader
 
                 reader = PdfReader(file_path)
@@ -5076,65 +5075,123 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
                     print(f"[OCR] PDF has {page_count} pages (limit {self._MAX_PDF_PAGES}), skipping")
                     return ""
 
-                # Convert PDF pages to images
-                # Always pass poppler_path so Celery workers find the binaries
-                # even if their PATH is stripped (e.g. systemd services)
-                import shutil
-                poppler_path = "/usr/bin"
-                for candidate in ["/usr/bin", "/usr/local/bin"]:
-                    if shutil.which("pdfinfo", path=candidate):
-                        poppler_path = candidate
-                        break
-                images = await asyncio.to_thread(
-                    convert_from_path, file_path, poppler_path=poppler_path
-                )
-                print(f"[OCR] PDF → {len(images)} page images")
+                # Fast path: native text-layer extraction (works for digital PDFs)
+                native_pages: list[str] = []
+                try:
+                    for i, page in enumerate(reader.pages):
+                        try:
+                            t = page.extract_text() or ""
+                        except Exception:
+                            t = ""
+                        native_pages.append(t)
+                    total_native_chars = sum(len(t.strip()) for t in native_pages)
+                    print(f"[OCR] PDF native extraction: {total_native_chars} chars across {page_count} pages")
+                except Exception as e:
+                    print(f"[OCR] Native PDF extraction failed: {e}")
+                    native_pages = ["" for _ in range(page_count)]
 
-                # Detect language from first page
-                import io
-                buf = io.BytesIO()
-                images[0].save(buf, format="JPEG")
-                first_page_bytes = buf.getvalue()
-                detected_lang = await self._detect_image_language(first_page_bytes)
-                effective_lang = detected_lang if language == "en" else language
+                # Pages with very little native text are likely image-heavy (diagrams,
+                # scanned figures, equations rendered as images). Run vision OCR on those.
+                _PER_PAGE_TEXT_THRESHOLD = 80  # chars
+                pages_needing_ocr = [
+                    i for i, t in enumerate(native_pages) if len(t.strip()) < _PER_PAGE_TEXT_THRESHOLD
+                ]
 
-                # Preprocess & prepare all pages
-                page_data: list[bytes] = []
-                import tempfile, os
+                # If every page has plenty of native text, return immediately (fastest path)
+                if not pages_needing_ocr:
+                    merged = "\n\n---\n\n".join(
+                        f"**Page {i+1}:**\n\n{t}" for i, t in enumerate(native_pages) if t.strip()
+                    )
+                    print(f"[OCR] PDF fully covered by native text ({len(merged)} chars), skipping OCR")
+                    return merged
+
+                print(f"[OCR] {len(pages_needing_ocr)}/{page_count} pages need vision OCR for images/diagrams")
+
+                # Render only the pages that need OCR (image-heavy / scanned pages)
+                from pdf2image import convert_from_path
+                import shutil, sys
+                poppler_path = None
+                if sys.platform.startswith("linux") or sys.platform == "darwin":
+                    for candidate in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]:
+                        if shutil.which("pdfinfo", path=candidate):
+                            poppler_path = candidate
+                            break
+                kwargs = {"poppler_path": poppler_path} if poppler_path else {}
+
+                # Render each needed page individually (1-indexed for pdf2image)
+                import io, tempfile, os
+                ocr_pages_text: dict[int, str] = {}
                 tmp_dir = tempfile.mkdtemp(prefix="ocr_pages_")
                 try:
-                    for i, pil_img in enumerate(images):
-                        page_path = os.path.join(tmp_dir, f"page_{i}.jpg")
+                    detected_lang = None
+                    page_data_list: list[tuple[int, bytes]] = []
+                    for page_idx in pages_needing_ocr:
+                        try:
+                            page_images = await asyncio.to_thread(
+                                convert_from_path,
+                                file_path,
+                                first_page=page_idx + 1,
+                                last_page=page_idx + 1,
+                                **kwargs,
+                            )
+                        except Exception as e:
+                            print(f"[OCR] Failed to render page {page_idx + 1}: {e}")
+                            continue
+                        if not page_images:
+                            continue
+                        pil_img = page_images[0]
+                        page_path = os.path.join(tmp_dir, f"page_{page_idx}.jpg")
                         pil_img.save(page_path, "JPEG")
-                        preprocessed = await asyncio.to_thread(self._preprocess_image, page_path)
-                        if preprocessed:
-                            page_data.append(preprocessed)
-                        else:
-                            # Fallback: use raw image bytes
+
+                        # Detect language from first OCR'd page
+                        if detected_lang is None:
                             buf = io.BytesIO()
                             pil_img.save(buf, format="JPEG")
-                            page_data.append(buf.getvalue())
+                            detected_lang = await self._detect_image_language(buf.getvalue())
+
+                        preprocessed = await asyncio.to_thread(self._preprocess_image, page_path)
+                        if preprocessed:
+                            page_data_list.append((page_idx, preprocessed))
+                        else:
+                            buf = io.BytesIO()
+                            pil_img.save(buf, format="JPEG")
+                            page_data_list.append((page_idx, buf.getvalue()))
                 finally:
-                    import shutil
                     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-                # Parallel OCR all pages
+                effective_lang = detected_lang if (detected_lang and language == "en") else language
+
+                # Parallel vision OCR (in batches) — instructed to describe diagrams/figures too
                 tasks = [
-                    self._ocr_single_image(data, effective_lang, f"Page {i+1}")
-                    for i, data in enumerate(page_data)
+                    self._ocr_single_image(data, effective_lang, f"Page {idx + 1}")
+                    for idx, data in page_data_list
                 ]
-                # Process in batches of _PDF_PARALLEL_WORKERS
-                results: list[str] = []
+                ocr_results: list[str] = []
                 for batch_start in range(0, len(tasks), self._PDF_PARALLEL_WORKERS):
                     batch = tasks[batch_start : batch_start + self._PDF_PARALLEL_WORKERS]
                     batch_results = await asyncio.gather(*batch, return_exceptions=True)
                     for r in batch_results:
-                        results.append(r if isinstance(r, str) else "")
+                        ocr_results.append(r if isinstance(r, str) else "")
 
-                whole_content = "\n\n---\n\n".join(
-                    f"**Page {i+1}:**\n\n{text}" for i, text in enumerate(results) if text.strip()
-                )
-                print(f"[OCR] PDF extraction complete: {len(whole_content)} chars total")
+                for (idx, _), text in zip(page_data_list, ocr_results):
+                    if text and text.strip():
+                        ocr_pages_text[idx] = text
+
+                # Merge: prefer native text per page, fall back to OCR text where available
+                merged_pages: list[str] = []
+                for i in range(page_count):
+                    native = native_pages[i].strip() if i < len(native_pages) else ""
+                    ocr_text = ocr_pages_text.get(i, "").strip()
+                    if native and ocr_text and i in pages_needing_ocr:
+                        # Page had a little native text + images — combine both
+                        merged_pages.append(f"**Page {i+1}:**\n\n{native}\n\n{ocr_text}")
+                    elif ocr_text:
+                        merged_pages.append(f"**Page {i+1}:**\n\n{ocr_text}")
+                    elif native:
+                        merged_pages.append(f"**Page {i+1}:**\n\n{native}")
+
+                whole_content = "\n\n---\n\n".join(merged_pages)
+                print(f"[OCR] PDF extraction complete: {len(whole_content)} chars total ({len(ocr_pages_text)} pages OCR'd)")
                 return whole_content
 
             # ── DOCX: extract paragraphs ──

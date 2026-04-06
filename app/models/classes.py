@@ -64,6 +64,33 @@ class ClassTeacher(Base):
     class_: Mapped["Class"] = relationship(back_populates="co_teachers")
 
 
+class ClassGroup(Base):
+    __tablename__ = "class_groups"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    class_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("classes.id", ondelete="CASCADE"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    color: Mapped[str | None] = mapped_column(String(20))
+    created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    members: Mapped[list["ClassGroupMember"]] = relationship(back_populates="group", cascade="all, delete-orphan")
+
+
+class ClassGroupMember(Base):
+    __tablename__ = "class_group_members"
+    __table_args__ = (UniqueConstraint("group_id", "student_id", name="uq_group_student"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("class_groups.id", ondelete="CASCADE"), nullable=False, index=True)
+    student_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    group: Mapped["ClassGroup"] = relationship(back_populates="members")
+
+
 class Assignment(Base):
     __tablename__ = "assignments"
 

@@ -58,12 +58,52 @@ class ClassStudentResponse(BaseModel):
     joined_at: datetime
     student_name: Optional[str] = None
     student_email: Optional[str] = None
+    student_avatar: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
 
 class JoinClassRequest(BaseModel):
     join_code: str
+
+
+class ClassGroupMemberInfo(BaseModel):
+    student_id: uuid.UUID
+    name: Optional[str] = None
+    email: Optional[str] = None
+    roll_no: Optional[str] = None
+    avatar: Optional[str] = None
+
+
+class ClassGroupCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    color: Optional[str] = None
+    member_ids: List[str] = []
+
+
+class ClassGroupUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+
+
+class ClassGroupSetMembers(BaseModel):
+    member_ids: List[str]
+
+
+class ClassGroupResponse(BaseModel):
+    id: uuid.UUID
+    class_id: uuid.UUID
+    name: str
+    description: Optional[str] = None
+    color: Optional[str] = None
+    created_by: uuid.UUID
+    created_at: datetime
+    members: List[ClassGroupMemberInfo] = []
+    member_count: int = 0
+
+    model_config = {"from_attributes": True}
 
 
 class AssignmentCreate(BaseModel):

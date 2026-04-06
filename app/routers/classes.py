@@ -8,12 +8,13 @@ from typing import Optional
 from sqlalchemy import select, func, or_
 
 from app.dependencies import DBSession, CurrentUser
-from app.models.classes import Class, ClassStudent, ClassTeacher, Assignment, Submission, PendingClassEnrollment, GradeSectionTeacher
+from app.models.classes import Class, ClassStudent, ClassTeacher, Assignment, Submission, PendingClassEnrollment, GradeSectionTeacher, ClassGroup, ClassGroupMember
 from app.models.user import User
 from app.models.organization import Organization, OrgMember
 from app.schemas.classes import (
     ClassCreate, ClassUpdate, ClassResponse, ClassStudentResponse, JoinClassRequest,
     AssignmentResponse, SubmissionResponse,
+    ClassGroupCreate, ClassGroupUpdate, ClassGroupSetMembers, ClassGroupResponse, ClassGroupMemberInfo,
 )
 from app.core.exceptions import NotFoundException, ForbiddenException, ConflictException
 from app.models.gamification import WorkspaceGamification, StudentBadge
@@ -274,6 +275,7 @@ async def list_students_for_classes(
             id=cs.id, class_id=cs.class_id, student_id=cs.student_id,
             roll_no=cs.roll_no or user.roll_number, joined_at=cs.joined_at,
             student_name=user.name, student_email=user.email,
+            student_avatar=user.avatar_url,
         )
         for cs, user in rows
     ]
@@ -536,6 +538,7 @@ async def list_class_students(class_id: uuid.UUID, current_user: CurrentUser, db
             id=cs.id, class_id=cs.class_id, student_id=cs.student_id,
             roll_no=cs.roll_no or user.roll_number, joined_at=cs.joined_at,
             student_name=user.name, student_email=user.email,
+            student_avatar=user.avatar_url,
         )
         for cs, user in rows
     ]
@@ -1099,3 +1102,207 @@ async def bulk_add_students(
 
     await db.commit()
     return {"added": len(added), "skipped": len(skipped), "added_students": added, "skipped_students": skipped}
+
+
+# ---------------------------------------------------------------------------
+# Class Groups (student grouping within a class)
+# ---------------------------------------------------------------------------
+
+async def _can_manage_class(class_: Class, user_id: uuid.UUID, db) -> bool:
+    """Class owner, co-teacher, grade-section teacher, or org admin can manage."""
+    if class_.teacher_id == user_id:
+        return True
+    co = await db.execute(
+        select(ClassTeacher).where(ClassTeacher.class_id == class_.id, ClassTeacher.teacher_id == user_id)
+    )
+    if co.scalar_one_or_none():
+        return True
+    if class_.org_id and class_.grade and class_.section:
+        gst_q = select(GradeSectionTeacher).where(
+            GradeSectionTeacher.org_id == class_.org_id,
+            GradeSectionTeacher.teacher_id == user_id,
+            GradeSectionTeacher.grade == class_.grade,
+            GradeSectionTeacher.section == class_.section,
+        )
+        if class_.academic_year:
+            gst_q = gst_q.where(GradeSectionTeacher.academic_year == class_.academic_year)
+        if (await db.execute(gst_q)).scalar_one_or_none():
+            return True
+    if class_.org_id:
+        admin = await db.execute(
+            select(OrgMember).where(
+                OrgMember.org_id == class_.org_id,
+                OrgMember.user_id == user_id,
+                OrgMember.role == "org_admin",
+                OrgMember.status == "active",
+            )
+        )
+        if admin.scalar_one_or_none():
+            return True
+    return False
+
+
+async def _serialize_group(group: ClassGroup, db) -> ClassGroupResponse:
+    member_rows = await db.execute(
+        select(ClassGroupMember, User)
+        .join(User, ClassGroupMember.student_id == User.id)
+        .where(ClassGroupMember.group_id == group.id)
+    )
+    members = [
+        ClassGroupMemberInfo(
+            student_id=m.student_id,
+            name=u.name,
+            email=u.email,
+            roll_no=getattr(u, "roll_number", None),
+            avatar=getattr(u, "avatar_url", None),
+        )
+        for m, u in member_rows.all()
+    ]
+    return ClassGroupResponse(
+        id=group.id,
+        class_id=group.class_id,
+        name=group.name,
+        description=group.description,
+        color=group.color,
+        created_by=group.created_by,
+        created_at=group.created_at,
+        members=members,
+        member_count=len(members),
+    )
+
+
+async def _validate_member_ids(class_id: uuid.UUID, member_ids: list[str], db) -> list[uuid.UUID]:
+    if not member_ids:
+        return []
+    try:
+        ids = [uuid.UUID(m) for m in member_ids]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid member id format")
+    result = await db.execute(
+        select(ClassStudent.student_id).where(
+            ClassStudent.class_id == class_id,
+            ClassStudent.student_id.in_(ids),
+        )
+    )
+    enrolled = {row[0] for row in result.all()}
+    invalid = [str(i) for i in ids if i not in enrolled]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Students not in class: {invalid}")
+    return list(enrolled)
+
+
+@router.get("/{class_id}/groups", response_model=list[ClassGroupResponse])
+async def list_class_groups(class_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    class_ = (await db.execute(select(Class).where(Class.id == class_id))).scalar_one_or_none()
+    if not class_:
+        raise NotFoundException("Class not found")
+    groups = (await db.execute(
+        select(ClassGroup).where(ClassGroup.class_id == class_id).order_by(ClassGroup.created_at)
+    )).scalars().all()
+    return [await _serialize_group(g, db) for g in groups]
+
+
+@router.post("/{class_id}/groups", response_model=ClassGroupResponse, status_code=status.HTTP_201_CREATED)
+async def create_class_group(
+    class_id: uuid.UUID, payload: ClassGroupCreate, current_user: CurrentUser, db: DBSession
+):
+    class_ = (await db.execute(select(Class).where(Class.id == class_id))).scalar_one_or_none()
+    if not class_:
+        raise NotFoundException("Class not found")
+    if not await _can_manage_class(class_, current_user.id, db):
+        raise ForbiddenException("Not allowed to manage groups for this class")
+
+    member_uuids = await _validate_member_ids(class_id, payload.member_ids, db)
+
+    group = ClassGroup(
+        class_id=class_id,
+        name=payload.name,
+        description=payload.description,
+        color=payload.color,
+        created_by=current_user.id,
+    )
+    db.add(group)
+    await db.flush()
+    for sid in member_uuids:
+        db.add(ClassGroupMember(group_id=group.id, student_id=sid))
+    await db.commit()
+    await db.refresh(group)
+    return await _serialize_group(group, db)
+
+
+@router.patch("/{class_id}/groups/{group_id}", response_model=ClassGroupResponse)
+async def update_class_group(
+    class_id: uuid.UUID, group_id: uuid.UUID, payload: ClassGroupUpdate,
+    current_user: CurrentUser, db: DBSession,
+):
+    class_ = (await db.execute(select(Class).where(Class.id == class_id))).scalar_one_or_none()
+    if not class_:
+        raise NotFoundException("Class not found")
+    if not await _can_manage_class(class_, current_user.id, db):
+        raise ForbiddenException("Not allowed to manage groups for this class")
+    group = (await db.execute(
+        select(ClassGroup).where(ClassGroup.id == group_id, ClassGroup.class_id == class_id)
+    )).scalar_one_or_none()
+    if not group:
+        raise NotFoundException("Group not found")
+    if payload.name is not None:
+        group.name = payload.name
+    if payload.description is not None:
+        group.description = payload.description
+    if payload.color is not None:
+        group.color = payload.color
+    await db.commit()
+    await db.refresh(group)
+    return await _serialize_group(group, db)
+
+
+@router.put("/{class_id}/groups/{group_id}/members", response_model=ClassGroupResponse)
+async def set_class_group_members(
+    class_id: uuid.UUID, group_id: uuid.UUID, payload: ClassGroupSetMembers,
+    current_user: CurrentUser, db: DBSession,
+):
+    class_ = (await db.execute(select(Class).where(Class.id == class_id))).scalar_one_or_none()
+    if not class_:
+        raise NotFoundException("Class not found")
+    if not await _can_manage_class(class_, current_user.id, db):
+        raise ForbiddenException("Not allowed to manage groups for this class")
+    group = (await db.execute(
+        select(ClassGroup).where(ClassGroup.id == group_id, ClassGroup.class_id == class_id)
+    )).scalar_one_or_none()
+    if not group:
+        raise NotFoundException("Group not found")
+
+    member_uuids = await _validate_member_ids(class_id, payload.member_ids, db)
+
+    existing = (await db.execute(
+        select(ClassGroupMember).where(ClassGroupMember.group_id == group_id)
+    )).scalars().all()
+    existing_ids = {m.student_id for m in existing}
+    new_ids = set(member_uuids)
+
+    for m in existing:
+        if m.student_id not in new_ids:
+            await db.delete(m)
+    for sid in new_ids - existing_ids:
+        db.add(ClassGroupMember(group_id=group_id, student_id=sid))
+    await db.commit()
+    await db.refresh(group)
+    return await _serialize_group(group, db)
+
+
+@router.delete("/{class_id}/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_class_group(
+    class_id: uuid.UUID, group_id: uuid.UUID, current_user: CurrentUser, db: DBSession
+):
+    class_ = (await db.execute(select(Class).where(Class.id == class_id))).scalar_one_or_none()
+    if not class_:
+        raise NotFoundException("Class not found")
+    if not await _can_manage_class(class_, current_user.id, db):
+        raise ForbiddenException("Not allowed to manage groups for this class")
+    group = (await db.execute(
+        select(ClassGroup).where(ClassGroup.id == group_id, ClassGroup.class_id == class_id)
+    )).scalar_one_or_none()
+    if not group:
+        raise NotFoundException("Group not found")
+    await db.delete(group)
+    await db.commit()
