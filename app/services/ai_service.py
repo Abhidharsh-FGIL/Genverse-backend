@@ -2700,12 +2700,29 @@ Return ONLY valid JSON matching this schema exactly:
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
+            # Strip markdown code fences (```json ... ``` or ``` ... ```)
             if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-            return json.loads(cleaned)
-        except Exception:
+                cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
+                if cleaned.rstrip().endswith("```"):
+                    cleaned = cleaned.rstrip()[:-3]
+            # Extract the outermost JSON object if any prose surrounds it
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                cleaned = cleaned[start:end + 1]
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError:
+                # AI sometimes emits LaTeX (\frac, \(, \sqrt) which are invalid JSON escapes.
+                # Escape any backslash not followed by a valid JSON escape character.
+                import re
+                sanitized = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', cleaned)
+                return json.loads(sanitized)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Lesson plan JSON parse failed: %s | raw response: %s", e, response[:500]
+            )
             return {"title": f"Lesson Plan: {topic}", "objectives": [topic], "timeEstimate": 45, "steps": []}
 
     async def generate_rubric(

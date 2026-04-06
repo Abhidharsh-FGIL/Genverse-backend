@@ -290,14 +290,8 @@ async def invite_member(
 ):
     await _require_org_admin(current_user.id, org_id, db)
 
-    # Validate mandatory fields for students
-    if payload.role == "student":
-        missing = _validate_student_mandatory_fields(payload.model_dump())
-        if missing:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Missing mandatory fields for student: {', '.join(missing)}",
-            )
+    # Student mandatory fields (grade, section, etc.) are not required at invite time.
+    # They can be filled later via the student's profile or CSV upload.
 
     # Fetch org name and admin name for the email
     org_result = await db.execute(select(Organization).where(Organization.id == org_id))
