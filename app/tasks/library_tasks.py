@@ -112,6 +112,38 @@ def process_library_file_embeddings(self, file_id: str):
         db.close()
 
 
+@celery.task(bind=True, name="delete_vault_embeddings", max_retries=2)
+def delete_vault_embeddings(self, user_id: str, chunk_ids: list[str]):
+    """
+    Remove the given chunk IDs from the user's FAISS index.
+
+    Called asynchronously after a Knowledge Vault item is deleted via
+    DELETE /library/{item_id}. The UserLibraryItem and its DocChunk rows
+    have already been removed from Postgres by the request handler;
+    this task only cleans up the vector store.
+    """
+    if not chunk_ids:
+        return {"status": "skipped", "detail": "No chunk IDs provided"}
+
+    logger.info(
+        "[Vault] Removing %d embedding(s) from FAISS for user=%s",
+        len(chunk_ids), user_id,
+    )
+    try:
+        faiss_svc = FAISSService(settings.STORAGE_ROOT)
+        faiss_svc.remove_chunks(user_id=user_id, chunk_ids=set(chunk_ids))
+        logger.info(
+            "[Vault] Removed %d embedding(s) from FAISS for user=%s",
+            len(chunk_ids), user_id,
+        )
+        return {"status": "success", "removed": len(chunk_ids)}
+    except Exception as exc:
+        logger.exception(
+            "[Vault] Failed to remove embeddings from FAISS for user=%s", user_id,
+        )
+        raise self.retry(exc=exc, countdown=10 * (self.request.retries + 1))
+
+
 @celery.task(bind=True, name="process_vault_embeddings", max_retries=2)
 def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = ""):
     """
