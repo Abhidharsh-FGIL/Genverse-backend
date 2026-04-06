@@ -15,7 +15,7 @@ from app.services.storage_service import StorageService
 from app.services.ai_service import AIService
 from app.services.faiss_service import FAISSService
 from app.services.points_service import PointsService
-from app.tasks.library_tasks import process_vault_embeddings
+from app.tasks.library_tasks import process_vault_embeddings, delete_vault_embeddings
 from app.config import settings
 
 router = APIRouter()
@@ -154,9 +154,12 @@ async def list_library_items(
     from datetime import datetime as dt
     from sqlalchemy import func as sa_func
 
+    # Include in-flight items (pending/processing) so freshly uploaded files
+    # appear immediately in the UI with a "Processing…" state. Only hide
+    # permanently-failed items.
     base = select(UserLibraryItem).where(
         UserLibraryItem.user_id == current_user.id,
-        UserLibraryItem.processing_status == "ready",
+        UserLibraryItem.processing_status != "failed",
     )
     if org_id is not None:
         base = _apply_org_filter(base, UserLibraryItem.org_id, org_id)
@@ -417,13 +420,13 @@ async def delete_library_item(item_id: uuid.UUID, current_user: CurrentUser, db:
     if not item:
         raise NotFoundException("Library item not found")
 
-    # Collect chunk IDs so we can remove them from the FAISS index
+    # Collect chunk IDs so the Celery worker can remove them from FAISS
+    # after the DB rows are gone. We snapshot them here because the chunks
+    # are cascade-deleted with the item below.
     chunks_result = await db.execute(
         select(DocChunk.id).where(DocChunk.library_item_id == item_id)
     )
-    chunk_ids = {str(row[0]) for row in chunks_result.all()}
-    if chunk_ids:
-        _faiss().remove_chunks(user_id=str(current_user.id), chunk_ids=chunk_ids)
+    chunk_ids = [str(row[0]) for row in chunks_result.all()]
 
     storage = StorageService()
     if item.storage_path:
@@ -431,6 +434,11 @@ async def delete_library_item(item_id: uuid.UUID, current_user: CurrentUser, db:
 
     await db.delete(item)
     await db.commit()
+
+    # Offload vector-store cleanup to Celery so the HTTP request returns fast
+    # and retries are handled by the worker if FAISS I/O fails.
+    if chunk_ids:
+        delete_vault_embeddings.delay(str(current_user.id), chunk_ids)
 
 
 @router.post("/vault/query", response_model=VaultQueryResponse)
