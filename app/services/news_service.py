@@ -5,11 +5,21 @@ Real-time news fetching via RapidAPI Google News (google-news13.p.rapidapi.com).
 Set RAPIDAPI_KEY and RAPIDAPI_NEWS_HOST in .env to enable.
 If the key is absent or a placeholder, the service returns [] and the
 frontend shows an empty state.
+
+All articles pass through a STUDENT-SAFE FILTER (see _is_student_safe) before
+being returned to the frontend. Eduverse is a student-facing platform so we
+hard-block headlines that mention violence, sexual content, substance abuse,
+self-harm, gambling, hate, terror, scandal, or other age-inappropriate topics.
+False positives are acceptable; false negatives are not.
 """
 
+import logging
+import re
 import aiohttp
 from datetime import datetime, timezone, timedelta
 from app.config import settings
+
+logger = logging.getLogger("news_service")
 
 # ---------------------------------------------------------------------------
 # Category → keyword mapping
@@ -50,6 +60,153 @@ LANGUAGE_KEYWORD_HINT: dict[str, str] = {
 SEARCH_URL = "https://google-news13.p.rapidapi.com/search"
 LATEST_URL = "https://google-news13.p.rapidapi.com/latest"
 _PLACEHOLDER = "your_rapidapi_key_here"
+
+
+# ---------------------------------------------------------------------------
+# Student-safe blocklist
+# ---------------------------------------------------------------------------
+# Headline-shaped regex patterns. These match against the article's combined
+# title + summary (lowercased). Each entry is a single-word or short-phrase
+# unambiguous trigger — we accept some false positives in exchange for
+# guaranteeing student-appropriate content. The grouping below is purely
+# documentary; at runtime they're all flattened into _STUDENT_BLOCK_PATTERNS.
+#
+# DO NOT add ambiguous single words like "shooting" (matches "basketball
+# shooting") or "drug" (matches "drug discovery"). Prefer specific phrases.
+# ---------------------------------------------------------------------------
+
+_STUDENT_BLOCK_RAW: list[str] = [
+    # ── Sexual / explicit ────────────────────────────────────────────────
+    r"\bporn(?:ography|ographic)?\b",
+    r"\bsex(?:ual)?\s+(?:assault|abuse|harassment|misconduct|offender|predator|crime|violence|slavery|trafficking)\b",
+    r"\brape(?:d|ist|s)?\b",
+    r"\bmolest(?:ed|ing|ation)?\b",
+    r"\bpaedophile|pedophile|paedophilia|pedophilia\b",
+    r"\bchild\s+(?:abuse|exploitation|marriage|bride|porn|sex)\b",
+    r"\bcsam\b",
+    r"\bobscene|obscenity|nudity|nude\s+(?:photos?|video|leak)\b",
+    r"\bonlyfans\b",
+    r"\bescort\s+(?:service|agency|girl)\b",
+    r"\bsex\s+(?:tape|scandal|racket|worker|toy)\b",
+    r"\bincest\b",
+    r"\baphrodisiac\b",
+    r"\berotic(?:a)?\b",
+
+    # ── Graphic violence / crime ─────────────────────────────────────────
+    r"\bmurder(?:ed|er|ous)?\b",
+    r"\bhomicide\b",
+    r"\bmassacre(?:d|s)?\b",
+    r"\blynch(?:ed|ing|ings)?\b",
+    r"\bstabb(?:ed|ing|s)\b",
+    r"\bshot\s+dead\b",
+    r"\bgunned\s+down\b",
+    r"\bmass\s+shooting\b",
+    r"\bschool\s+shooting\b",
+    r"\bgang\s*(?:rape|war|fight|murder)\b",
+    r"\bdecapitat(?:ed|ion)\b",
+    r"\bbeheading|beheaded\b",
+    r"\btorture(?:d|s)?\b",
+    r"\bdismember(?:ed|ing|ment)?\b",
+    r"\bbeat(?:en)?\s+to\s+death\b",
+    r"\bbody\s+(?:parts?|found|recovered|dumped)\b",
+    r"\bcorpse|cadaver\b",
+    r"\bbloodbath|bloodshed\b",
+    r"\bassassinat(?:ed|ion)\b",
+    r"\bhostage(?:s)?\b",
+    r"\bkidnap(?:ped|ping|s)?\b",
+    r"\bhuman\s+trafficking\b",
+    r"\bhonou?r\s+killing\b",
+    r"\bdowry\s+death\b",
+    r"\bacid\s+attack\b",
+
+    # ── Self-harm / suicide ──────────────────────────────────────────────
+    r"\bsuicide(?:d|s)?\b",
+    r"\bself[-\s]?harm(?:ing)?\b",
+    r"\bhang(?:ed|ing)\s+(?:self|himself|herself)\b",
+    r"\bjumps?\s+(?:from|off)\s+(?:building|bridge|terrace)\b",
+    r"\bslit(?:s|ting)?\s+(?:wrist|throat)\b",
+
+    # ── Substance abuse ──────────────────────────────────────────────────
+    r"\bdrug\s+(?:bust|raid|cartel|trafficking|peddler|smuggling|dealer|overdose|abuse|addict)\b",
+    r"\bnarcotic(?:s)?\b",
+    r"\bcocaine|heroin|methamphetamine|\bmeth\b|fentanyl|opioid|opium|ketamine|lsd|ecstasy|mdma|marijuana|cannabis|weed\s+seized|hashish|ganja\b",
+    r"\bvaping\s+(?:death|illness|injury)\b",
+    r"\balcohol(?:ism)?\s+(?:abuse|addict|death|poisoning)\b",
+    r"\bhooch\s+tragedy\b",
+    r"\bliquor\s+(?:tragedy|death)\b",
+
+    # ── Terror / war atrocities ──────────────────────────────────────────
+    r"\bterror(?:ist|ism|ists)\b",
+    r"\bsuicide\s+bomb(?:er|ing|ings)?\b",
+    r"\bbomb\s+(?:blast|attack|explosion)\b",
+    r"\bgrenade\s+attack\b",
+    r"\bairstrike\s+(?:kills?|deaths?)\b",
+    r"\bdrone\s+strike\s+(?:kills?|deaths?)\b",
+    r"\bgenocide\b",
+    r"\bethnic\s+cleansing\b",
+    r"\bwar\s+crime(?:s)?\b",
+    r"\bcivilian\s+(?:casualt|deaths?|killed)\b",
+    r"\bisis\b|\bisil\b|\bal[-\s]?qaeda\b|\btaliban\s+attack\b",
+
+    # ── Hate / communal ──────────────────────────────────────────────────
+    r"\bhate\s+(?:crime|speech)\b",
+    r"\bcommunal\s+(?:violence|riot|clash|tension)\b",
+    r"\bracist\s+(?:attack|slur)\b",
+    r"\bhomophobic\s+attack\b",
+    r"\blgbt(?:q)?\+?\s+(?:slur|attack)\b",
+
+    # ── Gambling / betting ───────────────────────────────────────────────
+    r"\bbetting\s+(?:racket|app|scandal|scam)\b",
+    r"\bgambl(?:ing|er)\s+(?:den|racket|addict)\b",
+    r"\bcasino\s+(?:raid|scandal)\b",
+    r"\bmatch[-\s]?fixing\b",
+    r"\bipl\s+betting\b",
+
+    # ── Sensational / scandal / gossip — non-educational ────────────────
+    r"\bscandal\b",
+    r"\bcontroversy\b",
+    r"\bcontroversial\s+(?:remark|statement|comment|tweet|post)\b",
+    r"\bdivorce\s+(?:drama|scandal|battle)\b",
+    r"\bdating\s+(?:rumou?rs?|drama)\b",
+    r"\bcheating\s+(?:scandal|allegation)\b",
+    r"\bmms\s+(?:leak|scandal)\b",
+    r"\bleaked\s+(?:photos?|video|chat|nude|private)\b",
+    r"\bviral\s+(?:fight|brawl|slap|kiss|nude)\b",
+
+    # ── Misc adult / inappropriate ───────────────────────────────────────
+    r"\bbrothel\b",
+    r"\bstrip\s+club\b",
+    r"\bsex\s+toy\b",
+    r"\bcondom\s+(?:ad|brand|scandal)\b",
+    r"\bdating\s+app\s+(?:scandal|murder|crime)\b",
+]
+
+_STUDENT_BLOCK_PATTERNS: list[re.Pattern] = [
+    re.compile(p, re.IGNORECASE) for p in _STUDENT_BLOCK_RAW
+]
+
+
+def _is_student_safe(item: dict) -> tuple[bool, str | None]:
+    """Return (allowed, trigger). False ⇒ drop the article from the feed.
+
+    Scans the title and summary together. We deliberately keep this synchronous
+    and regex-only so it costs ~zero per call and can run on every fetched
+    article without making the news endpoint slow.
+    """
+    haystack_parts = [
+        str(item.get("title") or ""),
+        str(item.get("snippet") or item.get("description") or ""),
+    ]
+    haystack = " ".join(haystack_parts).lower()
+    if not haystack.strip():
+        # Headlines without text are useless; drop them too.
+        return False, "empty_text"
+
+    for pat in _STUDENT_BLOCK_PATTERNS:
+        m = pat.search(haystack)
+        if m:
+            return False, m.group(0)[:50]
+    return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +365,21 @@ class NewsService:
         """
         result = []
         now_iso = datetime.now(timezone.utc).isoformat()
+        dropped = 0
 
         for item in items:
+            # Student-safety filter — drop anything that mentions violence,
+            # explicit content, substance abuse, terror, gambling, scandal, etc.
+            # Eduverse is a student platform; we err on the side of caution.
+            allowed, trigger = _is_student_safe(item)
+            if not allowed:
+                dropped += 1
+                logger.info(
+                    "[news] dropped unsafe article (trigger=%s): %s",
+                    trigger, (item.get("title") or "")[:120],
+                )
+                continue
+
             raw_url = item.get("newsUrl") or item.get("url") or ""
             article_id = str(abs(hash(raw_url)) % (10 ** 10))
 
@@ -253,4 +423,9 @@ class NewsService:
 
         # Sort by date — newest first
         result.sort(key=lambda a: a["created_at"], reverse=True)
+        if dropped:
+            logger.info(
+                "[news] student-safe filter dropped %d/%d articles (kept %d)",
+                dropped, len(items), len(result),
+            )
         return result
