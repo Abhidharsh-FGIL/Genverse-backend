@@ -5,9 +5,11 @@ These run in a separate worker process, so we use synchronous DB access
 and asyncio.run() for the async AI service calls.
 """
 import asyncio
+import json
 import logging
 import uuid
 
+import redis as sync_redis
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -19,6 +21,25 @@ from app.services.ai_service import AIService
 from app.services.faiss_service import FAISSService
 
 logger = logging.getLogger(__name__)
+
+
+def _vault_channel(user_id: str) -> str:
+    """Redis pub/sub channel for a user's Knowledge Vault status events.
+    Subscribed by the SSE endpoint in app/routers/library.py."""
+    return f"vault:events:{user_id}"
+
+
+def _publish_vault_event(user_id: str, event: dict) -> None:
+    """Publish a Knowledge Vault status event to Redis pub/sub.
+
+    Failure here is non-fatal — the SSE stream is best-effort, and the
+    frontend has a one-shot reconciliation refetch on reconnect.
+    """
+    try:
+        r = sync_redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+        r.publish(_vault_channel(user_id), json.dumps(event))
+    except Exception as exc:
+        logger.warning("[Vault] Failed to publish SSE event for user=%s: %s", user_id, exc)
 
 FAISS_KEY = "public_library"
 
@@ -175,6 +196,11 @@ def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = "
             item.processing_status = "failed"
             db.commit()
             logger.warning("[Vault] No text extracted from '%s'", filename)
+            _publish_vault_event(user_id, {
+                "type": "item_status",
+                "item_id": item_id,
+                "processing_status": "failed",
+            })
             return {"status": "error", "detail": "No text extracted"}
 
         # Log extracted text (truncated to 2000 chars for readability)
@@ -223,6 +249,15 @@ def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = "
             "[Vault] '%s' processed successfully: %d chunks, %d embeddings",
             filename, len(chunks), len(chunk_ids),
         )
+        # Notify any listening SSE subscribers that this item is now ready.
+        _publish_vault_event(user_id, {
+            "type": "item_status",
+            "item_id": item_id,
+            "processing_status": "ready",
+            "is_processed": True,
+            "extracted_text_ref": "processed",
+            "chunks_embedded": len(chunk_ids),
+        })
         return {
             "status": "success",
             "item_id": item_id,
@@ -238,6 +273,11 @@ def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = "
                 if item:
                     item.processing_status = "failed"
                     db.commit()
+                    _publish_vault_event(user_id, {
+                        "type": "item_status",
+                        "item_id": item_id,
+                        "processing_status": "failed",
+                    })
             except Exception:
                 db.rollback()
         logger.exception("[Vault] Failed processing '%s' (item=%s)", filename, item_id)
