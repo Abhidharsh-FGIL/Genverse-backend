@@ -202,6 +202,9 @@ async def generate_paper(
             mcq_subtypes=payload.mcq_subtypes,
             type_weightage=payload.type_weightage,
             negative_marking=payload.negative_marking,
+            language=payload.language or "en",
+            language_label=payload.language_label or "English",
+            language_instruction=payload.language_instruction,
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))

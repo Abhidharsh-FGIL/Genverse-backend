@@ -3025,6 +3025,9 @@ Return ONLY valid JSON.
         rubric_criteria: list | None = None,
         source_text: str | None = None,
         topic_weightage: dict | None = None,
+        language: str = "en",
+        language_label: str = "English",
+        language_instruction: str | None = None,
     ) -> List[dict]:
         """Generate structured assignment questions for an AssignmentEditor.
 
@@ -3151,7 +3154,16 @@ You MUST distribute the total number of questions across topics according to the
 For example, if there are 10 questions total and Topic A has 60% weight, generate ~6 questions about Topic A.
 """
 
+        lang_block = (
+            language_instruction
+            or f"Generate ALL question text, options, explanations, model answers, match pairs and any other content strictly in {language_label}. Do not mix languages. Even fixed/templated option sets (True/False, Assertion-Reason choices) MUST be translated into {language_label}. For Tamil specifically, use correct natural Tamil script — do NOT transliterate, do NOT mix English words. Proper nouns and standard scientific/mathematical symbols may remain in English."
+        )
+
         prompt = f"""Generate assignment questions for a Grade {grade} {subject} class.
+
+OUTPUT LANGUAGE — STRICT: {language_label}
+{lang_block}
+
 Topic: {topic}
 {difficulty_instruction}
 {blooms_section}Question breakdown: {types_str}
@@ -4065,6 +4077,9 @@ Return ONLY valid JSON.
         mcq_subtypes: List[str] | None = None,
         type_weightage: dict | None = None,
         negative_marking: bool = False,
+        language: str = "en",
+        language_label: str = "English",
+        language_instruction: str | None = None,
     ) -> tuple[List[dict], List[dict]]:
         """Generate institutional evaluation questions with full config support.
 
@@ -4268,7 +4283,16 @@ Return ONLY valid JSON.
             else:
                 board_instruction = f"BOARD ALIGNMENT: {board}. Follow {board} curriculum standards and question patterns."
 
+        lang_block = (
+            language_instruction
+            or f"Generate ALL question text, options, explanations and any other content strictly in {language_label}. Do not mix languages. Proper nouns and standard scientific/mathematical symbols may remain in English."
+        )
+
         prompt = f"""You are an expert question paper setter for school students. Generate exactly {question_count} questions for an institutional evaluation paper.
+
+OUTPUT LANGUAGE — STRICT: {language_label}
+{lang_block}
+This applies to EVERY field of EVERY question without exception: "text", every entry in "options", every "left"/"right" in "pairs", "correct_answer", and "explanation". Even fixed/templated option sets (e.g. True/False, Assertion-Reason choices) MUST be translated into {language_label}. For Tamil specifically, use correct, natural Tamil script — do NOT transliterate, do NOT mix English words, and ensure spelling/diacritics are accurate. The ONLY exceptions are proper nouns, chemical formulas, and standard mathematical symbols.
 
 SUBJECTS: {all_subjects_str}
 GRADE: {f'Grade {grade}' if grade else 'General'}{f' ({board})' if board else ''}
@@ -4300,8 +4324,13 @@ QUESTION FORMAT RULES — follow exactly:
    Then ask a question. 4 options as above.
 
 3. MCQ (assertion_reason): Two statements.
-   "text": "Assertion (A): [statement]\\nReason (R): [statement]\\nChoose the correct option:"
-   "options": ["Both A and R are true, and R is the correct explanation of A", "Both A and R are true, but R is not the correct explanation of A", "A is true but R is false", "A is false but R is true"]
+   "text": labelled Assertion (A) and Reason (R), followed by "Choose the correct option:" — ALL written in {language_label}.
+   "options": the four standard assertion-reason choices, written in {language_label} (translate the meanings below — do NOT output them in English):
+     1) Both A and R are true, and R is the correct explanation of A
+     2) Both A and R are true, but R is not the correct explanation of A
+     3) A is true but R is false
+     4) A is false but R is true
+   "correct_answer": the exact {language_label} option string you generated.
 
 4. MCQ (higher_order): Requires analysis/application — NOT simple recall. 4 options.
 

@@ -11,6 +11,7 @@ class UserBase(BaseModel):
     phone: Optional[str] = None
     address: Optional[str] = None
     grade: Optional[int] = None
+    board_preference: Optional[str] = None
     persona_band: Optional[str] = None
     language: str = "en"
     subjects: Optional[List[str]] = None

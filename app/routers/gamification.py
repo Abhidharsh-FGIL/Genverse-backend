@@ -84,15 +84,21 @@ async def record_activity(
 ):
     """Record activity ping, update streak, and award daily login XP (idempotent per day per workspace)."""
     DAILY_LOGIN_XP = 3
+    # Use IST (Asia/Kolkata) for day-boundary comparison so streaks behave for Indian users.
+    # Storing UTC timestamps is fine; only the .date() comparison must be local.
+    IST = timezone(timedelta(hours=5, minutes=30))
     now = datetime.now(timezone.utc)
-    today = now.date()
+    today = now.astimezone(IST).date()
 
     # Update workspace-specific streak + daily XP
     ws_gam = await _get_or_create_ws_gamification(current_user.id, org_id, db)
     already_today = False
 
     if ws_gam.last_activity_date:
-        ws_last = ws_gam.last_activity_date.date()
+        last_dt = ws_gam.last_activity_date
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        ws_last = last_dt.astimezone(IST).date()
         if ws_last == today:
             # Already recorded today — no XP, no streak change
             already_today = True
@@ -110,7 +116,10 @@ async def record_activity(
         # Also update global XP and streak (backward compatible)
         current_user.xp = (current_user.xp or 0) + DAILY_LOGIN_XP
         if current_user.last_login_date:
-            gl = current_user.last_login_date.date()
+            gl_dt = current_user.last_login_date
+            if gl_dt.tzinfo is None:
+                gl_dt = gl_dt.replace(tzinfo=timezone.utc)
+            gl = gl_dt.astimezone(IST).date()
             if gl != today:
                 if gl == today - timedelta(days=1):
                     current_user.streak = (current_user.streak or 0) + 1

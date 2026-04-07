@@ -134,6 +134,9 @@ class GenerateEvalPaperRequest(BaseModel):
     type_weightage: Optional[dict] = None
     negative_marking: bool = False
     negative_mark_value: float = 0.25
+    language: Optional[str] = "en"
+    language_label: Optional[str] = "English"
+    language_instruction: Optional[str] = None
     subjects: List[EvalSubjectConfigSchema]
 
 
