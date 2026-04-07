@@ -1,12 +1,16 @@
+import asyncio
+import json
 import uuid
 import logging
-from typing import Optional
+from typing import Optional, AsyncGenerator
 from fastapi import APIRouter, status, UploadFile, File, Form, Query, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select, delete as sql_delete, func as sa_func
 
 logger = logging.getLogger(__name__)
 
 from app.dependencies import DBSession, CurrentUser
+from app.core.security import verify_access_token
 from app.models.content import UserLibraryItem, DocChunk
 from app.models.subscription import Subscription, PlanDefinition
 from app.schemas.content import LibraryItemResponse, LibraryItemListResponse, LibraryItemUpdate, VaultQueryRequest, VaultQueryResponse
@@ -192,6 +196,77 @@ async def list_library_items(
     next_cursor = items[-1].created_at.isoformat() if has_more and items else None
 
     return LibraryItemListResponse(items=items, next_cursor=next_cursor, has_more=has_more, total=total)
+
+
+@router.get("/events")
+async def vault_events_stream(token: str = Query(..., description="Bearer JWT (EventSource cannot set headers)")):
+    """Server-Sent Events stream of Knowledge Vault status changes for the
+    authenticated user. The Celery worker (`process_vault_embeddings`) publishes
+    `item_status` events to a per-user Redis channel when an item flips from
+    `processing` → `ready`/`failed`; this endpoint forwards them as SSE.
+
+    The frontend uses this to drive UI updates instead of polling the list
+    endpoint, eliminating the steady-state request overhead while files are
+    being processed.
+
+    NOTE: auth is taken from `?token=` because the browser EventSource API
+    cannot attach an Authorization header. The token is the same access JWT
+    used by every other endpoint.
+    """
+    payload = verify_access_token(token)
+    if not payload or not payload.get("sub"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+    user_id = str(payload["sub"])
+
+    import redis.asyncio as aioredis
+    aio_redis = aioredis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    pubsub = aio_redis.pubsub()
+    channel = f"vault:events:{user_id}"
+    await pubsub.subscribe(channel)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            # Initial "open" frame so the client knows the stream is live.
+            yield f"data: {json.dumps({'type': 'connected'})}\n\n"
+            while True:
+                # Block up to 15s waiting for a real event; otherwise emit a
+                # heartbeat comment so proxies/load balancers don't kill the
+                # idle connection.
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=15.0)
+                if msg and msg.get("type") == "message":
+                    try:
+                        event = json.loads(msg["data"])
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    yield f"data: {json.dumps(event)}\n\n"
+                else:
+                    yield ": heartbeat\n\n"
+        except asyncio.CancelledError:
+            # Client disconnected — clean exit.
+            pass
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+            except Exception:
+                pass
+            try:
+                await aio_redis.close()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/extract-text-inline")
