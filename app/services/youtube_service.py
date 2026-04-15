@@ -7,10 +7,21 @@ from app.config import settings
 class YouTubeService:
     BASE_URL = "https://www.googleapis.com/youtube/v3"
 
-    async def search_videos(self, query: str, max_results: int = 3) -> List[dict]:
-        """Search YouTube for videos matching the query. Returns [] if API key is not configured."""
+    async def search_videos(
+        self,
+        query: str,
+        max_results: int = 3,
+        language: str | None = None,
+    ) -> List[dict]:
+        """Search YouTube for videos matching the query. Returns [] if API key is not configured.
+
+        ``language`` should be an ISO 639-1 code (e.g. 'en', 'hi', 'ta'). Falls back
+        to 'en' when not provided or unrecognised.
+        """
         if not settings.YOUTUBE_API_KEY:
             return []
+
+        relevance_language = (language or "en").strip().lower()[:5] or "en"
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -22,7 +33,7 @@ class YouTubeService:
                         "type": "video",
                         "maxResults": max_results,
                         "key": settings.YOUTUBE_API_KEY,
-                        "relevanceLanguage": "en",
+                        "relevanceLanguage": relevance_language,
                         "safeSearch": "strict",
                         "videoEmbeddable": "true",
                     },

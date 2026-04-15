@@ -149,6 +149,7 @@ class VideoRefsRequest(BaseModel):
     response: str
     grade: Optional[int] = None
     student_mode: Optional[bool] = None
+    language: Optional[str] = None
 
 
 class VideoResult(BaseModel):

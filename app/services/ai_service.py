@@ -4589,6 +4589,7 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
     async def extract_video_search_query(
         self, user_message: str, ai_response: str,
         grade: int | None = None, student_mode: bool = False,
+        language: str | None = None,
     ) -> str:
         """Extract the best YouTube search query from a Q&A exchange."""
         grade_instruction = ""
@@ -4603,10 +4604,22 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 "suitable for students.\n"
             )
 
+        lang_map = {"en": "English", "hi": "Hindi", "ta": "Tamil"}
+        lang_name = lang_map.get((language or "").lower())
+        language_instruction = ""
+        if lang_name and lang_name.lower() != "english":
+            language_instruction = (
+                f"\nThe user wants videos in {lang_name}. Write the search query "
+                f"in {lang_name} (use the {lang_name} script for the topic terms) "
+                f"and append the word '{lang_name}' at the end so YouTube returns "
+                f"videos in that language.\n"
+            )
+
         prompt = (
             "Extract a concise, specific YouTube search query (5-10 words max) that would find "
             "the most relevant educational video for this topic.\n"
-            f"{grade_instruction}\n"
+            f"{grade_instruction}"
+            f"{language_instruction}\n"
             f"User asked: {user_message[:300]}\n"
             f"Topic summary: {ai_response[:400]}\n\n"
             "Return ONLY the search query string, nothing else."
