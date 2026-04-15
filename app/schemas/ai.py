@@ -96,6 +96,8 @@ class PlaygroundRequest(BaseModel):
     mode: str  # experiment | play | challenge | imagine
     messages: Optional[List[dict]] = None
     grade: Optional[int] = None
+    board: Optional[str] = None
+    student_mode: bool = True
     harder_mode: bool = False
     context: Optional[dict] = None
 

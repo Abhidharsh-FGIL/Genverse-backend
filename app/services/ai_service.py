@@ -3215,8 +3215,17 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
             "imagine": f"Imagine and create a scenario involving '{topic}'. Encourage creative storytelling and speculation.",
         }
         system = mode_prompts.get(mode, f"Explore the topic: {topic}")
-        if grade:
-            system += f"\nAdapt for Grade {grade} students."
+
+        ctx = context or {}
+        student_mode = bool(ctx.get("student_mode", True))
+        board = ctx.get("board")
+        if student_mode:
+            if grade:
+                system += f"\nAdapt for Grade {grade} students."
+            if board:
+                system += (
+                    f"\nAlign examples and terminology with the {board} curriculum."
+                )
 
         full_messages = [{"role": "system", "content": system}] + messages + [
             {"role": "user", "content": f"Continue our {mode} session about {topic}."}
@@ -5720,9 +5729,29 @@ Return ONLY valid JSON."""
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _audience_context(role: str = "student", grade: int | None = None) -> str:
-        """Build an audience description string for AI prompts."""
-        if role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user"):
+    def _audience_context(
+        role: str = "student",
+        grade: int | None = None,
+        board: str | None = None,
+        student_mode: bool = True,
+    ) -> str:
+        """Build an audience description string for AI prompts.
+
+        When ``student_mode`` is False the prompt stays generic (no grade/board
+        constraints) so power-users get unconstrained content. When True, the
+        grade band shapes tone/difficulty and an optional ``board`` line anchors
+        terminology to the student's curriculum (e.g. CBSE, ICSE, State Board).
+        """
+        board_line = ""
+        if student_mode and board:
+            board_line = (
+                f" Align examples, terminology, and problem style with the "
+                f"{board} curriculum so the content feels familiar to a "
+                f"{board} student."
+            )
+
+        # Student mode off (or adult role with no grade) → generic adult audience
+        if not student_mode or role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user"):
             return (
                 "The audience is ADULTS (teachers, professionals, lifelong learners). "
                 "Use sophisticated vocabulary, real-world scenarios, deeper analytical questions, "
@@ -5737,17 +5766,20 @@ Return ONLY valid JSON."""
                 "Use simple words, fun comparisons, colourful imagery, and an encouraging tone. "
                 "Keep questions easy and concrete. "
                 "Roleplay: be a friendly animal buddy (like a wise owl or clever fox) who cheers them on."
+                f"{board_line}"
             )
         if grade and grade <= 8:
             return (
                 f"The audience is middle-school students (grade {grade}). "
                 "Use age-appropriate vocabulary, relatable examples, and moderate challenge. "
                 "Roleplay: be an adventurous explorer character who discovers facts alongside the student."
+                f"{board_line}"
             )
         return (
             f"The audience is high-school students (grade {grade or 'unknown'}). "
             "Use clear academic language, exam-style rigour, and a mix of easy to hard. "
             "Roleplay: be a cool mentor/coach character who pushes the student to excel."
+            f"{board_line}"
         )
 
     def _parse_json_array(self, text: str) -> list:
@@ -5776,9 +5808,12 @@ Return ONLY valid JSON."""
             return {}
         return json.loads(cleaned[start:end])
 
-    async def playground_match_pairs(self, topic: str, role: str = "student", grade: int | None = None) -> list:
+    async def playground_match_pairs(
+        self, topic: str, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
+    ) -> list:
         """Match Mania / Concept Connect: generate 6 term-definition pairs."""
-        audience = self._audience_context(role, grade)
+        audience = self._audience_context(role, grade, board, student_mode)
         prompt = (
             f"{audience}\n\n"
             f"Generate exactly 6 term-definition pairs for the topic: '{topic}'.\n"
@@ -5797,9 +5832,12 @@ Return ONLY valid JSON."""
                 for i in range(6)
             ]
 
-    async def playground_swipe_facts(self, topic: str, role: str = "student", grade: int | None = None) -> list:
+    async def playground_swipe_facts(
+        self, topic: str, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
+    ) -> list:
         """Swipe & Sort: generate 10 true/false statements."""
-        audience = self._audience_context(role, grade)
+        audience = self._audience_context(role, grade, board, student_mode)
         prompt = (
             f"{audience}\n\n"
             f"Generate exactly 10 statements about '{topic}'.\n"
@@ -5818,10 +5856,17 @@ Return ONLY valid JSON."""
         except Exception:
             return []
 
-    async def playground_speed_quiz(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+    async def playground_speed_quiz(
+        self, topic: str, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
+    ) -> dict:
         """Speed Blitz: generate 10 MCQ questions + a challenger persona."""
-        audience = self._audience_context(role, grade)
-        is_adult = role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user")
+        audience = self._audience_context(role, grade, board, student_mode)
+        is_adult = (
+            not student_mode
+            or role in ("teacher", "org_admin", "guardian")
+            or (grade is None and role == "normal_user")
+        )
 
         prompt = (
             f"{audience}\n\n"
@@ -5865,10 +5910,17 @@ Return ONLY valid JSON."""
             except Exception:
                 return {"questions": [], "challenger": {}}
 
-    async def playground_roleplay(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+    async def playground_roleplay(
+        self, topic: str, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
+    ) -> dict:
         """Generate an immersive roleplay scenario with character, scenes, and choices."""
-        audience = self._audience_context(role, grade)
-        is_adult = role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user")
+        audience = self._audience_context(role, grade, board, student_mode)
+        is_adult = (
+            not student_mode
+            or role in ("teacher", "org_admin", "guardian")
+            or (grade is None and role == "normal_user")
+        )
 
         role_examples = '"seasoned professor", "industry expert", "detective"' if is_adult else '"friendly guide", "explorer buddy", "wise mentor"'
         prompt = (
@@ -5911,10 +5963,17 @@ Return ONLY valid JSON."""
                 "total_scenes": 0,
             }
 
-    async def playground_imagine(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+    async def playground_imagine(
+        self, topic: str, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
+    ) -> dict:
         """Generate a creative 'What if?' scenario with open-ended prompts."""
-        audience = self._audience_context(role, grade)
-        is_adult = role in ("teacher", "org_admin", "guardian") or (grade is None and role == "normal_user")
+        audience = self._audience_context(role, grade, board, student_mode)
+        is_adult = (
+            not student_mode
+            or role in ("teacher", "org_admin", "guardian")
+            or (grade is None and role == "normal_user")
+        )
 
         prompt = (
             f"{audience}\n\n"
@@ -5945,10 +6004,11 @@ Return ONLY valid JSON."""
 
     async def playground_imagine_evaluate(
         self, topic: str, question: str, answer: str,
-        max_points: int = 20, role: str = "student", grade: int | None = None
+        max_points: int = 20, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
     ) -> dict:
         """Evaluate a creative open-ended answer."""
-        audience = self._audience_context(role, grade)
+        audience = self._audience_context(role, grade, board, student_mode)
         prompt = (
             f"{audience}\n\n"
             f"Topic: {topic}\n"
@@ -5972,9 +6032,12 @@ Return ONLY valid JSON."""
 
     # ── Myth Busters ─────────────────────────────────────────────────────────
 
-    async def playground_mythbusters(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+    async def playground_mythbusters(
+        self, topic: str, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
+    ) -> dict:
         """Generate a common myth/misconception + 8 evidence cards for sorting."""
-        audience = self._audience_context(role, grade)
+        audience = self._audience_context(role, grade, board, student_mode)
         prompt = (
             f"{audience}\n\n"
             f"Pick a common myth or misconception related to '{topic}'.\n"
@@ -6010,9 +6073,12 @@ Return ONLY valid JSON."""
 
     # ── Cascade Quiz ─────────────────────────────────────────────────────────
 
-    async def playground_cascade_quiz(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+    async def playground_cascade_quiz(
+        self, topic: str, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
+    ) -> dict:
         """Generate a branching quiz tree (depth 3, 7 questions total)."""
-        audience = self._audience_context(role, grade)
+        audience = self._audience_context(role, grade, board, student_mode)
         prompt = (
             f"{audience}\n\n"
             f"Create a branching quiz tree about '{topic}'.\n"
@@ -6043,9 +6109,12 @@ Return ONLY valid JSON."""
 
     # ── Time Warp (Timeline) ─────────────────────────────────────────────────
 
-    async def playground_timeline(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+    async def playground_timeline(
+        self, topic: str, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
+    ) -> dict:
         """Generate a timeline of events + ordering/prediction challenges."""
-        audience = self._audience_context(role, grade)
+        audience = self._audience_context(role, grade, board, student_mode)
         prompt = (
             f"{audience}\n\n"
             f"Create an educational timeline about '{topic}'.\n\n"
@@ -6081,9 +6150,12 @@ Return ONLY valid JSON."""
 
     # ── Build-a-Diagram ──────────────────────────────────────────────────────
 
-    async def playground_diagram(self, topic: str, role: str = "student", grade: int | None = None) -> dict:
+    async def playground_diagram(
+        self, topic: str, role: str = "student", grade: int | None = None,
+        board: str | None = None, student_mode: bool = True,
+    ) -> dict:
         """Generate a concept diagram with nodes, connections, and zones."""
-        audience = self._audience_context(role, grade)
+        audience = self._audience_context(role, grade, board, student_mode)
         prompt = (
             f"{audience}\n\n"
             f"Create a concept diagram about '{topic}' that a student can build.\n\n"

@@ -11,6 +11,7 @@ from app.schemas.ai import PlaygroundRequest
 from app.services.ai_service import AIService
 from app.services.points_service import PointsService
 from app.models.subscription import PointCost
+from app.models.ai import AiContextSession
 
 router = APIRouter()
 
@@ -32,6 +33,81 @@ def _resolve_role_grade(payload, current_user) -> tuple[str, int | None]:
     role = current_user.role or payload.role
     grade = payload.grade if payload.grade is not None else getattr(current_user, "grade", None)
     return role, grade
+
+
+async def _resolve_context(payload, current_user, db) -> tuple[str, int | None, str | None, bool]:
+    """Resolve role, grade, board, and student_mode with layered fallbacks.
+
+    Precedence (highest first) for grade / board:
+      1. The value the frontend sent on the payload.
+      2. The user's saved AI context session (same table ``GlobalContextBar`` writes to).
+         Looked up for the workspace implied by ``payload.org_id`` (or ``"personal"``).
+      3. The user's profile grade / board_preference.
+
+    This lets the backend recover grade/board even when the frontend's AI context
+    hasn't finished loading before a Playground mode auto-fires its initial
+    request — which was causing ``grade: null`` and missing ``board`` in the
+    ``/match-pairs`` payload.
+
+    ``student_mode`` defaults to True. When False, grade and board are cleared
+    so the prompt is fully generic.
+    """
+    role = current_user.role or getattr(payload, "role", "student")
+    student_mode = getattr(payload, "student_mode", True)
+    if student_mode is None:
+        student_mode = True
+
+    grade = getattr(payload, "grade", None)
+    board = getattr(payload, "board", None)
+
+    if grade is None or board is None:
+        # Resolve workspace id in the same way the frontend stores context.
+        org_id_raw = getattr(payload, "org_id", None)
+        context_dict = getattr(payload, "context", None) or {}
+        ws_raw = org_id_raw or context_dict.get("org_id")
+        workspace_id = str(ws_raw) if ws_raw and ws_raw != "personal" else "personal"
+
+        # 1) Try the active workspace row first.
+        ctx_result = await db.execute(
+            select(AiContextSession).where(
+                AiContextSession.user_id == current_user.id,
+                AiContextSession.workspace_id == workspace_id,
+            )
+        )
+        ctx = ctx_result.scalar_one_or_none()
+        if ctx is not None:
+            if grade is None:
+                grade = ctx.grade
+            if board is None:
+                board = ctx.board
+
+        # 2) If still missing, look across every AiContextSession the user owns
+        #    (picks up the case where board was saved in a different workspace —
+        #    e.g. during signup in "personal" but the user is now in an org).
+        if grade is None or board is None:
+            any_result = await db.execute(
+                select(AiContextSession).where(
+                    AiContextSession.user_id == current_user.id,
+                )
+            )
+            for any_ctx in any_result.scalars().all():
+                if grade is None and any_ctx.grade is not None:
+                    grade = any_ctx.grade
+                if board is None and any_ctx.board:
+                    board = any_ctx.board
+                if grade is not None and board:
+                    break
+
+    # Final fallback: the user's profile.
+    if grade is None:
+        grade = getattr(current_user, "grade", None)
+    if board is None:
+        board = getattr(current_user, "board_preference", None)
+
+    if not student_mode:
+        grade = None
+        board = None
+    return role, grade, board, bool(student_mode)
 
 # Map playground mode → feature_key for plan gating
 MODE_FEATURE_KEY = {
@@ -67,6 +143,8 @@ class FlashcardsRequest(BaseModel):
     topic: str
     role: str = "student"       # student | teacher | normal_user | guardian
     grade: int | None = None    # 1-12 or None for adults
+    board: str | None = None    # CBSE | ICSE | State | etc. Ignored when student_mode is False.
+    student_mode: bool = True   # When False, ignore grade/board and generate generically.
     org_id: Optional[str] = None
 
 
@@ -77,6 +155,8 @@ class ImagineEvalRequest(BaseModel):
     max_points: int = 20
     role: str = "student"
     grade: int | None = None
+    board: str | None = None
+    student_mode: bool = True
     org_id: Optional[str] = None
 
 
@@ -126,14 +206,24 @@ async def playground_explore_stream(
 
     ai = AIService()
 
+    # Resolve grade/board/student_mode with the same session-backed fallback
+    # used by the non-streaming mode endpoints, then merge them onto context
+    # so stream_playground sees consistent values regardless of where the
+    # caller placed them on the request.
+    _role, resolved_grade, resolved_board, resolved_sm = await _resolve_context(payload, current_user, db)
+    merged_context = dict(payload.context or {})
+    merged_context["student_mode"] = resolved_sm
+    if resolved_board is not None:
+        merged_context["board"] = resolved_board
+
     async def event_stream():
         async for chunk in ai.stream_playground(
             topic=payload.topic,
             mode=payload.mode,
             messages=payload.messages or [],
-            grade=payload.grade,
+            grade=resolved_grade,
             harder_mode=payload.harder_mode,
-            context=payload.context,
+            context=merged_context,
         ):
             # Encode newlines so they survive SSE line-splitting on the client
             encoded = chunk.replace('\n', '\\n')
@@ -177,13 +267,19 @@ async def playground_explore(
     )
 
     ai = AIService()
+    _role, resolved_grade, resolved_board, resolved_sm = await _resolve_context(payload, current_user, db)
+    merged_context = dict(payload.context or {})
+    merged_context["student_mode"] = resolved_sm
+    if resolved_board is not None:
+        merged_context["board"] = resolved_board
+
     response = await ai.playground_explore(
         topic=payload.topic,
         mode=payload.mode,
         messages=payload.messages or [],
-        grade=payload.grade,
+        grade=resolved_grade,
         harder_mode=payload.harder_mode,
-        context=payload.context,
+        context=merged_context,
     )
     return {"response": response, "mode": payload.mode, "topic": payload.topic}
 
@@ -261,9 +357,9 @@ async def playground_match_pairs(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
-    pairs = await ai.playground_match_pairs(payload.topic, role, grade)
+    pairs = await ai.playground_match_pairs(payload.topic, role, grade, board, student_mode)
     return {"pairs": pairs, "topic": payload.topic}
 
 
@@ -280,9 +376,9 @@ async def playground_swipe_facts(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
-    facts = await ai.playground_swipe_facts(payload.topic, role, grade)
+    facts = await ai.playground_swipe_facts(payload.topic, role, grade, board, student_mode)
     return {"facts": facts, "topic": payload.topic}
 
 
@@ -300,9 +396,9 @@ async def playground_speed_quiz(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
-    result = await ai.playground_speed_quiz(payload.topic, role, grade)
+    result = await ai.playground_speed_quiz(payload.topic, role, grade, board, student_mode)
     return {"questions": result.get("questions", []),
             "challenger": result.get("challenger", {}),
             "topic": payload.topic}
@@ -322,9 +418,9 @@ async def playground_roleplay(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
-    scenario = await ai.playground_roleplay(payload.topic, role, grade)
+    scenario = await ai.playground_roleplay(payload.topic, role, grade, board, student_mode)
     return {"scenario": scenario, "topic": payload.topic}
 
 
@@ -342,9 +438,9 @@ async def playground_imagine(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
-    scenario = await ai.playground_imagine(payload.topic, role, grade)
+    scenario = await ai.playground_imagine(payload.topic, role, grade, board, student_mode)
     return {"scenario": scenario, "topic": payload.topic}
 
 
@@ -360,11 +456,11 @@ async def playground_imagine_evaluate(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
     evaluation = await ai.playground_imagine_evaluate(
         payload.topic, payload.question, payload.answer,
-        payload.max_points, role, grade
+        payload.max_points, role, grade, board, student_mode,
     )
     return {"evaluation": evaluation}
 
@@ -382,9 +478,9 @@ async def playground_mythbusters(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
-    result = await ai.playground_mythbusters(payload.topic, role, grade)
+    result = await ai.playground_mythbusters(payload.topic, role, grade, board, student_mode)
     return result
 
 
@@ -401,9 +497,9 @@ async def playground_cascade_quiz(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
-    result = await ai.playground_cascade_quiz(payload.topic, role, grade)
+    result = await ai.playground_cascade_quiz(payload.topic, role, grade, board, student_mode)
     return result
 
 
@@ -420,9 +516,9 @@ async def playground_timeline(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
-    result = await ai.playground_timeline(payload.topic, role, grade)
+    result = await ai.playground_timeline(payload.topic, role, grade, board, student_mode)
     return result
 
 
@@ -439,7 +535,7 @@ async def playground_diagram(
         user_id=current_user.id, action="playground_explore", db=db,
         cost_override=2, xp_override=5, org_id=org_id,
     )
-    role, grade = _resolve_role_grade(payload, current_user)
+    role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = AIService()
-    result = await ai.playground_diagram(payload.topic, role, grade)
+    result = await ai.playground_diagram(payload.topic, role, grade, board, student_mode)
     return result
