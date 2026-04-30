@@ -108,6 +108,7 @@ async def generate_ebook(payload: EbookGenerateRequest, current_user: CurrentUse
         action="generate_ebook",
         db=db,
         cost_override=cost,
+        org_id=parsed_org_id,
     )
 
     # Convert structured chapters to flat outline if no legacy outline provided
@@ -173,7 +174,7 @@ async def generate_ebook_stream(
     pc = pc_result.scalars().first()
     per_page_cost = pc.cost if pc else 1
     cost = resolved_page_count * per_page_cost
-    await points_service.deduct_custom(user_id=current_user.id, action="generate_ebook", db=db, cost_override=cost)
+    await points_service.deduct_custom(user_id=current_user.id, action="generate_ebook", db=db, cost_override=cost, org_id=parsed_org_id)
 
     # Pre-build outline
     outline = payload.outline
