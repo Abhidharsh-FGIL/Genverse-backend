@@ -83,6 +83,7 @@ async def generate_assessment(payload: GenerateAssessmentRequest, current_user: 
         user_id=current_user.id,
         action="generate_assessment",
         db=db,
+        org_id=_parse_org_id(payload.org_id),
     )
 
     ai = AIService()

@@ -80,7 +80,7 @@ async def generate_insights(
 
     points_service = PointsService()
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="insights", db=db, org_id=parsed_oid)
-    await points_service.deduct(user_id=current_user.id, action="generate_insights", db=db)
+    await points_service.deduct(user_id=current_user.id, action="generate_insights", db=db, org_id=parsed_oid)
 
     ai = AIService()
     insights_data = await ai.generate_insights(user_id=str(current_user.id), db=db)
@@ -511,7 +511,7 @@ async def generate_recommendations(
 
     # Deduct 1 point for regenerating recommendations
     points_service = PointsService()
-    await points_service.deduct(user_id=current_user.id, action="view_recommendations", db=db)
+    await points_service.deduct(user_id=current_user.id, action="view_recommendations", db=db, org_id=parsed_oid)
 
     # Remove old pending recommendations for this workspace
     del_q = sql_delete(Recommendation).where(

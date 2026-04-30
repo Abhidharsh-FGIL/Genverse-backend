@@ -49,7 +49,7 @@ async def get_career_profile(
     # Only deduct 1 point on explicit refresh, not on normal page view
     if force_refresh:
         points_service = PointsService()
-        await points_service.deduct(user_id=current_user.id, action="view_career_profile", db=db)
+        await points_service.deduct(user_id=current_user.id, action="view_career_profile", db=db, org_id=_parse_org_id(org_id))
 
     if not force_refresh:
         try:

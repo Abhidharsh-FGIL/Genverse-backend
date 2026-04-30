@@ -535,7 +535,7 @@ async def download_ebook_pdf(ebook_id: uuid.UUID, current_user: CurrentUser, db:
     # Check usage + deduct download cost (skip for org workspace)
     points_service = PointsService()
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_pdf", db=db, org_id=ebook.org_id)
-    await points_service.deduct(user_id=current_user.id, action="ebook_download_pdf", db=db)
+    await points_service.deduct(user_id=current_user.id, action="ebook_download_pdf", db=db, org_id=ebook.org_id)
 
     pdf_bytes = await run_in_threadpool(generate_pdf, ebook.ebook_json, ebook.title)
     safe_name = urllib.parse.quote(ebook.title, safe="")
@@ -562,7 +562,7 @@ async def download_ebook_doc(ebook_id: uuid.UUID, current_user: CurrentUser, db:
     # Check usage + deduct download cost (skip for org workspace)
     points_service = PointsService()
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_docx", db=db, org_id=ebook.org_id)
-    await points_service.deduct(user_id=current_user.id, action="ebook_download_docx", db=db)
+    await points_service.deduct(user_id=current_user.id, action="ebook_download_docx", db=db, org_id=ebook.org_id)
 
     docx_bytes = await run_in_threadpool(generate_docx, ebook.ebook_json, ebook.title)
     safe_name = urllib.parse.quote(ebook.title, safe="")
@@ -656,7 +656,7 @@ async def generate_audiobook(
     # Check feature access, then deduct points (skip for org workspace)
     points_service = PointsService()
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_audio", db=db, org_id=ebook.org_id)
-    await points_service.deduct(user_id=current_user.id, action="generate_audiobook", db=db)
+    await points_service.deduct(user_id=current_user.id, action="generate_audiobook", db=db, org_id=ebook.org_id)
 
     ai = AIService()
     audio_data = await ai.generate_audiobook(

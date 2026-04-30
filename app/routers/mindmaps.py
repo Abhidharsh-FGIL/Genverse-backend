@@ -33,7 +33,7 @@ async def generate_mindmap(payload: MindMapGenerateRequest, current_user: Curren
     """Generate a visual mind map using AI."""
     points_service = PointsService()
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="mindmap", db=db, org_id=_parse_org_id(payload.org_id))
-    await points_service.deduct(user_id=current_user.id, action="generate_mindmap", db=db)
+    await points_service.deduct(user_id=current_user.id, action="generate_mindmap", db=db, org_id=_parse_org_id(payload.org_id))
 
     ai = AIService()
     mindmap_json = await ai.generate_mindmap(
