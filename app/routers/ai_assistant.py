@@ -493,13 +493,101 @@ async def delete_chat(chat_id: uuid.UUID, current_user: CurrentUser, db: DBSessi
 
 
 @router.get("/chats/{chat_id}/messages", response_model=list[AiMessageResponse])
-async def get_messages(chat_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
-    result = await db.execute(
-        select(AiChatMessage)
-        .where(AiChatMessage.chat_id == chat_id)
-        .order_by(AiChatMessage.created_at.asc())
+async def get_messages(
+    chat_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+    limit: int = Query(default=50, ge=1, le=100),
+    before: Optional[uuid.UUID] = Query(default=None),
+):
+    """Return messages for a chat session, newest-first in pages of `limit`.
+
+    Pass `before=<message_uuid>` to load the page older than that message
+    (for "load older messages" / infinite scroll upward).
+    The response is always returned in ascending chronological order so the
+    UI can simply prepend the batch without resorting.
+
+    `enhancements_json.infographic.image_base64` is stripped from the list
+    response to keep payloads small. Fetch the image on demand via:
+      GET /chats/{chat_id}/messages/{msg_id}/infographic-image
+    """
+    # Verify the chat belongs to this user
+    chat_check = await db.execute(
+        select(AiChat.id).where(AiChat.id == chat_id, AiChat.user_id == current_user.id)
     )
-    return result.scalars().all()
+    if not chat_check.scalar_one_or_none():
+        raise NotFoundException("Chat not found")
+
+    q = select(AiChatMessage).where(AiChatMessage.chat_id == chat_id)
+
+    if before:
+        # Keyset pagination: find the timestamp of the cursor message
+        cursor = await db.execute(
+            select(AiChatMessage.created_at).where(AiChatMessage.id == before)
+        )
+        cursor_ts = cursor.scalar_one_or_none()
+        if cursor_ts:
+            q = q.where(AiChatMessage.created_at < cursor_ts)
+
+    q = q.order_by(AiChatMessage.created_at.desc()).limit(limit)
+    result = await db.execute(q)
+    rows = list(reversed(result.scalars().all()))
+
+    # Strip image_base64 blobs — these can be 200–500 KB each.
+    # The flag has_image=True tells the frontend to fetch lazily when needed.
+    out = []
+    for msg in rows:
+        enhancements = msg.enhancements_json
+        if isinstance(enhancements, dict):
+            inf = enhancements.get("infographic")
+            if isinstance(inf, dict) and inf.get("image_base64"):
+                enhancements = {
+                    **enhancements,
+                    "infographic": {
+                        k: v for k, v in inf.items() if k != "image_base64"
+                    } | {"has_image": True},
+                }
+        out.append({
+            "id": msg.id,
+            "chat_id": msg.chat_id,
+            "role": msg.role,
+            "content": msg.content,
+            "language": msg.language,
+            "sources_json": msg.sources_json,
+            "enhancements_json": enhancements,
+            "created_at": msg.created_at,
+        })
+    return out
+
+
+@router.get("/chats/{chat_id}/messages/{msg_id}/infographic-image")
+async def get_infographic_image(
+    chat_id: uuid.UUID,
+    msg_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Return just the image_base64 for a single message's infographic.
+
+    Called lazily by the frontend when the message scrolls into view,
+    avoiding the cost of sending all images on initial history load.
+    """
+    result = await db.execute(
+        select(AiChatMessage.enhancements_json)
+        .join(AiChat, AiChatMessage.chat_id == AiChat.id)
+        .where(
+            AiChatMessage.id == msg_id,
+            AiChatMessage.chat_id == chat_id,
+            AiChat.user_id == current_user.id,
+        )
+    )
+    enhancements = result.scalar_one_or_none()
+    if enhancements is None:
+        raise NotFoundException("Message not found")
+    image_b64 = (enhancements.get("infographic") or {}).get("image_base64")
+    if not image_b64:
+        raise NotFoundException("No image for this message")
+    return {"image_base64": image_b64}
 
 
 @router.post("/chats/{chat_id}/messages/stream")

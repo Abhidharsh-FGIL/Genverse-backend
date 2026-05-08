@@ -25,6 +25,7 @@ class AIService:
 
     def __init__(self):
         self._gemini_client = None
+        self._gemini_async_client = None
         self._openai_client = None
         self._anthropic_client = None
 
@@ -34,6 +35,13 @@ class AIService:
             genai.configure(api_key=settings.GOOGLE_GEMINI_API_KEY)
             self._gemini_client = genai.GenerativeModel(settings.AI_PRIMARY_MODEL)
         return self._gemini_client
+
+    def _get_gemini_async(self):
+        """Return the google-genai async client (natively async, zero thread overhead)."""
+        if not self._gemini_async_client and settings.GOOGLE_GEMINI_API_KEY:
+            from google import genai as genai_new
+            self._gemini_async_client = genai_new.Client(api_key=settings.GOOGLE_GEMINI_API_KEY)
+        return self._gemini_async_client
 
     def _get_openai(self):
         if not self._openai_client and settings.OPENAI_API_KEY:
@@ -1847,7 +1855,7 @@ Return ONLY valid JSON in this exact structure:
             """Generate an infographic image using Gemini and return as base64 data URL."""
             try:
                 response = client.models.generate_content(
-                    model="gemini-3-pro-image-preview",
+                    model="gemini-2.5-flash-image",
                     contents=[prompt],
                     config=types.GenerateContentConfig(
                         response_modalities=["TEXT", "IMAGE"],
@@ -1923,7 +1931,7 @@ Return ONLY valid JSON in this exact structure:
                 f"{variant}"
             )
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Build all tasks: list of (key, chapter_index, prompt)
         tasks: list[tuple[str, int | None, str]] = []
@@ -4737,6 +4745,179 @@ Return ONLY this JSON structure:
             children = [{"label": ai_response[:60], "children": []}]
         return {"label": user_message[:50], "children": children[:8]}
 
+    @staticmethod
+    def _svg_escape(text: str) -> str:
+        return (str(text)
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
+                .replace("'", "&apos;"))
+
+    @staticmethod
+    def _svg_wrap(text: str, max_chars: int = 52) -> list[str]:
+        """Break text into lines at word boundaries."""
+        words = text.split()
+        lines, current = [], ""
+        for word in words:
+            if len(current) + len(word) + 1 > max_chars:
+                if current:
+                    lines.append(current)
+                current = word
+            else:
+                current = (current + " " + word).strip()
+        if current:
+            lines.append(current)
+        return lines or [""]
+
+    @classmethod
+    def _render_infographic_svg(cls, data: dict) -> str:
+        """Render an infographic JSON structure as a professional SVG poster."""
+        esc = cls._svg_escape
+        wrap = cls._svg_wrap
+
+        title = esc(data.get("title", "Infographic")[:60])
+        subtitle = esc(data.get("subtitle", "")[:80])
+        sections = (data.get("sections") or [])[:6]
+        key_takeaway = data.get("keyTakeaway", "")[:160]
+
+        # Colour palette for section cards
+        PALETTE = ["#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#EC4899"]
+        # Icon → Unicode emoji
+        ICONS = {
+            "BookOpen": "📚", "Globe": "🌍", "Clock": "⏰", "Lightbulb": "💡",
+            "Users": "👥", "Star": "⭐", "Target": "🎯", "Zap": "⚡",
+            "Award": "🏆", "Shield": "🛡", "Brain": "🧠", "Heart": "❤",
+            "TrendingUp": "📈", "BarChart": "📊", "Layers": "📋",
+        }
+
+        W = 800
+        MARGIN = 18
+        CARD_GAP = 14
+        CARD_W = (W - 2 * MARGIN - CARD_GAP) // 2
+        HEADER_H = 42
+        FACT_LINE_H = 20
+        CARD_PAD = 12
+
+        def card_height(sec: dict) -> int:
+            facts = (sec.get("facts") or [])[:4]
+            lines_total = sum(len(wrap(f)) for f in facts)
+            return HEADER_H + CARD_PAD + max(lines_total, 1) * FACT_LINE_H + CARD_PAD
+
+        # Build rows (2 columns)
+        rows: list[list[dict]] = []
+        for i in range(0, len(sections), 2):
+            rows.append(sections[i: i + 2])
+
+        row_heights = [max(card_height(s) for s in row) for row in rows]
+
+        TITLE_BLOCK = 88
+        KT_LINES = wrap(key_takeaway, 90) if key_takeaway else []
+        KT_H = (len(KT_LINES) + 1) * 20 + CARD_PAD * 2 + 4 if KT_LINES else 0
+        SECTIONS_H = sum(row_heights) + max(len(rows) - 1, 0) * CARD_GAP
+        H = MARGIN + TITLE_BLOCK + MARGIN + SECTIONS_H + (CARD_GAP + KT_H if KT_LINES else 0) + MARGIN
+
+        out: list[str] = []
+        out.append(f'<svg xmlns="http://www.w3.org/2000/svg" '
+                   f'viewBox="0 0 {W} {H}" width="{W}" height="{H}">')
+        out.append("<defs>")
+        out.append('<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">'
+                   '<stop offset="0%" stop-color="#0f2044"/>'
+                   '<stop offset="100%" stop-color="#0a0f1e"/></linearGradient>')
+        out.append('<linearGradient id="hdr" x1="0" y1="0" x2="1" y2="0">'
+                   '<stop offset="0%" stop-color="#1e3a5f"/>'
+                   '<stop offset="100%" stop-color="#0f172a"/></linearGradient>')
+        out.append("</defs>")
+
+        # Background
+        out.append(f'<rect width="{W}" height="{H}" fill="url(#bg)"/>')
+        # Header band
+        out.append(f'<rect width="{W}" height="{MARGIN + TITLE_BLOCK}" fill="url(#hdr)"/>')
+        # Decorative top stripe
+        out.append(f'<rect width="{W}" height="4" fill="#3B82F6"/>')
+
+        # Title
+        ty = MARGIN + 38
+        out.append(f'<text x="{W//2}" y="{ty}" text-anchor="middle" '
+                   f'font-family="Arial,Helvetica,sans-serif" font-size="26" '
+                   f'font-weight="bold" fill="#ffffff" letter-spacing="0.5">{title}</text>')
+        if subtitle:
+            out.append(f'<text x="{W//2}" y="{ty + 28}" text-anchor="middle" '
+                       f'font-family="Arial,Helvetica,sans-serif" font-size="13" '
+                       f'fill="#93c5fd">{subtitle}</text>')
+
+        # Section cards
+        y_off = MARGIN + TITLE_BLOCK + MARGIN
+        for row_i, row in enumerate(rows):
+            rh = row_heights[row_i]
+            for col_i, sec in enumerate(row):
+                color = sec.get("color") or PALETTE[(row_i * 2 + col_i) % len(PALETTE)]
+                # Normalise hex colour
+                if not color.startswith("#"):
+                    color = PALETTE[(row_i * 2 + col_i) % len(PALETTE)]
+                x = MARGIN + col_i * (CARD_W + CARD_GAP)
+                y = y_off
+
+                # Card background
+                out.append(f'<rect x="{x}" y="{y}" width="{CARD_W}" height="{rh}" '
+                           f'rx="10" fill="#1e293b"/>')
+                # Coloured left accent bar
+                out.append(f'<rect x="{x}" y="{y}" width="5" height="{rh}" '
+                           f'rx="3" fill="{color}"/>')
+                # Header strip
+                out.append(f'<rect x="{x}" y="{y}" width="{CARD_W}" height="{HEADER_H}" '
+                           f'rx="10" fill="{color}" opacity="0.18"/>')
+                out.append(f'<rect x="{x}" y="{y + HEADER_H - 1}" width="{CARD_W}" '
+                           f'height="1" fill="{color}" opacity="0.4"/>')
+
+                # Icon + heading
+                icon_name = sec.get("icon", "")
+                emoji = ICONS.get(icon_name, "◆")
+                heading = esc((sec.get("heading") or "")[:34])
+                out.append(f'<text x="{x + 14}" y="{y + 26}" '
+                           f'font-family="Arial,Helvetica,sans-serif" font-size="15" '
+                           f'font-weight="bold" fill="{color}">{emoji}  {heading}</text>')
+
+                # Facts
+                facts = (sec.get("facts") or [])[:4]
+                fy = y + HEADER_H + CARD_PAD
+                for fact in facts:
+                    fact_lines = wrap(str(fact))
+                    for li, line in enumerate(fact_lines):
+                        if li == 0:
+                            # bullet on first line only
+                            out.append(f'<circle cx="{x + 20}" cy="{fy + 6}" r="3" fill="{color}"/>')
+                            out.append(f'<text x="{x + 30}" y="{fy + 14}" '
+                                       f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
+                                       f'fill="#cbd5e1">{esc(line)}</text>')
+                        else:
+                            out.append(f'<text x="{x + 30}" y="{fy + 14}" '
+                                       f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
+                                       f'fill="#cbd5e1">{esc(line)}</text>')
+                        fy += FACT_LINE_H
+                # pad after last fact
+                fy += CARD_PAD // 2
+
+            y_off += rh + CARD_GAP
+
+        # Key takeaway box
+        if KT_LINES:
+            kty = y_off
+            out.append(f'<rect x="{MARGIN}" y="{kty}" width="{W - 2*MARGIN}" '
+                       f'height="{KT_H}" rx="8" fill="#052e16" opacity="0.9"/>')
+            out.append(f'<rect x="{MARGIN}" y="{kty}" width="5" height="{KT_H}" '
+                       f'rx="3" fill="#10B981"/>')
+            out.append(f'<text x="{MARGIN + 18}" y="{kty + 20}" '
+                       f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
+                       f'font-weight="bold" fill="#10B981">💡  KEY TAKEAWAY</text>')
+            for li, line in enumerate(KT_LINES):
+                out.append(f'<text x="{MARGIN + 18}" y="{kty + 20 + (li + 1)*20}" '
+                           f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
+                           f'fill="#86efac">{esc(line)}</text>')
+
+        out.append("</svg>")
+        return "\n".join(out)
+
     async def generate_chat_infographic(
         self,
         user_message: str,
@@ -4744,35 +4925,31 @@ Return ONLY this JSON structure:
         grade: int | None = None,
         language: str = "English",
     ) -> dict:
-        """Generate an infographic using Gemini image generation with JSON fallback."""
+        """Generate an infographic image using gemini-2.5-flash-image.
+
+        The prompt is built from the user's question and the AI response so the
+        image reflects the actual conversation content.  60-second timeout.
+        """
         import base64
         import asyncio
 
         grade_str = f"grade {grade}" if grade else "general"
-        topic = user_message[:300]
+        topic = user_message[:200].strip()
         explanation = ai_response[:3000]
 
-        prompt = (
-            f"Create a beautiful, colorful educational infographic poster about: {topic}\n\n"
-            f"Grade Level: {grade_str}\n"
-            f"Language: {language}\n\n"
-            f"Key information to include in the infographic:\n{explanation}\n\n"
+        image_prompt = (
+            f"Create a beautiful, detailed educational infographic image for {grade_str} students.\n\n"
+            f"Topic / Question: {topic}\n\n"
+            f"Key information to visualise:\n{explanation}\n\n"
             "Design requirements:\n"
-            "- Bold title at the top\n"
-            "- Use vibrant colors, icons, and visual hierarchy\n"
-            "- Organize information into clear visual sections with headings\n"
-            "- Include key facts, statistics, and dates as visual callouts\n"
-            "- Use arrows, connectors, or flow lines between related concepts\n"
-            "- Make text readable and well-spaced\n"
-            "- Professional infographic style suitable for students\n"
-            "- Dark or colored background with contrasting text\n"
-            "- Do NOT leave large empty spaces — fill with relevant visual elements\n\n"
-            "ACCURACY & SPELLING (CRITICAL):\n"
-            "- Every word, name, term, date, and formula MUST be spelled correctly.\n"
-            "- Copy scientific terms, proper nouns, and formulas EXACTLY from the key information above.\n"
-            "- Double-check ALL text before rendering — any spelling mistake will make the infographic unusable.\n"
-            "- Use proper capitalisation for headings and proper nouns.\n"
-            "- If including numbers or statistics, verify they match the source information exactly."
+            "- Bold, clearly readable title at the top\n"
+            "- Vibrant, contrasting colours with a dark background\n"
+            "- Organise information into clear labelled sections or panels\n"
+            "- Include relevant icons, diagrams, arrows or visual callouts\n"
+            "- Highlight key facts, numbers, dates and formulas as visual elements\n"
+            "- Professional infographic poster style — NOT a mindmap\n"
+            "- All text must be spelled exactly correctly\n"
+            f"- Language: {language}"
         )
 
         try:
@@ -4780,71 +4957,28 @@ Return ONLY this JSON structure:
             from google.genai import types
 
             client = genai.Client(api_key=settings.GEMINI_API_KEY)
-
-            def _generate():
-                return client.models.generate_content(
-                    model="gemini-3-pro-image-preview",
-                    contents=[prompt],
-                    config=types.GenerateContentConfig(
-                        response_modalities=["TEXT", "IMAGE"],
-                    ),
-                )
-
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(None, _generate)
-
-            for part in response.parts:
-                if part.inline_data is not None:
+            resp = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model="gemini-2.5-flash-image",
+                    contents=[image_prompt],
+                    config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
+                ),
+                timeout=60.0,
+            )
+            for part in resp.parts:
+                if getattr(part, "inline_data", None) is not None:
                     img_bytes = part.inline_data.data
                     mime = part.inline_data.mime_type or "image/png"
-                    b64 = base64.b64encode(img_bytes).decode("utf-8")
-                    data_uri = f"data:{mime};base64,{b64}"
-                    print(f"[Infographic] Generated image ({len(img_bytes)} bytes)")
-                    return {
-                        "image_base64": data_uri,
-                        "title": topic,
-                        "mode": "image",
-                    }
-            print("[Infographic] No image part in response, falling back to JSON mode")
+                    data_uri = f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"
+                    print(f"[Infographic] image generated ({len(img_bytes)} bytes)")
+                    return {"image_base64": data_uri, "title": topic, "mode": "image"}
+            print("[Infographic] model returned no image part")
+        except asyncio.TimeoutError:
+            print("[Infographic] image generation timed out after 60 s")
         except Exception as e:
-            print(f"[Infographic] Image generation failed: {e}, falling back to JSON mode")
+            print(f"[Infographic] image generation failed: {type(e).__name__}: {e}")
 
-        # Fallback: generate JSON-based infographic using primary text model
-        fallback_prompt = f"""You are an infographic designer. Convert this into a structured infographic layout.
-
-Topic: {topic}
-Grade Level: {grade_str}
-Language: {language}
-
-── AI EXPLANATION ──
-{explanation}
-── END ──
-
-ACCURACY & SPELLING (CRITICAL):
-- Every word, name, term, date, and formula in the output MUST be spelled correctly.
-- Copy scientific terms, proper nouns, and formulas EXACTLY from the explanation above.
-- Double-check ALL text strings before including them — spelling mistakes make the infographic unusable.
-- Use proper capitalisation for headings and proper nouns.
-
-Return ONLY raw JSON with: title, subtitle, sections (array of heading/icon/color/facts/highlight), keyTakeaway.
-Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shield, Brain, Heart, TrendingUp, BarChart, Layers"""
-
-        response_text = await self.chat([{"role": "user", "content": fallback_prompt}])
-        try:
-            cleaned = response_text.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-            start = cleaned.find("{")
-            end = cleaned.rfind("}") + 1
-            if start >= 0 and end > start:
-                result = json.loads(cleaned[start:end])
-                result["mode"] = "json"
-                return result
-        except Exception:
-            pass
-        return {"title": user_message[:50], "subtitle": "", "sections": [], "keyTakeaway": "", "mode": "json"}
+        return {"title": topic[:80], "subtitle": "", "sections": [], "keyTakeaway": "", "mode": "json"}
 
     def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 100) -> List[str]:
         """Split text into overlapping character-based chunks (legacy fallback)."""
