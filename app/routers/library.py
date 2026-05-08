@@ -16,7 +16,7 @@ from app.models.subscription import Subscription, PlanDefinition
 from app.schemas.content import LibraryItemResponse, LibraryItemListResponse, LibraryItemUpdate, VaultQueryRequest, VaultQueryResponse
 from app.core.exceptions import NotFoundException
 from app.services.storage_service import StorageService
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.faiss_service import FAISSService
 from app.services.points_service import PointsService
 from app.tasks.library_tasks import process_vault_embeddings, delete_vault_embeddings
@@ -283,7 +283,7 @@ async def extract_text_inline(
     import os
     from pathlib import Path as _Path
 
-    ai = AIService()
+    ai = get_ai_service()
     suffix = _Path(file.filename or "file").suffix.lower() or ".tmp"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -451,7 +451,7 @@ async def update_library_item(
         await db.execute(sql_delete(DocChunk).where(DocChunk.library_item_id == item_id))
 
         if extracted_text:
-            ai = AIService()
+            ai = get_ai_service()
             new_chunk_ids: list[str] = []
             new_embeddings: list[list[float]] = []
 
@@ -529,7 +529,7 @@ async def query_vault(payload: VaultQueryRequest, current_user: CurrentUser, db:
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="vault_ai_chat", db=db)
     await points_service.deduct(user_id=current_user.id, action="rag_query", db=db)
 
-    ai = AIService()
+    ai = get_ai_service()
     faiss_svc = _faiss()
 
     # --- Vector similarity search via FAISS (preferred path) ---

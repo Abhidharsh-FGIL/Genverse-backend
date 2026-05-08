@@ -6,7 +6,7 @@ from app.dependencies import DBSession, CurrentUser
 from app.models.classes import LessonPlan, Class
 from app.schemas.classes import LessonPlanRequest, LessonPlanResponse, LessonPlanCreateRequest, LessonPlanUpdateRequest
 from app.core.exceptions import NotFoundException, ForbiddenException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 
 router = APIRouter()
 
@@ -19,7 +19,7 @@ async def generate_lesson_plan(payload: LessonPlanRequest, current_user: Current
     if not class_:
         raise NotFoundException("Class not found")
 
-    ai = AIService()
+    ai = get_ai_service()
     plan_data = await ai.generate_lesson_plan(
         class_id=payload.class_id,
         topic=payload.topic,

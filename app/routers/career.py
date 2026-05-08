@@ -8,7 +8,7 @@ from app.models.insights import CareerGuidanceSession
 from app.models.ai import IntelligenceCache
 from app.schemas.ai import CareerGuidanceRequest, CareerGuidanceResponse
 from app.core.exceptions import NotFoundException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.points_service import PointsService
 
 router = APIRouter()
@@ -66,7 +66,7 @@ async def get_career_profile(
         except Exception:
             pass
 
-    ai = AIService()
+    ai = get_ai_service()
     profile = await ai.generate_career_profile(user_id=str(current_user.id), db=db, org_id=org_id)
 
     # Cache for 60 minutes
@@ -110,7 +110,7 @@ async def analyze_career(
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="career_guidance", db=db, org_id=parsed_oid)
     await points_service.deduct(user_id=current_user.id, action="career_guidance", db=db, org_id=parsed_oid)
 
-    ai = AIService()
+    ai = get_ai_service()
     analysis = await ai.analyze_career(
         interests=payload.interests,
         strengths=payload.strengths,

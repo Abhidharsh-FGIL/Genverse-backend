@@ -6,7 +6,7 @@ from app.dependencies import DBSession, CurrentUser
 from app.models.content import MindMap
 from app.schemas.content import MindMapGenerateRequest, MindMapResponse
 from app.core.exceptions import NotFoundException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.points_service import PointsService
 
 router = APIRouter()
@@ -35,7 +35,7 @@ async def generate_mindmap(payload: MindMapGenerateRequest, current_user: Curren
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="mindmap", db=db, org_id=_parse_org_id(payload.org_id))
     await points_service.deduct(user_id=current_user.id, action="generate_mindmap", db=db, org_id=_parse_org_id(payload.org_id))
 
-    ai = AIService()
+    ai = get_ai_service()
     mindmap_json = await ai.generate_mindmap(
         topic=payload.topic,
         subject=payload.subject,

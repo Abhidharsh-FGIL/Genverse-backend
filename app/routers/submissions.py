@@ -16,7 +16,7 @@ from app.schemas.classes import (
 )
 from app.core.exceptions import NotFoundException, ForbiddenException, ConflictException
 from app.services.storage_service import StorageService
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 
 router = APIRouter()
 
@@ -290,7 +290,7 @@ async def auto_grade_submission(
     if not submission:
         raise NotFoundException("Submission not found")
 
-    ai = AIService()
+    ai = get_ai_service()
     suggestion = await ai.auto_grade(
         submission_id=payload.submission_id,
         rubric_id=payload.rubric_id,

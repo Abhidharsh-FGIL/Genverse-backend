@@ -6,7 +6,7 @@ from app.dependencies import DBSession, CurrentUser
 from app.models.content import VideoProject
 from app.schemas.content import VideoScriptRequest, VideoProjectResponse
 from app.core.exceptions import NotFoundException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.points_service import PointsService
 
 router = APIRouter()
@@ -35,7 +35,7 @@ async def generate_video_script(payload: VideoScriptRequest, current_user: Curre
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="video_studio", db=db, org_id=_parse_org_id(payload.org_id))
     await points_service.deduct(user_id=current_user.id, action="generate_video_script", db=db, org_id=_parse_org_id(payload.org_id))
 
-    ai = AIService()
+    ai = get_ai_service()
     script_json = await ai.generate_video_script(
         topic=payload.topic,
         subject=payload.subject,
@@ -75,7 +75,7 @@ async def generate_video_visuals(project_id: uuid.UUID, current_user: CurrentUse
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="video_studio", db=db, org_id=project.org_id)
     await points_service.deduct(user_id=current_user.id, action="generate_video_visuals", db=db, org_id=project.org_id)
 
-    ai = AIService()
+    ai = get_ai_service()
     visuals_json = await ai.generate_video_visuals(script_json=project.script_json)
     project.visuals_json = visuals_json
     project.status = "visuals_ready"

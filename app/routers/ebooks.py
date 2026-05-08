@@ -20,7 +20,7 @@ from app.schemas.content import (
 )
 from app.config import settings
 from app.core.exceptions import NotFoundException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.points_service import PointsService
 from app.services.ebook_export_service import generate_pdf, generate_docx
 from app.services.audiobook_service import get_available_voices
@@ -64,7 +64,7 @@ async def generate_outline(payload: EbookOutlineRequest, current_user: CurrentUs
     resolved_size = payload.book_size or "short"
     chapter_range = BOOK_SIZE_CHAPTER_RANGES.get(resolved_size, (3, 5))
 
-    ai = AIService()
+    ai = get_ai_service()
     chapters = await ai.generate_ebook_outline(
         title=payload.title,
         topic=payload.topic,
@@ -119,7 +119,7 @@ async def generate_ebook(payload: EbookGenerateRequest, current_user: CurrentUse
             for ch in payload.chapters
         ]
 
-    ai = AIService()
+    ai = get_ai_service()
     ebook_json = await ai.generate_ebook(
         title=payload.title,
         author=payload.author or "",
@@ -303,7 +303,7 @@ async def generate_ebook_stream(
                         "total_chapters": ch_total,
                     })
 
-                ai = AIService()
+                ai = get_ai_service()
                 gen_task = asyncio.create_task(ai.generate_ebook_content_only(
                     title=payload.title,
                     author=payload.author or "",
@@ -658,7 +658,7 @@ async def generate_audiobook(
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_audio", db=db, org_id=ebook.org_id)
     await points_service.deduct(user_id=current_user.id, action="generate_audiobook", db=db, org_id=ebook.org_id)
 
-    ai = AIService()
+    ai = get_ai_service()
     audio_data = await ai.generate_audiobook(
         ebook_json=ebook.ebook_json,
         language=payload.language,

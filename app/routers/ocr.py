@@ -3,7 +3,7 @@ import uuid
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status
 from app.dependencies import DBSession, CurrentUser
 from app.models.content import UserLibraryItem, DocChunk
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.storage_service import StorageService
 from app.services.points_service import PointsService
 from app.schemas.content import OCRExtractResponse
@@ -60,7 +60,7 @@ async def extract_text(
         prefix=f"{current_user.id}/ocr",
     )
 
-    ai = AIService()
+    ai = get_ai_service()
     extracted_text = await ai.extract_text_from_file(
         file_path=file_info["path"],
         language=language,

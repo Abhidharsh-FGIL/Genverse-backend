@@ -47,7 +47,7 @@ from app.schemas.evaluation import (
     MyEvalResultResponse,
 )
 from app.core.exceptions import NotFoundException, ForbiddenException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 
 router = APIRouter()
 
@@ -177,7 +177,7 @@ async def generate_paper(
     db: DBSession = None,
 ):
     """AI-generate questions for a new paper. Does NOT persist — frontend reviews first."""
-    ai = AIService()
+    ai = get_ai_service()
 
     # Build subjects list for AI service
     subjects_for_ai = []
@@ -245,7 +245,7 @@ async def upload_source_file(
         tmp.write(content)
         tmp_path = tmp.name
 
-    ai = AIService()
+    ai = get_ai_service()
 
     # For plain text files, just read the content directly
     if file.content_type in {"text/plain", "text/markdown"}:
@@ -659,7 +659,7 @@ async def ai_generate_questions(
     paper_id: uuid.UUID, payload: GeneratePaperRequest, current_user: CurrentUser, db: DBSession
 ):
     """Use AI to generate questions for the question bank."""
-    ai = AIService()
+    ai = get_ai_service()
     questions, _ = await ai.generate_evaluation_paper(
         subjects=payload.subjects,
         question_types=payload.question_types,

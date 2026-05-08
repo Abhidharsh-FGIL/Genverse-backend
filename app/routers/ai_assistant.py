@@ -22,7 +22,7 @@ from app.schemas.ai import (
     GeneratePracticeAssessmentRequest, GeneratedQuestionsResponse,
 )
 from app.core.exceptions import NotFoundException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.faiss_service import FAISSService
 from app.services.points_service import PointsService
 from app.models.subscription import PointCost
@@ -686,17 +686,18 @@ async def send_message_stream(
         cost_override=total_cost, xp_override=total_xp, org_id=org_id,
     )
 
-    # Get chat history — fetch most recent messages so follow-ups have context
+    # Get chat history — 8 most recent messages (4 exchanges) keeps the prompt
+    # concise without losing conversational context for follow-ups.
     history_result = await db.execute(
         select(AiChatMessage)
         .where(AiChatMessage.chat_id == chat_id)
         .order_by(AiChatMessage.created_at.desc())
-        .limit(20)
+        .limit(8)
     )
     history = list(reversed(history_result.scalars().all()))  # reverse to chronological order
     messages = [{"role": m.role, "content": m.content} for m in history]
 
-    ai = AIService()
+    ai = get_ai_service()
 
     # RAG: enrich messages with vault/library content when files are selected
     selected_files: list[str] = (
@@ -801,11 +802,17 @@ async def send_message_stream(
             yield f"data: {encoded}\n\n"
         else:
             try:
+                _buf = ""
                 async for chunk in ai.stream_chat(messages=messages, context=payload.context, chat_settings=chat_settings or None, has_files=has_files):
                     full_response += chunk
-                    # Encode newlines so the SSE "data:" line stays intact (decoded by client)
-                    encoded = chunk.replace('\n', '\\n')
-                    yield f"data: {encoded}\n\n"
+                    _buf += chunk
+                    # Flush when buffer reaches a natural break or minimum size:
+                    # newline = markdown boundary; 30 chars = ~4-5 words visible fast
+                    if "\n" in _buf or len(_buf) >= 30:
+                        yield f"data: {_buf.replace(chr(10), chr(92) + 'n')}\n\n"
+                        _buf = ""
+                if _buf:
+                    yield f"data: {_buf.replace(chr(10), chr(92) + 'n')}\n\n"
             except Exception as e:
                 import traceback
                 print(f"[StreamChat] Streaming error: {e}", flush=True)
@@ -911,7 +918,7 @@ async def send_message(
     history = list(reversed(history_result.scalars().all()))
     messages = [{"role": m.role, "content": m.content} for m in history]
 
-    ai = AIService()
+    ai = get_ai_service()
 
     # RAG: enrich messages with vault/library content when files are selected
     selected_files: list[str] = (
@@ -1116,7 +1123,7 @@ async def generate_follow_ups(
     if not chat_result.scalar_one_or_none():
         raise NotFoundException("Chat not found")
 
-    ai = AIService()
+    ai = get_ai_service()
     questions = await ai.generate_follow_up_questions(
         user_message=payload.message,
         ai_response=payload.response,
@@ -1141,7 +1148,7 @@ async def get_video_refs(
     if not chat_result.scalar_one_or_none():
         raise NotFoundException("Chat not found")
 
-    ai = AIService()
+    ai = get_ai_service()
     search_query = await ai.extract_video_search_query(
         user_message=payload.message,
         ai_response=payload.response,
@@ -1176,7 +1183,7 @@ async def get_next_steps(
     if not chat_result.scalar_one_or_none():
         raise NotFoundException("Chat not found")
 
-    ai = AIService()
+    ai = get_ai_service()
     steps = await ai.generate_next_steps(
         user_message=payload.message,
         ai_response=payload.response,
@@ -1200,7 +1207,7 @@ async def generate_chat_practice_exercises(
     if not chat_result.scalar_one_or_none():
         raise NotFoundException("Chat not found")
 
-    ai = AIService()
+    ai = get_ai_service()
     raw_exercises = await ai.generate_practice_exercises(
         user_message=payload.message,
         ai_response=payload.response,
@@ -1230,7 +1237,7 @@ async def generate_chat_mindmap(
     if not chat_result.scalar_one_or_none():
         raise NotFoundException("Chat not found")
 
-    ai = AIService()
+    ai = get_ai_service()
     mindmap = await ai.generate_chat_mindmap(
         user_message=payload.message,
         ai_response=payload.response,
@@ -1255,7 +1262,7 @@ async def generate_chat_infographic(
     if not chat_result.scalar_one_or_none():
         raise NotFoundException("Chat not found")
 
-    ai = AIService()
+    ai = get_ai_service()
     infographic = await ai.generate_chat_infographic(
         user_message=payload.message,
         ai_response=payload.response,
@@ -1319,7 +1326,7 @@ async def generate_practice_assessment_preview(
     _log = logging.getLogger(__name__)
     if payload.library_file_ids:
         _log.info("Assessment RAG: library_file_ids=%s", payload.library_file_ids)
-        ai_for_rag = AIService()
+        ai_for_rag = get_ai_service()
         topic_query = payload.topic or payload.subject or "general content"
         _log.info("Assessment RAG: topic_query=%r", topic_query)
         rag_parts: list[str] = []
@@ -1340,7 +1347,7 @@ async def generate_practice_assessment_preview(
         else:
             _log.warning("Assessment RAG: NO content resolved from library files")
 
-    ai = AIService()
+    ai = get_ai_service()
     raw = await ai.generate_practice_assessment(
         subject=payload.subject,
         topics=topics,
@@ -1455,7 +1462,7 @@ async def generate_practice_assessment_stream(
 
     # Resolve library file content via FAISS RAG
     if payload.library_file_ids:
-        ai_for_rag = AIService()
+        ai_for_rag = get_ai_service()
         topic_query = payload.topic or payload.subject or "general content"
         rag_parts: list[str] = []
         for lib_fid in payload.library_file_ids:
@@ -1560,7 +1567,7 @@ async def generate_practice_assessment_stream(
                 yield f"data: {json.dumps({'stage': 'preparing', 'progress': 20, 'message': 'Preparing assessment configuration...'})}\n\n"
                 yield f"data: {json.dumps({'stage': 'generating', 'progress': 30, 'message': f'Generating {payload.question_count} questions with AI...'})}\n\n"
 
-                ai = AIService()
+                ai = get_ai_service()
                 raw = await ai.generate_practice_assessment(
                     subject=payload.subject,
                     topics=topics,
@@ -1634,7 +1641,7 @@ async def auto_grade(
     db: DBSession,
 ):
     """Auto-grade a submission using AI. Accepts rich payload directly from the grading page."""
-    ai = AIService()
+    ai = get_ai_service()
     result = await ai.auto_grade_direct(
         submission_text=payload.submissionText,
         rubric=payload.rubric,
@@ -1660,7 +1667,7 @@ async def auto_evaluate_attempt(
     db: DBSession,
 ):
     """Per-question AI grading for assignment/quiz attempts. Used by the teacher grading page."""
-    ai = AIService()
+    ai = get_ai_service()
     result = await ai.evaluate_assignment_attempt(
         responses_json=payload.responses_json,
         answer_key_json=payload.answer_key_json,
@@ -1740,7 +1747,7 @@ async def suggest_questions_for_assignment(
         except Exception:
             pass  # proceed without rubric if fetch fails
 
-    ai = AIService()
+    ai = get_ai_service()
     questions = await ai.generate_assignment_questions(
         topic=payload.topic,
         subject=payload.subject,

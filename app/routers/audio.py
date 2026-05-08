@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from app.dependencies import DBSession, CurrentUser
 from app.schemas.ai import AudioQARequest, AudioQAResponse
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.points_service import PointsService
 from app.services.audiobook_service import (
     clean_narration_text, _resolve_voice,
@@ -79,7 +79,7 @@ async def audio_qa(payload: AudioQARequest, current_user: CurrentUser, db: DBSes
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db)
     await points_service.deduct(user_id=current_user.id, action="basic_chat", db=db)
 
-    ai = AIService()
+    ai = get_ai_service()
     response_text = await ai.chat(
         messages=[{"role": "user", "content": payload.question}],
         context=payload.context,

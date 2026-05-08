@@ -20,7 +20,7 @@ from app.schemas.assessment import (
 )
 from app.core.exceptions import NotFoundException, ConflictException
 from fastapi import HTTPException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.points_service import PointsService
 
 router = APIRouter()
@@ -86,7 +86,7 @@ async def generate_assessment(payload: GenerateAssessmentRequest, current_user: 
         org_id=_parse_org_id(payload.org_id),
     )
 
-    ai = AIService()
+    ai = get_ai_service()
     questions = await ai.generate_practice_assessment(
         subject=payload.subject,
         topics=payload.topics,
@@ -642,7 +642,7 @@ async def submit_attempt_by_id(
     if not assessment:
         raise NotFoundException("Assessment not found")
 
-    ai = AIService()
+    ai = get_ai_service()
     evaluation = await ai.auto_evaluate_attempt(
         questions=assessment.question_json,
         responses=payload.responses,
@@ -793,7 +793,7 @@ async def submit_attempt(
     assessment = assessment_result.scalar_one_or_none()
 
     # Auto-evaluate using AI
-    ai = AIService()
+    ai = get_ai_service()
     evaluation = await ai.auto_evaluate_attempt(
         questions=assessment.question_json,
         responses=payload.responses,

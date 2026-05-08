@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.public_library import PublicFolder, PublicFile, PublicFileChunk
 from app.services.storage_service import StorageService
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.faiss_service import FAISSService
 from app.config import settings
 from app.tasks.library_tasks import process_library_file_embeddings
@@ -329,7 +329,7 @@ async def search_public_library(
     db: AsyncSession = Depends(get_db),
 ):
     """Semantic search across all public library files using FAISS."""
-    ai = AIService()
+    ai = get_ai_service()
     query_embedding = await ai.generate_query_embedding(q)
     if not query_embedding:
         raise HTTPException(status_code=500, detail="Failed to generate query embedding")

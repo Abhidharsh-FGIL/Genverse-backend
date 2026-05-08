@@ -6,7 +6,7 @@ from app.dependencies import DBSession, CurrentUser
 from app.models.classes import Assignment, Class
 from app.schemas.classes import AssignmentCreate, AssignmentUpdate, AssignmentResponse, SuggestQuestionsRequest
 from app.core.exceptions import NotFoundException, ForbiddenException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.models.classes import ClassStudent
 from app.models.notification import NotificationType
 from app.services.notification_service import create_notification_for_many
@@ -184,7 +184,7 @@ async def delete_assignment(assignment_id: uuid.UUID, current_user: CurrentUser,
 @router.post("/suggest-questions")
 async def suggest_questions(payload: SuggestQuestionsRequest, current_user: CurrentUser, db: DBSession):
     """Use AI to suggest questions for an assignment based on topic."""
-    ai = AIService()
+    ai = get_ai_service()
     suggestions = await ai.suggest_questions(
         class_id=payload.class_id,
         topic=payload.topic,

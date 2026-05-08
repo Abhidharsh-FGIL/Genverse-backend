@@ -20,6 +20,59 @@ from app.config import settings
 _SENTINEL = object()
 
 
+def _build_genai_config(gemini_gen_config: dict | None):
+    """Convert a legacy gemini_gen_config dict to a google-genai GenerateContentConfig."""
+    if not gemini_gen_config:
+        return None
+    try:
+        from google.genai import types as _gt
+        kwargs = {}
+        if gemini_gen_config.get("max_output_tokens"):
+            kwargs["max_output_tokens"] = gemini_gen_config["max_output_tokens"]
+        if gemini_gen_config.get("response_mime_type"):
+            kwargs["response_mime_type"] = gemini_gen_config["response_mime_type"]
+        return _gt.GenerateContentConfig(**kwargs) if kwargs else None
+    except Exception:
+        return None
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return True for transient Gemini errors that warrant a retry."""
+    msg = str(exc)
+    return any(k in msg for k in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "quota"))
+
+
+async def _gemini_generate_with_retry(client, model: str, contents, config=None, max_retries: int = 2):
+    """Call client.aio.models.generate_content with exponential-backoff retry on 503/429.
+
+    Retry order: primary model × 2, then backup model × 1, then raise for caller's fallback.
+    """
+    models_to_try = [model]
+    backup = settings.AI_GEMINI_BACKUP_MODEL
+    if backup and backup != model:
+        models_to_try.append(backup)
+
+    last_exc: Exception | None = None
+    for m in models_to_try:
+        for attempt in range(max_retries if m == model else 1):
+            try:
+                return await client.aio.models.generate_content(
+                    model=m, contents=contents, config=config,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if _is_retryable(exc) and attempt < max_retries - 1:
+                    wait = 0.5 * (2 ** attempt)
+                    print(f"[Gemini] 503/429 ({m}) attempt {attempt + 1}, retry in {wait}s…", flush=True)
+                    await asyncio.sleep(wait)
+                    continue
+                if _is_retryable(exc):
+                    print(f"[Gemini] 503/429 ({m}) exhausted, trying backup model…", flush=True)
+                    break
+                raise
+    raise last_exc  # type: ignore[misc]
+
+
 class AIService:
     """Unified AI service wrapping Gemini, Anthropic Claude, and OpenAI."""
 
@@ -855,19 +908,21 @@ class AIService:
             except Exception as e:
                 print(f"[AIService] OpenAI chat fallback failed: {e}", flush=True)
             try:
-                gemini = self._get_gemini()
-                if gemini and response_text is None:
-                    response = gemini.generate_content(full_prompt, generation_config=gemini_gen_config)
-                    response_text = response.text
+                _gc = self._get_gemini_async()
+                if _gc and response_text is None:
+                    _cfg = _build_genai_config(gemini_gen_config)
+                    _r = await _gemini_generate_with_retry(_gc, settings.AI_PRIMARY_MODEL, full_prompt, _cfg)
+                    response_text = _r.text
             except Exception as e:
                 print(f"[AIService] Gemini chat fallback failed: {e}", flush=True)
         else:
-            # Direct questions → Gemini primary, OpenAI fallback
+            # Direct questions → Gemini async primary, OpenAI fallback
             try:
-                gemini = self._get_gemini()
-                if gemini and response_text is None:
-                    response = gemini.generate_content(full_prompt, generation_config=gemini_gen_config)
-                    response_text = response.text
+                _gc = self._get_gemini_async()
+                if _gc and response_text is None:
+                    _cfg = _build_genai_config(gemini_gen_config)
+                    _r = await _gemini_generate_with_retry(_gc, settings.AI_PRIMARY_MODEL, full_prompt, _cfg)
+                    response_text = _r.text
             except Exception as e:
                 print(f"[AIService] Gemini chat failed: {e}", flush=True)
             try:
@@ -899,35 +954,47 @@ class AIService:
         return response_text
 
     async def _stream_gemini(self, full_prompt: str) -> AsyncIterator[str]:
-        """Stream from Gemini without blocking the event loop.
+        """Stream from Gemini using the native async client (zero thread overhead).
 
-        Gemini's SDK is synchronous, so we call next() on the iterator
-        inside asyncio.to_thread to keep the event loop free. This lets
-        FastAPI flush each SSE chunk to the client immediately.
+        Retries the initial connection up to 2 times on 503/429 before raising
+        so the caller can fall through to the next provider.
         """
-        gemini = self._get_gemini()
-        if not gemini:
+        client = self._get_gemini_async()
+        if not client:
             return
 
-        # Start the streaming call in a thread (the initial request blocks)
-        def _start_stream():
-            return gemini.generate_content(full_prompt, stream=True)
+        primary = settings.AI_PRIMARY_MODEL
+        backup = settings.AI_GEMINI_BACKUP_MODEL
+        models_to_try = [primary] + ([backup] if backup and backup != primary else [])
 
-        response = await asyncio.to_thread(_start_stream)
-        it = iter(response)
-
-        while True:
-            # Get next chunk without blocking the event loop
-            chunk = await asyncio.to_thread(next, it, _SENTINEL)
-            if chunk is _SENTINEL:
-                break
-            try:
-                text = chunk.text
-                if text:
-                    yield text
-            except (ValueError, AttributeError):
-                # Thinking/reasoning chunks may not have .text — skip
-                continue
+        last_exc: Exception | None = None
+        for model_name in models_to_try:
+            for attempt in range(2):
+                try:
+                    async for chunk in client.aio.models.generate_content_stream(
+                        model=model_name,
+                        contents=full_prompt,
+                    ):
+                        try:
+                            text = chunk.text
+                            if text:
+                                yield text
+                        except (ValueError, AttributeError):
+                            continue
+                    return  # stream completed successfully
+                except Exception as exc:
+                    last_exc = exc
+                    if _is_retryable(exc) and attempt == 0:
+                        wait = 0.5
+                        print(f"[Gemini Stream] 503/429 ({model_name}), retrying in {wait}s…", flush=True)
+                        await asyncio.sleep(wait)
+                        continue
+                    if _is_retryable(exc):
+                        print(f"[Gemini Stream] 503/429 ({model_name}) exhausted → trying backup", flush=True)
+                        break  # next model
+                    raise  # non-retryable error → let _prefetch fall to OpenAI
+        if last_exc:
+            raise last_exc
 
     async def _stream_openai(self, system_prompt: str, messages: List[dict]) -> AsyncIterator[str]:
         """Stream from OpenAI (natively async)."""
@@ -1142,11 +1209,11 @@ class AIService:
     ) -> AsyncIterator[str]:
         """SSE streaming chat with AI.
 
-        Routing:
-          - has_files=True  → OpenAI (better at document Q&A), Gemini fallback
-          - has_files=False → Gemini Pro (direct questions), OpenAI fallback
+        Guard check and provider stream start concurrently so that by the
+        time the guard LLM call finishes (~300ms), the first tokens from
+        the provider are already queued. TTFB = max(guard, provider_ttfb)
+        instead of guard + provider_ttfb.
         """
-        # --- Content Guard: pre-generation check ---
         from app.services.content_guard import ContentGuardService, GuardAction
 
         student_mode = bool(
@@ -1162,17 +1229,8 @@ class AIService:
                 user_query = m.get("content", "")
                 break
 
-        grade_context_instruction = None
-        if user_query:
-            guard_result = await guard.run_input_pipeline(user_query)
-            guard.log_guard_event(user_query, guard_result)
-            if guard_result.action != GuardAction.ALLOW:
-                yield guard_result.message
-                return
-            # Carry grade-relevance context for the system prompt
-            grade_context_instruction = guard_result.grade_context
-        # --- End pre-generation check ---
-
+        # Build system prompt immediately (sync) — grade_context is intentionally
+        # omitted here so the provider stream can start before the guard finishes.
         context_str = self._build_context_prompt(context)
         settings_str = self._build_settings_prompt(chat_settings)
         system_prompt = (
@@ -1216,8 +1274,6 @@ class AIService:
             system_prompt += f"\n{context_str}"
         if settings_str:
             system_prompt += f"\n\n{settings_str}"
-        if grade_context_instruction:
-            system_prompt += f"\n\n{grade_context_instruction}"
 
         _conv = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
         _lang_tag = ""
@@ -1226,78 +1282,121 @@ class AIService:
             _lang_tag = f"\n\n[SYSTEM: Respond entirely in {_rlang}. Use ONLY {_rlang} script — do NOT mix other scripts like Devanagari in Tamil or Tamil in Hindi.]"
         full_prompt = system_prompt + "\n\n" + _conv + _lang_tag
 
-        # --- Helper: stream from providers with output safety check ---
+        # --- Concurrent guard + provider startup ---
+        # Guard runs as a background task while the provider stream is already fetching.
+        guard_task = (
+            asyncio.create_task(guard.run_input_pipeline(user_query))
+            if user_query else None
+        )
+
+        _queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        _stream_error: list = []
+
+        async def _prefetch():
+            try:
+                if has_files:
+                    try:
+                        client = self._get_anthropic()
+                        if client:
+                            print(f"[MODEL] Anthropic (document Q&A): {settings.AI_DOCUMENT_MODEL}", flush=True)
+                            async for tok in self._stream_anthropic(system_prompt, messages):
+                                await _queue.put(tok)
+                            return
+                    except Exception as e:
+                        print(f"[AIService] Anthropic stream failed: {e}", flush=True)
+                    try:
+                        client = self._get_openai()
+                        if client:
+                            print(f"[MODEL] OpenAI (document Q&A fallback): {settings.AI_FALLBACK_MODEL}", flush=True)
+                            async for tok in self._stream_openai(system_prompt, messages):
+                                await _queue.put(tok)
+                            return
+                    except Exception as e:
+                        print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
+                    try:
+                        if self._get_gemini_async():
+                            print(f"[MODEL] Gemini (document Q&A fallback): {settings.AI_PRIMARY_MODEL}", flush=True)
+                            async for tok in self._stream_gemini(full_prompt):
+                                await _queue.put(tok)
+                            return
+                    except Exception as e:
+                        print(f"[AIService] Gemini stream fallback failed: {e}", flush=True)
+                else:
+                    try:
+                        if self._get_gemini_async():
+                            print(f"[MODEL] Gemini (direct Q&A): {settings.AI_PRIMARY_MODEL}", flush=True)
+                            async for tok in self._stream_gemini(full_prompt):
+                                await _queue.put(tok)
+                            return
+                    except Exception as e:
+                        print(f"[AIService] Gemini stream failed: {e}", flush=True)
+                    try:
+                        client = self._get_openai()
+                        if client:
+                            print(f"[MODEL] OpenAI (direct Q&A fallback): {settings.AI_FALLBACK_MODEL}", flush=True)
+                            async for tok in self._stream_openai(system_prompt, messages):
+                                await _queue.put(tok)
+                            return
+                    except Exception as e:
+                        print(f"[AIService] OpenAI fallback failed: {e}", flush=True)
+                await _queue.put("AI service is temporarily unavailable. Please try again in a moment.")
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                _stream_error.append(e)
+            finally:
+                await _queue.put(None)  # sentinel — always signal completion
+
+        stream_task = asyncio.create_task(_prefetch())
+
+        # Await guard (stream has been running concurrently for its duration).
+        # Hard timeout of 500ms: if the guard LLM call hasn't responded by then,
+        # fail open so a slow/unavailable classifier never stalls the stream.
+        if guard_task:
+            try:
+                guard_result = await asyncio.wait_for(guard_task, timeout=0.5)
+            except (asyncio.TimeoutError, Exception):
+                guard_result = None  # fail open — never block legitimate queries
+            if guard_result and guard_result.action != GuardAction.ALLOW:
+                guard.log_guard_event(user_query, guard_result)
+                stream_task.cancel()
+                try:
+                    await asyncio.shield(stream_task)
+                except (asyncio.CancelledError, Exception):
+                    pass
+                yield guard_result.message
+                return
+            if guard_result:
+                guard.log_guard_event(user_query, guard_result)
+
+        # Drain the queue — tokens were already buffering while guard ran
         accumulated = ""
-        next_check_at = 500  # check output every ~500 chars
+        next_check_at = 500
+        try:
+            while True:
+                token = await _queue.get()
+                if token is None:
+                    break
+                if _stream_error:
+                    raise _stream_error[0]
+                accumulated += token
+                yield token
 
-        async def _provider_stream():
-            """Yield chunks from the appropriate provider chain."""
-            if has_files:
-                # Anthropic (primary for document Q&A)
-                try:
-                    client = self._get_anthropic()
-                    if client:
-                        print(f"[MODEL] Invoking Anthropic (document Q&A): {settings.AI_DOCUMENT_MODEL}", flush=True)
-                        async for chunk in self._stream_anthropic(system_prompt, messages):
-                            yield chunk
+                if len(accumulated) >= next_check_at:
+                    next_check_at += 500
+                    output_check = guard.check_output(accumulated)
+                    if output_check.action != GuardAction.ALLOW:
+                        guard.log_guard_event(user_query, output_check)
+                        stream_task.cancel()
+                        yield "\n\n" + output_check.message
                         return
-                except Exception as e:
-                    print(f"[AIService] Anthropic stream failed: {e}", flush=True)
-                # OpenAI fallback
+        finally:
+            if not stream_task.done():
+                stream_task.cancel()
                 try:
-                    client = self._get_openai()
-                    if client:
-                        print(f"[MODEL] Invoking OpenAI (document Q&A fallback): {settings.AI_FALLBACK_MODEL}", flush=True)
-                        async for chunk in self._stream_openai(system_prompt, messages):
-                            yield chunk
-                        return
-                except Exception as e:
-                    print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
-                # Gemini fallback
-                try:
-                    client = self._get_gemini()
-                    if client:
-                        print(f"[MODEL] Invoking Gemini (document Q&A fallback): {settings.AI_PRIMARY_MODEL}", flush=True)
-                        async for chunk in self._stream_gemini(full_prompt):
-                            yield chunk
-                        return
-                except Exception as e:
-                    print(f"[AIService] Gemini stream fallback failed: {e}", flush=True)
-            else:
-                # Gemini (primary for direct questions)
-                try:
-                    client = self._get_gemini()
-                    if client:
-                        print(f"[MODEL] Invoking Gemini (direct Q&A): {settings.AI_PRIMARY_MODEL}", flush=True)
-                        async for chunk in self._stream_gemini(full_prompt):
-                            yield chunk
-                        return
-                except Exception as e:
-                    print(f"[AIService] Gemini stream failed: {e}", flush=True)
-                # OpenAI fallback
-                try:
-                    client = self._get_openai()
-                    if client:
-                        print(f"[MODEL] Invoking OpenAI (direct Q&A fallback): {settings.AI_FALLBACK_MODEL}", flush=True)
-                        async for chunk in self._stream_openai(system_prompt, messages):
-                            yield chunk
-                        return
-                except Exception as e:
-                    print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
-            yield "AI service is temporarily unavailable. Please try again in a moment."
-
-        async for chunk in _provider_stream():
-            accumulated += chunk
-            yield chunk
-
-            # Periodic output safety check
-            if len(accumulated) >= next_check_at:
-                next_check_at += 500
-                output_check = guard.check_output(accumulated)
-                if output_check.action != GuardAction.ALLOW:
-                    guard.log_guard_event(user_query, output_check)
-                    yield "\n\n" + output_check.message
-                    return
+                    await asyncio.shield(stream_task)
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         # Final output check on complete text
         output_check = guard.check_output(accumulated)
@@ -4772,151 +4871,249 @@ Return ONLY this JSON structure:
 
     @classmethod
     def _render_infographic_svg(cls, data: dict) -> str:
-        """Render an infographic JSON structure as a professional SVG poster."""
+        """Render an infographic as a visually rich, magazine-quality SVG poster.
+
+        Layout: bold header banner → 2-column section grid with icon + stat badge
+        per card → highlighted key-takeaway ribbon at the bottom.
+        """
         esc = cls._svg_escape
         wrap = cls._svg_wrap
 
-        title = esc(data.get("title", "Infographic")[:60])
-        subtitle = esc(data.get("subtitle", "")[:80])
-        sections = (data.get("sections") or [])[:6]
-        key_takeaway = data.get("keyTakeaway", "")[:160]
+        title    = esc((data.get("title") or "Infographic")[:60])
+        subtitle = esc((data.get("subtitle") or "")[:90])
+        sections = (data.get("sections") or [])[:4]
+        kt       = (data.get("keyTakeaway") or "")[:200]
 
-        # Colour palette for section cards
-        PALETTE = ["#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#EC4899"]
-        # Icon → Unicode emoji
-        ICONS = {
-            "BookOpen": "📚", "Globe": "🌍", "Clock": "⏰", "Lightbulb": "💡",
-            "Users": "👥", "Star": "⭐", "Target": "🎯", "Zap": "⚡",
-            "Award": "🏆", "Shield": "🛡", "Brain": "🧠", "Heart": "❤",
-            "TrendingUp": "📈", "BarChart": "📊", "Layers": "📋",
-        }
+        # Per-section colour themes: (accent, card-bg, light-text, badge-bg)
+        THEMES = [
+            ("#3B82F6", "#0c1e3b", "#93c5fd", "#1d4ed8"),   # blue
+            ("#10B981", "#052e1c", "#6ee7b7", "#065f46"),   # emerald
+            ("#F59E0B", "#2d1a00", "#fcd34d", "#92400e"),   # amber
+            ("#EF4444", "#2d0a0a", "#fca5a5", "#7f1d1d"),   # red
+        ]
+        # Emoji icons per section slot
+        SEC_ICONS = ["🔹", "🟢", "🟡", "🔴"]
 
-        W = 800
-        MARGIN = 18
-        CARD_GAP = 14
-        CARD_W = (W - 2 * MARGIN - CARD_GAP) // 2
-        HEADER_H = 42
-        FACT_LINE_H = 20
-        CARD_PAD = 12
+        W      = 960
+        M      = 20          # outer margin
+        GAP    = 16          # column gap
+        CW     = (W - 2*M - GAP) // 2  # card width
+        ICON_H = 70          # top icon zone height
+        FACT_H = 26          # height per fact line
+        BAD_H  = 38          # highlight badge height
 
         def card_height(sec: dict) -> int:
-            facts = (sec.get("facts") or [])[:4]
-            lines_total = sum(len(wrap(f)) for f in facts)
-            return HEADER_H + CARD_PAD + max(lines_total, 1) * FACT_LINE_H + CARD_PAD
+            facts = (sec.get("facts") or sec.get("points") or [])[:4]
+            n_facts = sum(max(len(wrap(str(f), 44)), 1) for f in facts)
+            return ICON_H + 8 + n_facts * FACT_H + (BAD_H + 12 if sec.get("highlight") else 0) + 16
 
-        # Build rows (2 columns)
-        rows: list[list[dict]] = []
-        for i in range(0, len(sections), 2):
-            rows.append(sections[i: i + 2])
+        rows: list[list[dict]] = [sections[i:i+2] for i in range(0, len(sections), 2)]
+        row_h = [max((card_height(s) for s in row), default=120) for row in rows]
 
-        row_heights = [max(card_height(s) for s in row) for row in rows]
+        HEADER_H  = 96
+        SECS_H    = sum(row_h) + max(len(rows)-1, 0)*GAP
+        kt_lines  = wrap(kt, 100) if kt else []
+        KT_H      = len(kt_lines)*20 + 40 if kt_lines else 0
+        H = HEADER_H + M + SECS_H + (M + KT_H if KT_H else 0) + M
 
-        TITLE_BLOCK = 88
-        KT_LINES = wrap(key_takeaway, 90) if key_takeaway else []
-        KT_H = (len(KT_LINES) + 1) * 20 + CARD_PAD * 2 + 4 if KT_LINES else 0
-        SECTIONS_H = sum(row_heights) + max(len(rows) - 1, 0) * CARD_GAP
-        H = MARGIN + TITLE_BLOCK + MARGIN + SECTIONS_H + (CARD_GAP + KT_H if KT_LINES else 0) + MARGIN
+        o: list[str] = []
+        o.append(f'<svg xmlns="http://www.w3.org/2000/svg" '
+                 f'viewBox="0 0 {W} {H}" width="{W}" height="{H}">')
 
-        out: list[str] = []
-        out.append(f'<svg xmlns="http://www.w3.org/2000/svg" '
-                   f'viewBox="0 0 {W} {H}" width="{W}" height="{H}">')
-        out.append("<defs>")
-        out.append('<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">'
-                   '<stop offset="0%" stop-color="#0f2044"/>'
-                   '<stop offset="100%" stop-color="#0a0f1e"/></linearGradient>')
-        out.append('<linearGradient id="hdr" x1="0" y1="0" x2="1" y2="0">'
-                   '<stop offset="0%" stop-color="#1e3a5f"/>'
-                   '<stop offset="100%" stop-color="#0f172a"/></linearGradient>')
-        out.append("</defs>")
+        # ── Gradients & pattern ─────────────────────────────────────────────
+        o.append("<defs>")
+        o.append('<linearGradient id="gbg" x1="0" y1="0" x2="0" y2="1">'
+                 '<stop offset="0%" stop-color="#071428"/>'
+                 '<stop offset="100%" stop-color="#0b1220"/></linearGradient>')
+        o.append('<linearGradient id="ghdr" x1="0" y1="0" x2="1" y2="0">'
+                 '<stop offset="0%" stop-color="#0e2a5a"/>'
+                 '<stop offset="50%" stop-color="#0a1628"/>'
+                 '<stop offset="100%" stop-color="#130b2e"/></linearGradient>')
+        for i, (acc, cbg, lt, bb) in enumerate(THEMES):
+            o.append(f'<linearGradient id="gc{i}" x1="0" y1="0" x2="0" y2="1">'
+                     f'<stop offset="0%" stop-color="{acc}" stop-opacity="0.22"/>'
+                     f'<stop offset="100%" stop-color="{cbg}" stop-opacity="0.95"/>'
+                     f'</linearGradient>')
+        # Subtle dot-grid background pattern
+        o.append('<pattern id="dots" width="36" height="36" patternUnits="userSpaceOnUse">'
+                 '<circle cx="18" cy="18" r="1" fill="#1e3a5f" fill-opacity="0.55"/>'
+                 '</pattern>')
+        o.append("</defs>")
 
-        # Background
-        out.append(f'<rect width="{W}" height="{H}" fill="url(#bg)"/>')
-        # Header band
-        out.append(f'<rect width="{W}" height="{MARGIN + TITLE_BLOCK}" fill="url(#hdr)"/>')
-        # Decorative top stripe
-        out.append(f'<rect width="{W}" height="4" fill="#3B82F6"/>')
+        # ── Background ──────────────────────────────────────────────────────
+        o.append(f'<rect width="{W}" height="{H}" fill="url(#gbg)"/>')
+        o.append(f'<rect width="{W}" height="{H}" fill="url(#dots)"/>')
 
+        # ── Header ──────────────────────────────────────────────────────────
+        o.append(f'<rect width="{W}" height="{HEADER_H}" fill="url(#ghdr)"/>')
+        # Rainbow top stripe
+        stripe_colors = ["#3B82F6", "#10B981", "#F59E0B", "#EF4444"]
+        sw = W // len(stripe_colors)
+        for si, sc in enumerate(stripe_colors):
+            o.append(f'<rect x="{si*sw}" y="0" width="{sw}" height="5" fill="{sc}"/>')
         # Title
-        ty = MARGIN + 38
-        out.append(f'<text x="{W//2}" y="{ty}" text-anchor="middle" '
-                   f'font-family="Arial,Helvetica,sans-serif" font-size="26" '
-                   f'font-weight="bold" fill="#ffffff" letter-spacing="0.5">{title}</text>')
+        o.append(f'<text x="{W//2}" y="48" text-anchor="middle" '
+                 f'font-family="Arial Black,Arial,Helvetica,sans-serif" font-size="32" '
+                 f'font-weight="900" fill="#ffffff" letter-spacing="1.2">{title}</text>')
         if subtitle:
-            out.append(f'<text x="{W//2}" y="{ty + 28}" text-anchor="middle" '
-                       f'font-family="Arial,Helvetica,sans-serif" font-size="13" '
-                       f'fill="#93c5fd">{subtitle}</text>')
+            o.append(f'<text x="{W//2}" y="76" text-anchor="middle" '
+                     f'font-family="Arial,Helvetica,sans-serif" font-size="14" '
+                     f'font-style="italic" fill="#93c5fd">{subtitle}</text>')
+        # Bottom border of header
+        o.append(f'<line x1="0" y1="{HEADER_H}" x2="{W}" y2="{HEADER_H}" '
+                 f'stroke="#1e3a5f" stroke-width="2"/>')
 
-        # Section cards
-        y_off = MARGIN + TITLE_BLOCK + MARGIN
-        for row_i, row in enumerate(rows):
-            rh = row_heights[row_i]
-            for col_i, sec in enumerate(row):
-                color = sec.get("color") or PALETTE[(row_i * 2 + col_i) % len(PALETTE)]
-                # Normalise hex colour
-                if not color.startswith("#"):
-                    color = PALETTE[(row_i * 2 + col_i) % len(PALETTE)]
-                x = MARGIN + col_i * (CARD_W + CARD_GAP)
-                y = y_off
+        # ── Section cards ───────────────────────────────────────────────────
+        y_off = HEADER_H + M
+        for ri, row in enumerate(rows):
+            rh = row_h[ri]
+            for ci, sec in enumerate(row):
+                si = ri*2 + ci
+                acc, cbg, lt, bb = THEMES[si % len(THEMES)]
+                icon_em = SEC_ICONS[si % len(SEC_ICONS)]
+                heading  = esc((sec.get("heading") or "")[:44])
+                facts    = (sec.get("facts") or sec.get("points") or [])[:4]
+                highlight = (sec.get("highlight") or "")[:30]
 
-                # Card background
-                out.append(f'<rect x="{x}" y="{y}" width="{CARD_W}" height="{rh}" '
-                           f'rx="10" fill="#1e293b"/>')
-                # Coloured left accent bar
-                out.append(f'<rect x="{x}" y="{y}" width="5" height="{rh}" '
-                           f'rx="3" fill="{color}"/>')
-                # Header strip
-                out.append(f'<rect x="{x}" y="{y}" width="{CARD_W}" height="{HEADER_H}" '
-                           f'rx="10" fill="{color}" opacity="0.18"/>')
-                out.append(f'<rect x="{x}" y="{y + HEADER_H - 1}" width="{CARD_W}" '
-                           f'height="1" fill="{color}" opacity="0.4"/>')
+                cx = M + ci*(CW + GAP)
+                cy = y_off
 
-                # Icon + heading
-                icon_name = sec.get("icon", "")
-                emoji = ICONS.get(icon_name, "◆")
-                heading = esc((sec.get("heading") or "")[:34])
-                out.append(f'<text x="{x + 14}" y="{y + 26}" '
-                           f'font-family="Arial,Helvetica,sans-serif" font-size="15" '
-                           f'font-weight="bold" fill="{color}">{emoji}  {heading}</text>')
+                # Card body
+                o.append(f'<rect x="{cx}" y="{cy}" width="{CW}" height="{rh}" '
+                         f'rx="14" fill="url(#gc{si % len(THEMES)})" '
+                         f'stroke="{acc}" stroke-width="1.5" stroke-opacity="0.45"/>')
+                # Top accent bar (full width)
+                o.append(f'<rect x="{cx}" y="{cy}" width="{CW}" height="5" '
+                         f'rx="2" fill="{acc}"/>')
+
+                # Icon zone background
+                o.append(f'<rect x="{cx}" y="{cy+5}" width="{CW}" height="{ICON_H-5}" '
+                         f'fill="{acc}" fill-opacity="0.12"/>')
+                # Large icon emoji
+                o.append(f'<text x="{cx+36}" y="{cy+46}" '
+                         f'font-family="Segoe UI Emoji,Apple Color Emoji,sans-serif" '
+                         f'font-size="32" fill="{acc}" dominant-baseline="central">'
+                         f'{icon_em}</text>')
+                # Heading
+                o.append(f'<text x="{cx+80}" y="{cy+38}" '
+                         f'font-family="Arial,Helvetica,sans-serif" font-size="15" '
+                         f'font-weight="bold" fill="{lt}">{heading}</text>')
+                # Section number badge
+                o.append(f'<circle cx="{cx+CW-20}" cy="{cy+25}" r="14" '
+                         f'fill="{bb}" fill-opacity="0.7"/>')
+                o.append(f'<text x="{cx+CW-20}" y="{cy+25}" text-anchor="middle" '
+                         f'dominant-baseline="central" '
+                         f'font-family="Arial,Helvetica,sans-serif" font-size="13" '
+                         f'font-weight="bold" fill="#fff">{si+1}</text>')
+
+                # Divider
+                o.append(f'<line x1="{cx+12}" y1="{cy+ICON_H+4}" '
+                         f'x2="{cx+CW-12}" y2="{cy+ICON_H+4}" '
+                         f'stroke="{acc}" stroke-width="1" stroke-opacity="0.35"/>')
 
                 # Facts
-                facts = (sec.get("facts") or [])[:4]
-                fy = y + HEADER_H + CARD_PAD
+                fy = cy + ICON_H + 14
                 for fact in facts:
-                    fact_lines = wrap(str(fact))
-                    for li, line in enumerate(fact_lines):
-                        if li == 0:
-                            # bullet on first line only
-                            out.append(f'<circle cx="{x + 20}" cy="{fy + 6}" r="3" fill="{color}"/>')
-                            out.append(f'<text x="{x + 30}" y="{fy + 14}" '
-                                       f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
-                                       f'fill="#cbd5e1">{esc(line)}</text>')
-                        else:
-                            out.append(f'<text x="{x + 30}" y="{fy + 14}" '
-                                       f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
-                                       f'fill="#cbd5e1">{esc(line)}</text>')
-                        fy += FACT_LINE_H
-                # pad after last fact
-                fy += CARD_PAD // 2
+                    fact_text = esc(str(fact)[:85])
+                    o.append(f'<circle cx="{cx+22}" cy="{fy+5}" r="3.5" fill="{acc}" fill-opacity="0.9"/>')
+                    o.append(f'<text x="{cx+34}" y="{fy+11}" '
+                             f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
+                             f'fill="#e2e8f0">{fact_text}</text>')
+                    fy += FACT_H
 
-            y_off += rh + CARD_GAP
+                # Highlight / stat badge
+                if highlight:
+                    by = cy + rh - BAD_H - 10
+                    bx = cx + 12
+                    bw = CW - 24
+                    o.append(f'<rect x="{bx}" y="{by}" width="{bw}" height="{BAD_H}" '
+                             f'rx="{BAD_H//2}" fill="{bb}" fill-opacity="0.25" '
+                             f'stroke="{acc}" stroke-width="1.5" stroke-opacity="0.7"/>')
+                    o.append(f'<text x="{bx + bw//2}" y="{by + BAD_H//2}" '
+                             f'text-anchor="middle" dominant-baseline="central" '
+                             f'font-family="Arial,Helvetica,sans-serif" font-size="13" '
+                             f'font-weight="bold" fill="{lt}">{esc(highlight)}</text>')
 
-        # Key takeaway box
-        if KT_LINES:
-            kty = y_off
-            out.append(f'<rect x="{MARGIN}" y="{kty}" width="{W - 2*MARGIN}" '
-                       f'height="{KT_H}" rx="8" fill="#052e16" opacity="0.9"/>')
-            out.append(f'<rect x="{MARGIN}" y="{kty}" width="5" height="{KT_H}" '
-                       f'rx="3" fill="#10B981"/>')
-            out.append(f'<text x="{MARGIN + 18}" y="{kty + 20}" '
-                       f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
-                       f'font-weight="bold" fill="#10B981">💡  KEY TAKEAWAY</text>')
-            for li, line in enumerate(KT_LINES):
-                out.append(f'<text x="{MARGIN + 18}" y="{kty + 20 + (li + 1)*20}" '
-                           f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
-                           f'fill="#86efac">{esc(line)}</text>')
+            y_off += rh + GAP
 
-        out.append("</svg>")
-        return "\n".join(out)
+        # ── Key Takeaway ────────────────────────────────────────────────────
+        if kt_lines:
+            kty = y_off + M//2
+            o.append(f'<rect x="{M}" y="{kty}" width="{W-2*M}" height="{KT_H}" '
+                     f'rx="12" fill="#022c22" fill-opacity="0.85" '
+                     f'stroke="#10B981" stroke-width="1.5" stroke-opacity="0.6"/>')
+            o.append(f'<rect x="{M}" y="{kty}" width="6" height="{KT_H}" '
+                     f'rx="3" fill="#10B981"/>')
+            # Lightbulb icon
+            o.append(f'<text x="{M+20}" y="{kty + 22}" '
+                     f'font-family="Segoe UI Emoji,Apple Color Emoji,sans-serif" '
+                     f'font-size="18" fill="#10B981">💡</text>')
+            o.append(f'<text x="{M+46}" y="{kty + 22}" '
+                     f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
+                     f'font-weight="bold" letter-spacing="1" fill="#10B981">KEY TAKEAWAY</text>')
+            for li, line in enumerate(kt_lines[:3]):
+                o.append(f'<text x="{M+20}" y="{kty + 38 + li*20}" '
+                         f'font-family="Arial,Helvetica,sans-serif" font-size="12.5" '
+                         f'fill="#6ee7b7">{esc(line)}</text>')
+
+        o.append("</svg>")
+        return "\n".join(o)
+
+    async def _generate_infographic_svg_fallback(
+        self, topic: str, content: str, grade: int | None
+    ) -> dict | None:
+        """Generate a structured infographic via the chat model when image generation fails."""
+        grade_str = f"grade {grade}" if grade else "general"
+        prompt = (
+            f"Create a rich, detailed educational infographic for {grade_str} students.\n\n"
+            f"Topic: {topic}\n\nSource content:\n{content}\n\n"
+            "Return ONLY a valid JSON object with this EXACT structure — no markdown fences:\n"
+            '{\n'
+            '  "title": "SHORT BOLD TITLE (max 6 words, ALL CAPS)",\n'
+            '  "subtitle": "One-line subtitle describing the topic",\n'
+            '  "sections": [\n'
+            '    {\n'
+            '      "heading": "Section heading (3-4 words)",\n'
+            '      "facts": [\n'
+            '        "Concise fact or definition (1 sentence)",\n'
+            '        "Another key point with a specific detail",\n'
+            '        "A third fact, number, or formula if applicable"\n'
+            '      ],\n'
+            '      "highlight": "One standout stat or keyword (optional, can be null)"\n'
+            '    }\n'
+            '  ],\n'
+            '  "keyTakeaway": "One powerful summary sentence the student must remember."\n'
+            '}\n\n'
+            "Rules:\n"
+            "- Use 4 sections, each with exactly 3 facts\n"
+            "- Facts must be specific: include numbers, dates, formulas, or examples where relevant\n"
+            "- highlight should be a short memorable phrase like '9.8 m/s²' or 'Since 1687' — or null\n"
+            "- Return ONLY the JSON object, nothing else"
+        )
+        try:
+            response = await self.chat([{"role": "user", "content": prompt}])
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+            # Strip any trailing ``` that got captured
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3].strip()
+            data = json.loads(cleaned)
+            # Ensure sections have the right structure
+            for sec in data.get("sections", []):
+                if "points" in sec and "facts" not in sec:
+                    sec["facts"] = sec.pop("points")
+            svg = self._render_infographic_svg(data)
+            import base64
+            svg_b64 = base64.b64encode(svg.encode()).decode()
+            data_uri = f"data:image/svg+xml;base64,{svg_b64}"
+            return {"image_base64": data_uri, "title": topic, "mode": "image"}
+        except Exception as e:
+            print(f"[Infographic SVG fallback] failed: {e}", flush=True)
+            return None
 
     async def generate_chat_infographic(
         self,
@@ -4938,45 +5135,89 @@ Return ONLY this JSON structure:
         explanation = ai_response[:3000]
 
         image_prompt = (
-            f"Create a beautiful, detailed educational infographic image for {grade_str} students.\n\n"
-            f"Topic / Question: {topic}\n\n"
-            f"Key information to visualise:\n{explanation}\n\n"
-            "Design requirements:\n"
-            "- Bold, clearly readable title at the top\n"
-            "- Vibrant, contrasting colours with a dark background\n"
-            "- Organise information into clear labelled sections or panels\n"
-            "- Include relevant icons, diagrams, arrows or visual callouts\n"
-            "- Highlight key facts, numbers, dates and formulas as visual elements\n"
-            "- Professional infographic poster style — NOT a mindmap\n"
-            "- All text must be spelled exactly correctly\n"
-            f"- Language: {language}"
+            f"Create a STUNNING, magazine-quality educational infographic poster for {grade_str} students "
+            f"on the topic: \"{topic}\"\n\n"
+            "=== CONTENT TO VISUALISE ===\n"
+            f"{explanation}\n\n"
+            "=== DESIGN SPECIFICATIONS ===\n"
+            "LAYOUT: Structured poster with a bold header banner, 3-4 distinct content panels arranged "
+            "in a clean grid, and a highlighted key-takeaway banner at the bottom.\n\n"
+            "VISUAL STYLE:\n"
+            "- Deep dark background (navy #0f2044 or near-black) with vivid accent colours\n"
+            "- Each content panel uses a different accent colour (electric blue, emerald, amber, coral)\n"
+            "- Large, eye-catching title in the header with a coloured underline or stripe\n"
+            "- Icons, small illustrations, or diagrams inside each panel to reinforce the concept\n"
+            "- Important numbers, formulas, and dates styled as large highlighted 'stat badges'\n"
+            "- Connecting arrows or flow lines between related panels where logical\n"
+            "- Bullet points inside panels use coloured dot markers\n\n"
+            "TYPOGRAPHY:\n"
+            "- Header title: very large, bold, white or bright yellow\n"
+            "- Section headings: medium, bold, panel accent colour\n"
+            "- Body text: small, clean, high-contrast white or light grey\n"
+            "- All text must be spelled correctly and be fully readable\n\n"
+            "QUALITY: Photorealistic rendering quality, 1024×1536 portrait orientation, "
+            "professional graphic-design finish — NOT a hand-drawn diagram or mind-map.\n\n"
+            f"LANGUAGE: All text in {language}."
         )
 
-        try:
-            from google import genai
+        # Use the shared async client (avoids per-call TCP handshake overhead)
+        client = self._get_gemini_async()
+        if client:
             from google.genai import types
+            image_model = settings.AI_IMAGE_MODEL
 
-            client = genai.Client(api_key=settings.GEMINI_API_KEY)
-            resp = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model="gemini-2.5-flash-image",
-                    contents=[image_prompt],
-                    config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
-                ),
-                timeout=60.0,
-            )
-            for part in resp.parts:
-                if getattr(part, "inline_data", None) is not None:
-                    img_bytes = part.inline_data.data
-                    mime = part.inline_data.mime_type or "image/png"
-                    data_uri = f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"
-                    print(f"[Infographic] image generated ({len(img_bytes)} bytes)")
-                    return {"image_base64": data_uri, "title": topic, "mode": "image"}
-            print("[Infographic] model returned no image part")
-        except asyncio.TimeoutError:
-            print("[Infographic] image generation timed out after 60 s")
+            # Try two configs: with explicit IMAGE modality, then without (some models auto-detect)
+            configs_to_try = [
+                types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
+                types.GenerateContentConfig(response_modalities=["IMAGE"]),
+                None,  # bare call — some models return image without modality hint
+            ]
+
+            for attempt in range(3):  # up to 3 attempts with backoff on 503/429
+                cfg = configs_to_try[min(attempt, len(configs_to_try) - 1)]
+                try:
+                    call_kwargs: dict = dict(model=image_model, contents=[image_prompt])
+                    if cfg is not None:
+                        call_kwargs["config"] = cfg
+                    resp = await asyncio.wait_for(
+                        client.aio.models.generate_content(**call_kwargs),
+                        timeout=60.0,
+                    )
+                    for part in resp.parts:
+                        if getattr(part, "inline_data", None) is not None:
+                            img_bytes = part.inline_data.data
+                            mime = part.inline_data.mime_type or "image/png"
+                            data_uri = f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"
+                            print(f"[Infographic] image generated ({len(img_bytes)} bytes, model={image_model})", flush=True)
+                            return {"image_base64": data_uri, "title": topic, "mode": "image"}
+                    print(f"[Infographic] no image part (model={image_model}, attempt={attempt+1})", flush=True)
+                    if attempt < 2:
+                        await asyncio.sleep(1.0)
+                        continue
+                    break  # all config variants tried
+                except asyncio.TimeoutError:
+                    print(f"[Infographic] timed out on attempt {attempt + 1}", flush=True)
+                    if attempt < 2:
+                        await asyncio.sleep(1.0)
+                        continue
+                    break
+                except Exception as e:
+                    if _is_retryable(e) and attempt < 2:
+                        wait = 1.0 * (2 ** attempt)
+                        print(f"[Infographic] 503/429 attempt {attempt + 1}, retry in {wait}s: {e}", flush=True)
+                        await asyncio.sleep(wait)
+                        continue
+                    print(f"[Infographic] failed: {type(e).__name__}: {e}", flush=True)
+                    break
+
+        # Graceful fallback: generate SVG-based infographic via the chat model
+        print("[Infographic] falling back to SVG mode", flush=True)
+        try:
+            svg_data = await self._generate_infographic_svg_fallback(topic, ai_response[:2000], grade)
+            if svg_data:
+                return svg_data
         except Exception as e:
-            print(f"[Infographic] image generation failed: {type(e).__name__}: {e}")
+            print(f"[Infographic] SVG fallback also failed: {e}", flush=True)
 
         return {"title": topic[:80], "subtitle": "", "sections": [], "keyTakeaway": "", "mode": "json"}
 
@@ -6324,3 +6565,24 @@ Return ONLY valid JSON."""
             return data
         except Exception:
             return {"title": f"{topic} Diagram", "zones": [], "nodes": [], "connections": []}
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton — one AIService shared across all requests.
+# Reusing the same instance keeps HTTP connections to Gemini/OpenAI/Anthropic
+# alive between requests, eliminating the ~7-8s per-request TCP handshake
+# overhead that occurs when creating a new client on every call.
+# ---------------------------------------------------------------------------
+_default_service: "AIService | None" = None
+
+
+def get_ai_service() -> AIService:
+    global _default_service
+    if _default_service is None:
+        _default_service = AIService()
+        # Pre-initialize all provider clients so their HTTP sessions are warm
+        # before the first user request arrives.
+        _default_service._get_gemini_async()
+        _default_service._get_openai()
+        _default_service._get_anthropic()
+    return _default_service

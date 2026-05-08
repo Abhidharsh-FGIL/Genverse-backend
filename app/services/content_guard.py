@@ -21,6 +21,21 @@ from typing import Optional
 
 logger = logging.getLogger("content_guard")
 
+# Cached google-genai client — created once and reused across all guard calls
+# so the underlying HTTP session is not torn down between requests.
+_guard_gemini_client = None
+
+
+def _get_guard_client():
+    global _guard_gemini_client
+    if _guard_gemini_client is None:
+        from app.config import settings
+        from google import genai as genai_new
+        _guard_gemini_client = genai_new.Client(
+            api_key=settings.GOOGLE_GEMINI_API_KEY or settings.GEMINI_API_KEY
+        )
+    return _guard_gemini_client
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -288,10 +303,7 @@ class ContentGuardService:
             return GuardResult(action=GuardAction.ALLOW, category="educational", message=None)
 
         try:
-            import google.generativeai as genai
-
-            genai.configure(api_key=settings.GOOGLE_GEMINI_API_KEY or settings.GEMINI_API_KEY)
-            model = genai.GenerativeModel(settings.AI_PRIMARY_MODEL)
+            client = _get_guard_client()
 
             # Use grade-aware prompt when student_mode + grade is set
             if self.student_mode and self.grade:
@@ -301,7 +313,10 @@ class ContentGuardService:
             else:
                 prompt = CLASSIFIER_PROMPT_BASE.format(query=query[:500])
 
-            response = await asyncio.to_thread(model.generate_content, prompt)
+            response = await client.aio.models.generate_content(
+                model=settings.AI_PRIMARY_MODEL,
+                contents=prompt,
+            )
             text = response.text.strip()
 
             # Strip markdown fences if present

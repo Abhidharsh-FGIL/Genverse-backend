@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
 from app.schemas.ai import PlaygroundRequest
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.points_service import PointsService
 from app.models.subscription import PointCost
 from app.models.ai import AiContextSession
@@ -204,7 +204,7 @@ async def playground_explore_stream(
         cost_override=total_cost, xp_override=total_xp, org_id=org_id,
     )
 
-    ai = AIService()
+    ai = get_ai_service()
 
     # Resolve grade/board/student_mode with the same session-backed fallback
     # used by the non-streaming mode endpoints, then merge them onto context
@@ -266,7 +266,7 @@ async def playground_explore(
         cost_override=total_cost, xp_override=total_xp, org_id=org_id,
     )
 
-    ai = AIService()
+    ai = get_ai_service()
     _role, resolved_grade, resolved_board, resolved_sm = await _resolve_context(payload, current_user, db)
     merged_context = dict(payload.context or {})
     merged_context["student_mode"] = resolved_sm
@@ -291,7 +291,7 @@ async def playground_setup(
     payload: SetupRequest, current_user: CurrentUser, db: DBSession
 ):
     """Topic interpreter: returns topic-specific controls + scene setup for the Sandbox."""
-    ai = AIService()
+    ai = get_ai_service()
     return await ai.playground_setup(payload.topic)
 
 
@@ -302,7 +302,7 @@ async def playground_simulate(
     payload: SimulateRequest, current_user: CurrentUser, db: DBSession
 ):
     """Sandbox: send slider variables + control context → AI returns analysis + visual_directives."""
-    ai = AIService()
+    ai = get_ai_service()
     controls_raw = [c.model_dump() for c in payload.controls] if payload.controls else None
     return await ai.playground_simulate(payload.topic, payload.variables, controls_raw)
 
@@ -314,7 +314,7 @@ async def playground_cards(
     payload: FlashcardsRequest, current_user: CurrentUser, db: DBSession
 ):
     """Flash-Duel: generate 5 gamified flashcards (question/answer/hint/points)."""
-    ai = AIService()
+    ai = get_ai_service()
     cards = await ai.playground_flashcards(payload.topic)
     return {"cards": cards, "topic": payload.topic}
 
@@ -326,7 +326,7 @@ async def playground_quest(
     payload: QuestRequest, current_user: CurrentUser, db: DBSession
 ):
     """Quest-Line: advance a branching narrative RPG. Pass history + current choice."""
-    ai = AIService()
+    ai = get_ai_service()
     return await ai.playground_quest(payload.topic, payload.history, payload.choice)
 
 
@@ -337,7 +337,7 @@ async def playground_mirror_chat(
     payload: MirrorChatRequest, current_user: CurrentUser, db: DBSession
 ):
     """The Mirror: LLM adopts an educational persona and chats in character."""
-    ai = AIService()
+    ai = get_ai_service()
     response = await ai.playground_mirror_chat(
         payload.topic, payload.persona, payload.messages
     )
@@ -358,7 +358,7 @@ async def playground_match_pairs(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     pairs = await ai.playground_match_pairs(payload.topic, role, grade, board, student_mode)
     return {"pairs": pairs, "topic": payload.topic}
 
@@ -377,7 +377,7 @@ async def playground_swipe_facts(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     facts = await ai.playground_swipe_facts(payload.topic, role, grade, board, student_mode)
     return {"facts": facts, "topic": payload.topic}
 
@@ -397,7 +397,7 @@ async def playground_speed_quiz(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     result = await ai.playground_speed_quiz(payload.topic, role, grade, board, student_mode)
     return {"questions": result.get("questions", []),
             "challenger": result.get("challenger", {}),
@@ -419,7 +419,7 @@ async def playground_roleplay(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     scenario = await ai.playground_roleplay(payload.topic, role, grade, board, student_mode)
     return {"scenario": scenario, "topic": payload.topic}
 
@@ -439,7 +439,7 @@ async def playground_imagine(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     scenario = await ai.playground_imagine(payload.topic, role, grade, board, student_mode)
     return {"scenario": scenario, "topic": payload.topic}
 
@@ -457,7 +457,7 @@ async def playground_imagine_evaluate(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     evaluation = await ai.playground_imagine_evaluate(
         payload.topic, payload.question, payload.answer,
         payload.max_points, role, grade, board, student_mode,
@@ -479,7 +479,7 @@ async def playground_mythbusters(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     result = await ai.playground_mythbusters(payload.topic, role, grade, board, student_mode)
     return result
 
@@ -498,7 +498,7 @@ async def playground_cascade_quiz(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     result = await ai.playground_cascade_quiz(payload.topic, role, grade, board, student_mode)
     return result
 
@@ -517,7 +517,7 @@ async def playground_timeline(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     result = await ai.playground_timeline(payload.topic, role, grade, board, student_mode)
     return result
 
@@ -536,6 +536,6 @@ async def playground_diagram(
         cost_override=2, xp_override=5, org_id=org_id,
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
-    ai = AIService()
+    ai = get_ai_service()
     result = await ai.playground_diagram(payload.topic, role, grade, board, student_mode)
     return result

@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
     AI_PRIMARY_MODEL: str = "gemini-2.5-flash"
+    AI_GEMINI_BACKUP_MODEL: str = "gemini-2.0-flash-lite"  # used when primary returns 503/429
+    AI_IMAGE_MODEL: str = "gemini-2.5-flash-preview-05-20"  # image-capable Gemini model
     AI_FALLBACK_MODEL: str = "gpt-4o-mini"
     AI_DOCUMENT_MODEL: str = "claude-sonnet-4-20250514"
     AI_EBOOK_MODEL: str = "gpt-4o"

@@ -6,7 +6,7 @@ from app.dependencies import DBSession, CurrentUser
 from app.models.classes import Rubric
 from app.schemas.classes import RubricCreate, RubricUpdate, RubricResponse, GenerateRubricRequest
 from app.core.exceptions import NotFoundException, ForbiddenException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 
 router = APIRouter()
 
@@ -90,7 +90,7 @@ async def delete_rubric(rubric_id: uuid.UUID, current_user: CurrentUser, db: DBS
 async def generate_rubric_ai(payload: GenerateRubricRequest, current_user: CurrentUser, db: DBSession):
     """Use AI to auto-generate rubric criteria. Does NOT save to DB — the user
     reviews and clicks Save to persist."""
-    ai = AIService()
+    ai = get_ai_service()
     criteria = await ai.generate_rubric(
         board=payload.board,
         grade=payload.grade,

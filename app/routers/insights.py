@@ -20,7 +20,7 @@ from app.schemas.insights import (
     ClassRecommendationItem,
 )
 from app.core.exceptions import NotFoundException
-from app.services.ai_service import AIService
+from app.services.ai_service import AIService, get_ai_service
 from app.services.points_service import PointsService
 from app.services.news_service import NewsService
 
@@ -82,7 +82,7 @@ async def generate_insights(
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="insights", db=db, org_id=parsed_oid)
     await points_service.deduct(user_id=current_user.id, action="generate_insights", db=db, org_id=parsed_oid)
 
-    ai = AIService()
+    ai = get_ai_service()
     insights_data = await ai.generate_insights(user_id=str(current_user.id), db=db)
 
     new_insights = []
@@ -134,7 +134,7 @@ async def list_insights(
             )
         )
         if attempt_count.scalar_one() > 0:
-            ai = AIService()
+            ai = get_ai_service()
             insights_data = await ai.generate_insights(user_id=str(current_user.id), db=db)
             new_insights = []
             for item in insights_data:
@@ -204,7 +204,7 @@ async def get_insight_feed(
     articles = result.scalars().all()
     if not articles:
         # Generate new feed
-        ai = AIService()
+        ai = get_ai_service()
         feed_data = await ai.generate_insight_feed(
             user_id=str(current_user.id),
             subject=subject,
@@ -345,7 +345,7 @@ async def get_learning_intelligence(
         except Exception:
             pass
 
-    ai = AIService()
+    ai = get_ai_service()
     intelligence = await ai.get_learning_intelligence(
         user_id=str(current_user.id),
         modules=payload.modules,
@@ -401,7 +401,7 @@ async def get_assessment_summary(
         except Exception:
             pass
 
-    ai = AIService()
+    ai = get_ai_service()
     summary = await ai.generate_assessment_summary(user_id=str(current_user.id), db=db, org_id=org_id)
 
     # Cache for 30 minutes
@@ -465,7 +465,7 @@ async def get_recommendations(
 
     if not recs:
         # Auto-generate on first load — same logic as /recommendations/generate
-        ai = AIService()
+        ai = get_ai_service()
         recs_data = await ai.generate_assessment_recommendations(
             user_id=str(current_user.id), db=db, org_id=org_id
         )
@@ -529,7 +529,7 @@ async def generate_recommendations(
     await db.execute(del_q)
     await db.commit()
 
-    ai = AIService()
+    ai = get_ai_service()
     recs_data = await ai.generate_assessment_recommendations(
         user_id=str(current_user.id), db=db, org_id=org_id
     )
@@ -736,7 +736,7 @@ async def generate_student_performance_summary(
         ]
 
     payload["topic_mastery"] = topic_mastery_data
-    ai = AIService()
+    ai = get_ai_service()
     result = await ai.generate_student_performance_summary(payload)
 
     # Persist to DB (upsert — one per student per org)
@@ -797,7 +797,7 @@ async def generate_class_recommendations(
         except Exception:
             pass
 
-    ai = AIService()
+    ai = get_ai_service()
     recommendations = await ai.generate_class_recommendations({
         "class_id": payload.class_id,
         "class_name": class_name,
