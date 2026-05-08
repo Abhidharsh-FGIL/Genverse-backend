@@ -1229,6 +1229,7 @@ class AIService:
                 try:
                     client = self._get_anthropic()
                     if client:
+                        print(f"[MODEL] Invoking Anthropic (document Q&A): {settings.AI_DOCUMENT_MODEL}", flush=True)
                         async for chunk in self._stream_anthropic(system_prompt, messages):
                             yield chunk
                         return
@@ -1238,6 +1239,7 @@ class AIService:
                 try:
                     client = self._get_openai()
                     if client:
+                        print(f"[MODEL] Invoking OpenAI (document Q&A fallback): {settings.AI_FALLBACK_MODEL}", flush=True)
                         async for chunk in self._stream_openai(system_prompt, messages):
                             yield chunk
                         return
@@ -1247,6 +1249,7 @@ class AIService:
                 try:
                     client = self._get_gemini()
                     if client:
+                        print(f"[MODEL] Invoking Gemini (document Q&A fallback): {settings.AI_PRIMARY_MODEL}", flush=True)
                         async for chunk in self._stream_gemini(full_prompt):
                             yield chunk
                         return
@@ -1257,6 +1260,7 @@ class AIService:
                 try:
                     client = self._get_gemini()
                     if client:
+                        print(f"[MODEL] Invoking Gemini (direct Q&A): {settings.AI_PRIMARY_MODEL}", flush=True)
                         async for chunk in self._stream_gemini(full_prompt):
                             yield chunk
                         return
@@ -1266,6 +1270,7 @@ class AIService:
                 try:
                     client = self._get_openai()
                     if client:
+                        print(f"[MODEL] Invoking OpenAI (direct Q&A fallback): {settings.AI_FALLBACK_MODEL}", flush=True)
                         async for chunk in self._stream_openai(system_prompt, messages):
                             yield chunk
                         return
