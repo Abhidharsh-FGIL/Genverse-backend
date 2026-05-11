@@ -5060,36 +5060,28 @@ Return ONLY this JSON structure:
         return "\n".join(o)
 
     async def _generate_infographic_svg_fallback(
-        self, topic: str, content: str, grade: int | None
+        self, topic: str, content: str, grade: int | None, language: str = "English"
     ) -> dict | None:
         """Generate a structured infographic via the chat model when image generation fails."""
         grade_str = f"grade {grade}" if grade else "general"
-        prompt = (
-            f"Create a rich, detailed educational infographic for {grade_str} students.\n\n"
-            f"Topic: {topic}\n\nSource content:\n{content}\n\n"
-            "Return ONLY a valid JSON object with this EXACT structure — no markdown fences:\n"
-            '{\n'
-            '  "title": "SHORT BOLD TITLE (max 6 words, ALL CAPS)",\n'
-            '  "subtitle": "One-line subtitle describing the topic",\n'
-            '  "sections": [\n'
-            '    {\n'
-            '      "heading": "Section heading (3-4 words)",\n'
-            '      "facts": [\n'
-            '        "Concise fact or definition (1 sentence)",\n'
-            '        "Another key point with a specific detail",\n'
-            '        "A third fact, number, or formula if applicable"\n'
-            '      ],\n'
-            '      "highlight": "One standout stat or keyword (optional, can be null)"\n'
-            '    }\n'
-            '  ],\n'
-            '  "keyTakeaway": "One powerful summary sentence the student must remember."\n'
-            '}\n\n'
-            "Rules:\n"
-            "- Use 4 sections, each with exactly 3 facts\n"
-            "- Facts must be specific: include numbers, dates, formulas, or examples where relevant\n"
-            "- highlight should be a short memorable phrase like '9.8 m/s²' or 'Since 1687' — or null\n"
-            "- Return ONLY the JSON object, nothing else"
-        )
+        prompt = f"""You are an infographic designer. Convert this into a structured infographic layout.
+
+Topic: {topic}
+Grade Level: {grade_str}
+Language: {language}
+
+── AI EXPLANATION ──
+{content}
+── END ──
+
+ACCURACY & SPELLING (CRITICAL):
+- Every word, name, term, date, and formula in the output MUST be spelled correctly.
+- Copy scientific terms, proper nouns, and formulas EXACTLY from the explanation above.
+- Double-check ALL text strings before including them — spelling mistakes make the infographic unusable.
+- Use proper capitalisation for headings and proper nouns.
+
+Return ONLY raw JSON with: title, subtitle, sections (array of heading/icon/color/facts/highlight), keyTakeaway.
+Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shield, Brain, Heart, TrendingUp, BarChart, Layers"""
         try:
             response = await self.chat([{"role": "user", "content": prompt}])
             cleaned = response.strip()
@@ -5135,29 +5127,32 @@ Return ONLY this JSON structure:
         explanation = ai_response[:3000]
 
         image_prompt = (
-            f"Create a STUNNING, magazine-quality educational infographic poster for {grade_str} students "
-            f"on the topic: \"{topic}\"\n\n"
-            "=== CONTENT TO VISUALISE ===\n"
-            f"{explanation}\n\n"
-            "=== DESIGN SPECIFICATIONS ===\n"
-            "LAYOUT: Structured poster with a bold header banner, 3-4 distinct content panels arranged "
-            "in a clean grid, and a highlighted key-takeaway banner at the bottom.\n\n"
-            "VISUAL STYLE:\n"
-            "- Deep dark background (navy #0f2044 or near-black) with vivid accent colours\n"
-            "- Each content panel uses a different accent colour (electric blue, emerald, amber, coral)\n"
-            "- Large, eye-catching title in the header with a coloured underline or stripe\n"
-            "- Icons, small illustrations, or diagrams inside each panel to reinforce the concept\n"
-            "- Important numbers, formulas, and dates styled as large highlighted 'stat badges'\n"
-            "- Connecting arrows or flow lines between related panels where logical\n"
-            "- Bullet points inside panels use coloured dot markers\n\n"
-            "TYPOGRAPHY:\n"
-            "- Header title: very large, bold, white or bright yellow\n"
-            "- Section headings: medium, bold, panel accent colour\n"
-            "- Body text: small, clean, high-contrast white or light grey\n"
-            "- All text must be spelled correctly and be fully readable\n\n"
-            "QUALITY: Photorealistic rendering quality, 1024×1536 portrait orientation, "
-            "professional graphic-design finish — NOT a hand-drawn diagram or mind-map.\n\n"
-            f"LANGUAGE: All text in {language}."
+            "⚠️ STRICTLY FORBIDDEN: Do NOT draw a 2×2 grid, 3×2 grid, or any layout where sections are "
+            "equal-sized boxes arranged in rows and columns. This is the single most important rule. "
+            "Violating it makes the output unusable. ⚠️\n\n"
+            f"Create a beautiful, colorful educational infographic poster about: {topic}\n\n"
+            f"Grade Level: {grade_str}\n"
+            f"Language: {language}\n\n"
+            f"Key information to include in the infographic:\n{explanation}\n\n"
+            "LAYOUT — think like a newspaper front page or a National Geographic spread:\n"
+            "- One large full-width title banner at the very top\n"
+            "- Below that: sections of DIFFERENT widths and heights — some wide, some narrow, some tall\n"
+            "- At least one section should span the full width; others should sit side by side at different heights\n"
+            "- Sections bleed into each other with connecting arrows and flow lines\n"
+            "- End with a bold full-width key-takeaway ribbon at the bottom\n\n"
+            "Design requirements:\n"
+            "- Vibrant colors, icons, and clear visual hierarchy\n"
+            "- Draw actual mini-diagrams or illustrations inside sections (e.g. planets, forces, timelines) "
+            "— not just bullet points\n"
+            "- Key facts, statistics, and dates as bold visual callout badges\n"
+            "- Dark or rich colored background with contrasting text; no large empty spaces\n"
+            "- Professional infographic style suitable for students\n\n"
+            "ACCURACY & SPELLING (CRITICAL):\n"
+            "- Every word, name, term, date, and formula MUST be spelled correctly.\n"
+            "- Copy scientific terms, proper nouns, and formulas EXACTLY from the key information above.\n"
+            "- Double-check ALL text before rendering — any spelling mistake will make the infographic unusable.\n"
+            "- Use proper capitalisation for headings and proper nouns.\n"
+            "- If including numbers or statistics, verify they match the source information exactly."
         )
 
         # Use the shared async client (avoids per-call TCP handshake overhead)
@@ -5213,7 +5208,7 @@ Return ONLY this JSON structure:
         # Graceful fallback: generate SVG-based infographic via the chat model
         print("[Infographic] falling back to SVG mode", flush=True)
         try:
-            svg_data = await self._generate_infographic_svg_fallback(topic, ai_response[:2000], grade)
+            svg_data = await self._generate_infographic_svg_fallback(topic, ai_response[:2000], grade, language)
             if svg_data:
                 return svg_data
         except Exception as e:
