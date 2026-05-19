@@ -159,6 +159,8 @@ async def _seed_individual_user(db, data, now, period_end):
             sub.points_balance = data["points_balance"]
             sub.points_monthly_quota = data["points_monthly_quota"]
             sub.storage_limit_mb = data["storage_limit_mb"]
+            sub.current_period_start = now
+            sub.current_period_end = period_end
             print(f"  [update] subscription -> {data['plan']}")
         else:
             db.add(Subscription(
@@ -377,6 +379,8 @@ async def _seed_org_admin(db, data, now, period_end):
                 sub.points_monthly_quota = data["points_monthly_quota"]
                 sub.storage_limit_mb = data["storage_limit_mb"]
                 sub.max_seats = data["max_seats"]
+                sub.current_period_start = now
+                sub.current_period_end = period_end
                 print(f"  [update] org subscription -> {data['plan']}")
             else:
                 db.add(Subscription(
@@ -472,7 +476,7 @@ async def _seed_org_admin(db, data, now, period_end):
 async def seed():
     async with AsyncSessionLocal() as db:
         now = datetime.now(timezone.utc)
-        period_end = now + timedelta(days=30)
+        period_end = now + timedelta(days=60)
 
         print("-- Individual users --")
         for data in TEST_USERS:
