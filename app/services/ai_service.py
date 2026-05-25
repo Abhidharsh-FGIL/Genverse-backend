@@ -4485,6 +4485,12 @@ Return a JSON array of EXACTLY {question_count} objects. Each object MUST have A
 - "chapter": MUST be one of the chapter names listed above — use the EXACT spelling provided, do NOT invent your own chapter names
 - "blooms_level": one of "remember"|"understand"|"apply"|"analyze"|"evaluate"|"create"
 
+MATH NOTATION — CRITICAL:
+1. Every mathematical expression, formula, matrix, fraction, trig function, Greek letter, or operator MUST be wrapped in LaTeX math delimiters: $...$ for inline (e.g. $1 + \\tan^2\\theta = \\sec^2\\theta$, $\\frac{{1}}{{2}}$) or $$...$$ for display/block math (e.g. $$\\begin{{pmatrix}}1&2\\\\3&4\\end{{pmatrix}}$$).
+2. NEVER output bare LaTeX commands (\\frac, \\begin, \\sqrt, \\tan, \\sin, \\theta, etc.) outside $ or $$ delimiters.
+3. NEVER use Unicode math characters (², ³, θ, α, β, π, ∑, →, −, ·, ∞, etc.) in option values or formulas — use LaTeX inside $...$ instead (e.g. write $\\theta$ not θ, write $x^2$ not x², write $\\tan^2\\theta - 1 = \\sec^2\\theta$ not tan²θ−1=sec²θ).
+4. Plain English words in question text do NOT need delimiters; ONLY mathematical expressions get $...$.
+
 Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""
 
         response = await self.chat([{"role": "user", "content": prompt}])
