@@ -1447,6 +1447,49 @@ Answer:"""
         counts[last_key] = max(1, total - allocated)
         return counts
 
+    @staticmethod
+    def _fix_json_escapes(s: str) -> str:
+        """Repair invalid JSON backslash escapes produced by LLM-generated LaTeX.
+        JSON only allows: \\\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX
+        LaTeX commands like \\frac, \\text, \\alpha inside JSON strings need doubling.
+        """
+        out = []
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch == '\\' and i + 1 < n:
+                nxt = s[i + 1]
+                if nxt == '\\':
+                    out.append('\\\\')
+                    i += 2
+                elif nxt == 'u':
+                    if i + 5 < n and all(c in '0123456789abcdefABCDEF' for c in s[i+2:i+6]):
+                        out.append(s[i:i+6])
+                        i += 6
+                    else:
+                        out.append('\\\\')
+                        i += 1
+                elif nxt in ('"', '/'):
+                    out.append(s[i:i+2])
+                    i += 2
+                elif nxt in ('t', 'b', 'f', 'n', 'r'):
+                    # Could be a valid JSON escape OR the start of a LaTeX command
+                    # (\text, \beta, \frac, \nu, \rho). If followed by a letter → LaTeX.
+                    if i + 2 < n and s[i + 2].isalpha():
+                        out.append('\\\\')
+                        i += 1
+                    else:
+                        out.append(s[i:i+2])
+                        i += 2
+                else:
+                    out.append('\\\\')
+                    i += 1
+            else:
+                out.append(ch)
+                i += 1
+        return ''.join(out)
+
     async def generate_practice_assessment(
         self,
         subject: str,
@@ -1672,6 +1715,12 @@ Return a JSON array of EXACTLY {question_count} objects. Each object MUST have A
 - "marks": 1 for mcq/fill/true_false; 2 for short/match; 4 for long
 - "blooms_level": one of "remember" | "understand" | "apply" | "analyze" | "evaluate" | "create"
 
+MATH NOTATION — CRITICAL:
+1. Every mathematical expression, formula, matrix, fraction, trig function, Greek letter, or operator MUST be wrapped in LaTeX math delimiters: $...$ for inline (e.g. $1 + \\tan^2\\theta = \\sec^2\\theta$, $\\frac{{1}}{{2}}$) or $$...$$ for display/block math (e.g. $$\\begin{{pmatrix}}1&2\\\\3&4\\end{{pmatrix}}$$).
+2. NEVER output bare LaTeX commands (\\frac, \\begin, \\sqrt, \\tan, \\sin, \\theta, etc.) outside $ or $$ delimiters.
+3. NEVER use Unicode math characters (², ³, θ, α, β, π, ∑, →, −, ·, ∞, etc.) in option values or formulas — use LaTeX inside $...$ instead (e.g. write $\\theta$ not θ, write $x^2$ not x², write $\\tan^2\\theta - 1 = \\sec^2\\theta$ not tan²θ−1=sec²θ).
+4. Plain English words in question text do NOT need delimiters; ONLY mathematical expressions get $...$.
+
 ⚠️ FINAL CHECKS BEFORE OUTPUT:
 1. Verify every "type" field is one of {allowed_types_str}.
 2. Verify every MCQ "subtype" field matches the required distribution above.
@@ -1683,15 +1732,38 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
+
+            # Extract JSON from markdown code fences
             if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-            result = json.loads(cleaned)
+                parts = cleaned.split("```")
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith("json"):
+                        part = part[4:].strip()
+                    if part.startswith("["):
+                        cleaned = part
+                        break
+
+            # Fallback: find JSON array anywhere in the response
+            if not cleaned.startswith("["):
+                import re as _re
+                match = _re.search(r'\[[\s\S]*\]', cleaned)
+                if match:
+                    cleaned = match.group(0)
+
+            try:
+                result = json.loads(cleaned, strict=False)
+            except json.JSONDecodeError:
+                cleaned = AIService._fix_json_escapes(cleaned)
+                result = json.loads(cleaned, strict=False)
+
             if isinstance(result, list):
                 return result
         except Exception:
-            pass
+            import logging as _logging
+            _logging.getLogger(__name__).exception(
+                "[generate_practice_assessment] Failed to parse LLM response"
+            )
         return []
 
     async def auto_evaluate_attempt(self, questions: List[dict], responses: dict) -> dict:
@@ -4514,59 +4586,10 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 if match:
                     cleaned = match.group(0)
 
-            # Fix invalid JSON backslash escapes from AI-generated content.
-            # AI generates LaTeX like \text, \frac, \alpha, \epsilon inside JSON strings.
-            # JSON only allows: \" \\ \/ \b \f \n \r \t \uXXXX
-            # Tricky: \text starts with \t (tab), \frac with \f (form-feed), \beta with \b, etc.
-            # A character-by-character scanner handles all edge cases correctly.
-            def _fix_json_escapes(s: str) -> str:
-                out = []
-                i = 0
-                n = len(s)
-                while i < n:
-                    ch = s[i]
-                    if ch == '\\' and i + 1 < n:
-                        nxt = s[i + 1]
-                        if nxt == '\\':
-                            # Already escaped \\, keep as-is
-                            out.append('\\\\')
-                            i += 2
-                        elif nxt == 'u':
-                            # \uXXXX is valid only if followed by exactly 4 hex digits
-                            if i + 5 < n and all(c in '0123456789abcdefABCDEF' for c in s[i+2:i+6]):
-                                out.append(s[i:i+6])
-                                i += 6
-                            else:
-                                # \union, \underline etc — LaTeX, double-escape
-                                out.append('\\\\')
-                                i += 1
-                        elif nxt in ('"', '/'):
-                            # \" \/ — always valid JSON escapes
-                            out.append(s[i:i+2])
-                            i += 2
-                        elif nxt in ('t', 'b', 'f', 'n', 'r'):
-                            # Could be valid JSON escape (\t \b \f \n \r) OR
-                            # LaTeX command (\text \beta \frac \nu \rho)
-                            # If followed by another letter → LaTeX → double-escape
-                            if i + 2 < n and s[i + 2].isalpha():
-                                out.append('\\\\')
-                                i += 1
-                            else:
-                                out.append(s[i:i+2])
-                                i += 2
-                        else:
-                            # Any other \X — not valid JSON, double-escape
-                            out.append('\\\\')
-                            i += 1
-                    else:
-                        out.append(ch)
-                        i += 1
-                return ''.join(out)
-
             try:
                 questions = json.loads(cleaned, strict=False)
             except json.JSONDecodeError:
-                cleaned = _fix_json_escapes(cleaned)
+                cleaned = AIService._fix_json_escapes(cleaned)
                 questions = json.loads(cleaned, strict=False)
             if not isinstance(questions, list):
                 raise ValueError(f"Expected JSON array, got {type(questions).__name__}")
