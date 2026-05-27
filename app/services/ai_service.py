@@ -822,7 +822,11 @@ class AIService:
             "'I don't have information after', etc.). Present information confidently without disclaimers "
             "about when you were trained. If you are unsure about something, say so without referencing dates.\n"
             "2. Math: use $...$ for inline math and $$...$$ for display/block math. "
-            "Never use \\(...\\) or \\[...\\] notation.\n"
+            "Never use \\(...\\) or \\[...\\] notation. "
+            "CRITICAL — NEVER wrap a sentence or example that contains math in backtick code spans. "
+            "BAD: `If $f(x) = x^3$, then $f'(x) = 3x^2$.` "
+            "GOOD: If $f(x) = x^3$, then $f'(x) = 3x^2$. "
+            "Backticks are ONLY for computer code, terminal commands, or variable names — never for math examples.\n"
             "3. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
             "4. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
             "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax.\n"
@@ -956,6 +960,16 @@ class AIService:
     async def _stream_gemini(self, full_prompt: str) -> AsyncIterator[str]:
         """Stream from Gemini using the native async client (zero thread overhead).
 
+        Two optimisations vs. vanilla Gemini streaming:
+        1. thinking_budget=0 — disables gemini-2.5-flash's extended reasoning mode.
+           Without this the model silently "thinks" for 3-7 s before the first token
+           appears, giving GPT-4o-mini a huge perceived-speed advantage.
+        2. Chunk sub-division — Gemini natively returns 50-200 char blobs while
+           OpenAI streams ~10-30 chars. We split each blob into ≤15-char word-boundary
+           pieces and yield control (asyncio.sleep(0)) between them so uvicorn flushes
+           each SSE event before the next arrives, giving the user a smooth
+           per-word typewriter effect instead of whole-paragraph jumps.
+
         Retries the initial connection up to 2 times on 503/429 before raising
         so the caller can fall through to the next provider.
         """
@@ -967,18 +981,45 @@ class AIService:
         backup = settings.AI_GEMINI_BACKUP_MODEL
         models_to_try = [primary] + ([backup] if backup and backup != primary else [])
 
+        # Build a config that disables extended thinking (reduces TTFT from ~7s → ~1s).
+        # Gracefully skip if the SDK version doesn't expose ThinkingConfig yet.
+        _stream_config = None
+        try:
+            from google.genai import types as _gt
+            _stream_config = _gt.GenerateContentConfig(
+                thinking_config=_gt.ThinkingConfig(thinking_budget=0)
+            )
+        except Exception:
+            pass  # older SDK or model doesn't support it — fall through with no config
+
         last_exc: Exception | None = None
         for model_name in models_to_try:
             for attempt in range(2):
                 try:
-                    async for chunk in client.aio.models.generate_content_stream(
+                    # generate_content_stream is an async def (coroutine) that returns
+                    # an AsyncIterator — it MUST be awaited before iterating.
+                    stream = await client.aio.models.generate_content_stream(
                         model=model_name,
                         contents=full_prompt,
-                    ):
+                        config=_stream_config,
+                    )
+                    async for chunk in stream:
                         try:
                             text = chunk.text
-                            if text:
-                                yield text
+                            if not text:
+                                continue
+                            # Sub-divide large chunks into ≤15-char word-boundary pieces
+                            # so SSE events look like per-token output (smooth typewriter).
+                            # asyncio.sleep(0) hands control back to the event loop so
+                            # uvicorn can flush each piece as a separate HTTP chunk.
+                            words = text.split(' ')
+                            buf = ''
+                            for j, word in enumerate(words):
+                                buf += ('' if j == 0 else ' ') + word
+                                if len(buf) >= 15 or j == len(words) - 1:
+                                    yield buf
+                                    buf = ''
+                                    await asyncio.sleep(0)
                         except (ValueError, AttributeError):
                             continue
                     return  # stream completed successfully
@@ -1243,7 +1284,11 @@ class AIService:
             "'I don't have information after', etc.). Present information confidently without disclaimers "
             "about when you were trained. If you are unsure about something, say so without referencing dates.\n"
             "2. Math: use $...$ for inline math and $$...$$ for display/block math. "
-            "Never use \\(...\\) or \\[...\\] notation.\n"
+            "Never use \\(...\\) or \\[...\\] notation. "
+            "CRITICAL — NEVER wrap a sentence or example that contains math in backtick code spans. "
+            "BAD: `If $f(x) = x^3$, then $f'(x) = 3x^2$.` "
+            "GOOD: If $f(x) = x^3$, then $f'(x) = 3x^2$. "
+            "Backticks are ONLY for computer code, terminal commands, or variable names — never for math examples.\n"
             "3. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
             "4. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
             "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax.\n"
@@ -5040,15 +5085,17 @@ Return ONLY this JSON structure:
                          f'x2="{cx+CW-12}" y2="{cy+ICON_H+4}" '
                          f'stroke="{acc}" stroke-width="1" stroke-opacity="0.35"/>')
 
-                # Facts
+                # Facts — render with line-wrapping to match the card_height calculation
                 fy = cy + ICON_H + 14
                 for fact in facts:
-                    fact_text = esc(str(fact)[:85])
-                    o.append(f'<circle cx="{cx+22}" cy="{fy+5}" r="3.5" fill="{acc}" fill-opacity="0.9"/>')
-                    o.append(f'<text x="{cx+34}" y="{fy+11}" '
-                             f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
-                             f'fill="#e2e8f0">{fact_text}</text>')
-                    fy += FACT_H
+                    fact_lines = wrap(str(fact), 44)
+                    # Bullet dot aligned to first line
+                    o.append(f'<circle cx="{cx+22}" cy="{fy+8}" r="3.5" fill="{acc}" fill-opacity="0.9"/>')
+                    for li, line in enumerate(fact_lines):
+                        o.append(f'<text x="{cx+34}" y="{fy + 8 + li*14}" '
+                                 f'font-family="Arial,Helvetica,sans-serif" font-size="12" '
+                                 f'dominant-baseline="central" fill="#e2e8f0">{esc(line)}</text>')
+                    fy += max(len(fact_lines), 1) * FACT_H
 
                 # Highlight / stat badge
                 if highlight:
@@ -5156,32 +5203,19 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
         explanation = ai_response[:3000]
 
         image_prompt = (
-            "⚠️ STRICTLY FORBIDDEN: Do NOT draw a 2×2 grid, 3×2 grid, or any layout where sections are "
-            "equal-sized boxes arranged in rows and columns. This is the single most important rule. "
-            "Violating it makes the output unusable. ⚠️\n\n"
-            f"Create a beautiful, colorful educational infographic poster about: {topic}\n\n"
-            f"Grade Level: {grade_str}\n"
-            f"Language: {language}\n\n"
-            f"Key information to include in the infographic:\n{explanation}\n\n"
-            "LAYOUT — think like a newspaper front page or a National Geographic spread:\n"
-            "- One large full-width title banner at the very top\n"
-            "- Below that: sections of DIFFERENT widths and heights — some wide, some narrow, some tall\n"
-            "- At least one section should span the full width; others should sit side by side at different heights\n"
-            "- Sections bleed into each other with connecting arrows and flow lines\n"
-            "- End with a bold full-width key-takeaway ribbon at the bottom\n\n"
+            f"Create a beautiful, detailed educational infographic image for {grade_str} students.\n\n"
+            f"Topic / Question: {topic}\n\n"
+            f"Key information to visualise:\n{explanation}\n\n"
             "Design requirements:\n"
-            "- Vibrant colors, icons, and clear visual hierarchy\n"
-            "- Draw actual mini-diagrams or illustrations inside sections (e.g. planets, forces, timelines) "
-            "— not just bullet points\n"
-            "- Key facts, statistics, and dates as bold visual callout badges\n"
-            "- Dark or rich colored background with contrasting text; no large empty spaces\n"
-            "- Professional infographic style suitable for students\n\n"
-            "ACCURACY & SPELLING (CRITICAL):\n"
-            "- Every word, name, term, date, and formula MUST be spelled correctly.\n"
-            "- Copy scientific terms, proper nouns, and formulas EXACTLY from the key information above.\n"
-            "- Double-check ALL text before rendering — any spelling mistake will make the infographic unusable.\n"
-            "- Use proper capitalisation for headings and proper nouns.\n"
-            "- If including numbers or statistics, verify they match the source information exactly."
+            "- Bold, clearly readable title banner at the top\n"
+            "- Vibrant, contrasting colours with a dark background\n"
+            "- Organise information into clear labelled sections or panels of varying sizes\n"
+            "- Include relevant icons, diagrams, arrows or visual callouts\n"
+            "- Highlight key facts, numbers, dates and formulas as visual elements\n"
+            "- Draw mini-diagrams or illustrations where relevant (e.g. planets, forces, timelines)\n"
+            "- Professional infographic poster style — NOT a mindmap\n"
+            "- All text must be spelled exactly correctly\n"
+            f"- Language: {language}"
         )
 
         # Use the shared async client (avoids per-call TCP handshake overhead)

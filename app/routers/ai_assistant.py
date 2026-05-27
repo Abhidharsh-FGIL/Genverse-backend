@@ -802,17 +802,12 @@ async def send_message_stream(
             yield f"data: {encoded}\n\n"
         else:
             try:
-                _buf = ""
+                # Gemini chunks are already sub-divided to ≤15 chars in _stream_gemini,
+                # so send each token straight through — no buffering needed.
+                # The newline escape keeps SSE framing intact.
                 async for chunk in ai.stream_chat(messages=messages, context=payload.context, chat_settings=chat_settings or None, has_files=has_files):
                     full_response += chunk
-                    _buf += chunk
-                    # Flush when buffer reaches a natural break or minimum size:
-                    # newline = markdown boundary; 30 chars = ~4-5 words visible fast
-                    if "\n" in _buf or len(_buf) >= 30:
-                        yield f"data: {_buf.replace(chr(10), chr(92) + 'n')}\n\n"
-                        _buf = ""
-                if _buf:
-                    yield f"data: {_buf.replace(chr(10), chr(92) + 'n')}\n\n"
+                    yield f"data: {chunk.replace(chr(10), chr(92) + 'n')}\n\n"
             except Exception as e:
                 import traceback
                 print(f"[StreamChat] Streaming error: {e}", flush=True)
