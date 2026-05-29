@@ -42,6 +42,7 @@ async def generate_mindmap(payload: MindMapGenerateRequest, current_user: Curren
         grade=payload.grade,
         board=payload.board,
         depth=payload.depth,
+        language=payload.language or current_user.language or "en",
     )
 
     mindmap = MindMap(

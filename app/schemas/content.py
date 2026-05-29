@@ -176,6 +176,7 @@ class MindMapGenerateRequest(BaseModel):
     board: Optional[str] = None
     depth: int = 3
     org_id: Optional[str] = None
+    language: str = "en"
 
 
 class MindMapResponse(BaseModel):

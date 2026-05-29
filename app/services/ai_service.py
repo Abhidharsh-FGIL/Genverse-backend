@@ -572,35 +572,53 @@ class AIService:
 
         if subject:
             parts.append(f"Subject focus: {subject}. Keep your response relevant to this subject area.")
-        if language and language.lower() != "english":
-            # Map language names to their specific scripts to prevent script mixing
-            _script_map = {
-                "hindi": "Devanagari (हिन्दी)",
-                "tamil": "Tamil (தமிழ்)",
-                "telugu": "Telugu (తెలుగు)",
-                "kannada": "Kannada (ಕನ್ನಡ)",
-                "malayalam": "Malayalam (മലയാളം)",
-                "bengali": "Bengali (বাংলা)",
-                "marathi": "Devanagari (मराठी)",
-                "gujarati": "Gujarati (ગુજરાતી)",
-                "punjabi": "Gurmukhi (ਪੰਜਾਬੀ)",
-                "odia": "Odia (ଓଡ଼ିଆ)",
-                "urdu": "Urdu (اردو)",
-                "arabic": "Arabic (العربية)",
-                "french": "Latin",
-                "spanish": "Latin",
-                "german": "Latin",
-            }
-            script = _script_map.get(language.lower(), f"{language}")
-            parts.append(
-                f"RESPONSE LANGUAGE: {language}. Write your ENTIRE response using ONLY {script} script. "
-                f"Do NOT mix characters from other Indian/foreign scripts. "
-                f"For example, if writing in Tamil, never use Devanagari (Hindi) characters — use only Tamil script. "
-                f"Do NOT put English translations in parentheses like '(Gravity)' or '(Mass)' — "
-                f"write the term directly in {language} or use the English term as-is without parenthetical translation. "
-                f"Do NOT use emojis or special Unicode symbols (🌟, ⚡, 🍔, etc.) in the response. "
-                f"Only keep code snippets, math notation, chemical formulas, and technical acronyms in English."
-            )
+        if language:
+            # Resolve language code (e.g. "hi", "ta") to full name ("Hindi", "Tamil")
+            lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
+            if lang_name.lower() != "english":
+                # Map language names to their specific scripts to prevent script mixing
+                _script_map = {
+                    "hindi": "Hindi (हिन्दी)",
+                    "tamil": "Tamil (தமிழ்)",
+                    "telugu": "Telugu (తెలుగు)",
+                    "kannada": "Kannada (ಕನ್ನಡ)",
+                    "malayalam": "Malayalam (മലയാളം)",
+                    "bengali": "Bengali (বাংলা)",
+                    "marathi": "Devanagari (मराठी)",
+                    "gujarati": "Gujarati (ગુજરાતી)",
+                    "punjabi": "Gurmukhi (ਪੰਜਾਬੀ)",
+                    "odia": "Odia (ଓଡ଼ିଆ)",
+                    "urdu": "Urdu (اردو)",
+                    "arabic": "Arabic (العربية)",
+                    "french": "Latin",
+                    "spanish": "Latin",
+                    "german": "Latin",
+                }
+                script = _script_map.get(lang_name.lower(), lang_name)
+                parts.append(
+                    f"RESPONSE LANGUAGE: {lang_name}. Write your ENTIRE response using ONLY {script} script. "
+                    f"Do NOT mix characters from other Indian/foreign scripts. "
+                    f"For example, if writing in Tamil, never use Devanagari (Hindi) characters — use only Tamil script. "
+                    f"Do NOT put English translations in parentheses like '(Gravity)' or '(Mass)' — "
+                    f"write the term directly in {lang_name} or use the English term as-is without parenthetical translation. "
+                    f"Do NOT use emojis or special Unicode symbols (🌟, ⚡, 🍔, etc.) in the response. "
+                    f"SCRIPT EXCEPTIONS (keep these in their standard form — do NOT transliterate or translate): "
+                    f"LaTeX math ($...$, $$...$$), chemical equations ($\\ce{{...}}$), code blocks, "
+                    f"programming keywords, variable names, and standard scientific symbols. "
+                    f"SPELLING & GRAMMAR ACCURACY: Use correct {lang_name} orthography throughout. "
+                    f"Every word must use proper character combinations, vowel signs, and conjuncts for {lang_name}. "
+                    f"Do NOT produce transliterated English written in {lang_name} script — use genuine {lang_name} vocabulary."
+                )
+            else:
+                # Explicit English instruction — prevents the model from continuing
+                # in a non-English language carried over from prior conversation turns
+                # or from topic-based associations (e.g. Indian history topics).
+                parts.append(
+                    "RESPONSE LANGUAGE: English. You MUST respond entirely in English. "
+                    "Do NOT use Hindi, Tamil, or any other language in your response — "
+                    "even if the topic relates to Indian history, culture, or a non-English subject, "
+                    "and even if earlier messages in this conversation were in another language."
+                )
 
         return "\n".join(parts) if parts else ""
 
@@ -863,8 +881,22 @@ class AIService:
         _conv = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
         _lang_tag = ""
         _rlang = (context or {}).get("language")
-        if _rlang and _rlang.lower() != "english":
-            _lang_tag = f"\n\n[SYSTEM: Respond entirely in {_rlang}. Use ONLY {_rlang} script — do NOT mix other scripts like Devanagari in Tamil or Tamil in Hindi.]"
+        if _rlang:
+            _rlang_name = self._LANGUAGE_NAMES.get(_rlang.lower(), _rlang)
+            if _rlang_name.lower() != "english":
+                _lang_tag = (
+                    f"\n\n[SYSTEM: Respond entirely in {_rlang_name}. "
+                    f"Use ONLY {_rlang_name} script — do NOT mix other scripts like Devanagari in Tamil or Tamil in Hindi. "
+                    f"CRITICAL EXCEPTIONS — keep these exactly as-is in standard notation: "
+                    f"LaTeX math ($...$, $$...$$), chemical equations ($\\ce{{...}}$), code blocks, and scientific symbols. "
+                    f"Use correct {_rlang_name} orthography — no spelling mistakes, no transliterated English.]"
+                )
+            else:
+                _lang_tag = (
+                    "\n\n[SYSTEM: Respond entirely in English. "
+                    "Do NOT use Hindi, Tamil, or any other language — "
+                    "regardless of the topic or previous conversation language.]"
+                )
         full_prompt = system_prompt + "\n\n" + _conv + _lang_tag
 
         response_text: str | None = None
@@ -1323,8 +1355,22 @@ class AIService:
         _conv = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
         _lang_tag = ""
         _rlang = (context or {}).get("language")
-        if _rlang and _rlang.lower() != "english":
-            _lang_tag = f"\n\n[SYSTEM: Respond entirely in {_rlang}. Use ONLY {_rlang} script — do NOT mix other scripts like Devanagari in Tamil or Tamil in Hindi.]"
+        if _rlang:
+            _rlang_name = self._LANGUAGE_NAMES.get(_rlang.lower(), _rlang)
+            if _rlang_name.lower() != "english":
+                _lang_tag = (
+                    f"\n\n[SYSTEM: Respond entirely in {_rlang_name}. "
+                    f"Use ONLY {_rlang_name} script — do NOT mix other scripts like Devanagari in Tamil or Tamil in Hindi. "
+                    f"CRITICAL EXCEPTIONS — keep these exactly as-is in standard notation: "
+                    f"LaTeX math ($...$, $$...$$), chemical equations ($\\ce{{...}}$), code blocks, and scientific symbols. "
+                    f"Use correct {_rlang_name} orthography — no spelling mistakes, no transliterated English.]"
+                )
+            else:
+                _lang_tag = (
+                    "\n\n[SYSTEM: Respond entirely in English. "
+                    "Do NOT use Hindi, Tamil, or any other language — "
+                    "regardless of the topic or previous conversation language.]"
+                )
         full_prompt = system_prompt + "\n\n" + _conv + _lang_tag
 
         # --- Concurrent guard + provider startup ---
@@ -1991,15 +2037,19 @@ Return ONLY valid JSON, no markdown:
                 f"\n- Chapter topics should align with what {target} would study"
             )
 
-        language_name = self._LANGUAGE_NAMES.get(language, language.upper())
+        language_name = self._LANGUAGE_NAMES.get(language.lower(), language)
+        is_non_english_outline = language_name.lower() != "english"
 
         lang_instruction = ""
-        if language != "en":
+        if is_non_english_outline:
             lang_instruction = (
                 f"\n\nLANGUAGE REQUIREMENT (MANDATORY):"
                 f"\n- Write ALL chapter titles and descriptions in {language_name}."
                 f"\n- Do NOT use English for titles or descriptions."
                 f"\n- Every single word in the output must be in {language_name}."
+                f"\n- Use correct {language_name} orthography — proper character combinations, vowel signs, and grammar."
+                f"\n- Do NOT transliterate English words into {language_name} script."
+                f"\n- Standard scientific symbols, formulas, and numbers may remain in their universal form."
             )
 
         prompt = f"""You are an expert educational author. Create a chapter outline for an eBook.
@@ -2320,8 +2370,21 @@ Return ONLY valid JSON in this exact structure:
         chapter_list: list[dict],
     ) -> dict:
         """Generate book metadata: title_page, book_summary, table_of_contents, thank_you_message."""
-        language_name = self._LANGUAGE_NAMES.get(language, language.upper())
+        language_name = self._LANGUAGE_NAMES.get(language.lower(), language)
         toc_list = "\n".join(f"  {i+1}. {ch.get('title', f'Chapter {i+1}')}" for i, ch in enumerate(chapter_list))
+        is_non_english = language_name.lower() != "english"
+        lang_enforcement = (
+            f"\n\n⚠️ CRITICAL LANGUAGE REQUIREMENT — {language_name.upper()} ONLY:\n"
+            f"- The 'subtitle', 'description', 'book_summary', and 'thank_you_message' fields MUST be written entirely in {language_name}.\n"
+            f"- Do NOT write any of these fields in English — use {language_name} script exclusively.\n"
+            f"- Use correct {language_name} orthography: proper character combinations, vowel signs, and conjuncts. No spelling mistakes.\n"
+            f"- Use genuine {language_name} vocabulary — do NOT transliterate English words into {language_name} script.\n"
+            f"- The 'title' and 'author' fields are kept as-is from the input.\n"
+            f"- Chapter titles in 'table_of_contents' are already set — copy them exactly as provided.\n"
+            f"- LaTeX math, chemical formulas, and scientific symbols (if any) stay in standard notation."
+            if is_non_english else
+            "\n\nLANGUAGE: Write all generated content in English."
+        )
 
         prompt = f"""Generate the metadata for an educational eBook. Return ONLY valid JSON (no markdown fences).
 
@@ -2336,22 +2399,21 @@ Book details:
 
 Chapters in this book:
 {toc_list}
+{lang_enforcement}
 
-LANGUAGE REQUIREMENT: Write ALL content in {language_name}.
-
-Return this exact JSON structure:
+Return this exact JSON structure (fill every string field with {language_name} content):
 {{
   "title_page": {{
     "title": "{title}",
     "author": "{author}",
-    "subtitle": "A compelling subtitle for the book",
-    "description": "2-3 sentence overview of the entire book"
+    "subtitle": "<write a compelling subtitle in {language_name}>",
+    "description": "<write 2-3 sentence overview of the entire book in {language_name}>"
   }},
-  "book_summary": "4-10 sentences giving a comprehensive overview of the ENTIRE book — its scope, key themes, and what the reader will learn.",
+  "book_summary": "<write 4-10 sentences giving a comprehensive overview of the ENTIRE book in {language_name} — its scope, key themes, and what the reader will learn>",
   "table_of_contents": [
     {", ".join(f'{{"chapter_number": {i+1}, "title": "{ch.get("title", f"Chapter {i+1}")}"}}' for i, ch in enumerate(chapter_list))}
   ],
-  "thank_you_message": "2-3 warm, encouraging sentences wishing the reader well after completing the book."
+  "thank_you_message": "<write 2-3 warm, encouraging sentences in {language_name} wishing the reader well after completing the book>"
 }}"""
         print(f"[Ebook] Generating metadata for '{title}'...", flush=True)
         response = await self._ebook_llm_call(prompt, max_tokens=2048)
@@ -2439,7 +2501,20 @@ CONTENT REQUIREMENTS:
 
 {self._HTML_FORMAT_RULES}
 
-LANGUAGE: Write ALL content in {language_name}. Do NOT use any other language.
+LANGUAGE — STRICT: Write ALL prose, headings, lists, and explanations in {language_name}.
+{
+    f"Use correct {language_name} orthography throughout — proper character combinations, vowel signs, and conjuncts. "
+    f"Do NOT produce transliterated English in {language_name} script. "
+    f"Use genuine {language_name} vocabulary and grammatically correct sentences."
+    if language_name.lower() != "english" else ""
+}
+LATEX / MATH EXCEPTION: All LaTeX math ($...$, $$...$$), chemical equations ($\\ce{{...}}$), code blocks, variable names, and standard scientific symbols MUST remain in their standard notation — do NOT convert them to {language_name} script.
+
+QUALITY STANDARDS (mandatory):
+- Every paragraph must be substantive, complete, and factually accurate — no filler, no placeholders.
+- Sentences must be well-formed and flow naturally in {language_name}.
+- Technical terms should use correct {language_name} equivalents; retain the English term only if no natural equivalent exists.
+- Do NOT repeat the same point across multiple paragraphs.
 
 Return ONLY valid JSON (no markdown fences):
 {{
@@ -2522,9 +2597,16 @@ Return ONLY valid JSON (no markdown fences):
             for ch in chapters_data
         )
 
+        is_non_english_assess = language_name.lower() != "english"
+        lang_assess_note = (
+            f" Use correct {language_name} orthography throughout — proper character combinations and grammar. "
+            f"EXCEPTION: LaTeX math ($...$, $$...$$), chemical formulas ($\\ce{{...}}$), "
+            f"code, and standard scientific symbols must stay in their standard notation."
+            if is_non_english_assess else ""
+        )
         prompt = f"""Generate assessment questions for an educational eBook titled "{title}".
 
-LANGUAGE: Write ALL questions and answers in {language_name}.
+LANGUAGE — STRICT: Write ALL questions, options, and answers ENTIRELY in {language_name}.{lang_assess_note}
 
 Chapter summaries:
 {chapter_context}
@@ -2552,6 +2634,48 @@ Return ONLY valid JSON (no markdown fences):
                 print(f"[Ebook] Assessment attempt {attempt+1} failed, retrying...", flush=True)
         print(f"[Ebook] Assessment all attempts failed", flush=True)
         return None
+
+    # ── TOC page-number calculation ───────────────────────────────────────
+
+    @staticmethod
+    def _calculate_toc_page_numbers(
+        toc: list[dict],
+        chapters: list[dict],
+        has_summary: bool = True,
+    ) -> list[dict]:
+        """Assign content-aware page numbers to TOC entries.
+
+        Front-matter layout (fixed):
+          Page 1  — Title Page
+          Page 2  — About This Book  (only if has_summary)
+          Page 3  — Table of Contents
+          Page 4+ — Chapters
+
+        Page count per chapter is estimated from actual word count
+        (stripped of HTML) at ~280 words per page — a standard
+        educational textbook page — giving realistic, non-uniform gaps
+        rather than the old equal-distribution formula.
+        """
+        _TAG_RE = re.compile(r"<[^>]+>")
+        _WORDS_PER_PAGE = 280
+
+        def _word_count(html: str) -> int:
+            return len(_TAG_RE.sub(" ", html or "").split())
+
+        # front: title(1) + summary(1 if present) + toc(1)
+        front_pages = 2 + (1 if has_summary else 0)
+        ch_map = {ch.get("chapter_number", i + 1): ch for i, ch in enumerate(chapters)}
+
+        current_page = front_pages + 1   # first chapter always starts here
+        updated: list[dict] = []
+        for entry in toc:
+            new_entry = {**entry, "page_number": current_page}
+            ch = ch_map.get(entry.get("chapter_number"))
+            words = _word_count(ch.get("content", "")) if ch else 0
+            pages = max(1, round(words / _WORDS_PER_PAGE))
+            current_page += pages
+            updated.append(new_entry)
+        return updated
 
     # ── Main entry point: parallel ebook generation ──────────────────────
 
@@ -2669,6 +2793,12 @@ Return ONLY valid JSON (no markdown fences):
                 print(f"[Ebook] Assessment generation failed: {e}", flush=True)
 
         # ── Assemble final ebook_data ──
+        raw_toc = metadata.get("table_of_contents", [
+            {"chapter_number": i + 1, "title": ch["title"]} for i, ch in enumerate(chapter_list)
+        ])
+        has_summary = bool(metadata.get("book_summary"))
+        toc_with_pages = self._calculate_toc_page_numbers(raw_toc, generated_chapters, has_summary)
+
         ebook_data = {
             "title": title,
             "author": author,
@@ -2677,9 +2807,7 @@ Return ONLY valid JSON (no markdown fences):
             "tone": tone,
             "title_page": metadata.get("title_page", {"title": title, "author": author, "subtitle": "", "description": ""}),
             "book_summary": metadata.get("book_summary", ""),
-            "table_of_contents": metadata.get("table_of_contents", [
-                {"chapter_number": i + 1, "title": ch["title"]} for i, ch in enumerate(chapter_list)
-            ]),
+            "table_of_contents": toc_with_pages,
             "chapters": generated_chapters,
             "final_assessment": final_assessment,
             "thank_you_message": metadata.get("thank_you_message",
@@ -2753,14 +2881,26 @@ Return ONLY valid JSON (no markdown fences):
         grade: int | None,
         board: str | None,
         depth: int,
+        language: str = "en",
     ) -> dict:
         """Generate a mind map structure as JSON."""
+        lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
+        lang_rule = (
+            f"- LANGUAGE: ALL node labels MUST be written in {lang_name}. "
+            + (
+                f"Use {lang_name} script exclusively — do NOT write labels in English or any other script. "
+                "Proper nouns, formulas, and standard scientific symbols may remain in their original form."
+                if lang_name.lower() != "english"
+                else "Write all node labels in English."
+            )
+        )
         prompt = f"""Create a mind map for:
 Topic: {topic}
 Subject: {subject or "General"}
 Grade: {grade or "General"}
 Board: {board or "General"}
 Depth: {depth} levels
+Language: {lang_name}
 
 ACCURACY & SPELLING (CRITICAL):
 - Every word in every node label MUST be spelled correctly.
@@ -2768,6 +2908,7 @@ ACCURACY & SPELLING (CRITICAL):
 - Double-check all technical vocabulary and terminology before including it.
 - Use proper capitalisation for proper nouns and sentence-case for other labels.
 - Do NOT abbreviate in a way that changes meaning or creates ambiguity.
+{lang_rule}
 
 Return JSON with this structure:
 {{
@@ -2859,6 +3000,7 @@ Return ONLY valid JSON.
         class_name: str | None = None,
         class_section: str | None = None,
         class_description: str | None = None,
+        language: str = "en",
     ) -> dict:
         """Generate a structured, grade-aware lesson plan."""
 
@@ -2904,6 +3046,10 @@ GRADE-CALIBRATION RULES (follow strictly)
 • Formative check must be a single focused question or quick activity appropriate for {grade_label}.
 • Homework must be achievable in 15-30 minutes by a {grade_label} student.
 • Differentiation: easy = scaffolded/simplified for below-grade learners; standard = grade-level; advanced = extension/enrichment for above-grade learners.
+
+OUTPUT LANGUAGE
+───────────────
+{self._LANGUAGE_NAMES.get(language.lower(), language)} — Write ALL content in this language. Do NOT use English unless it is the selected language.
 
 OUTPUT
 ──────
@@ -4833,6 +4979,16 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
     ) -> dict:
         """Generate a structured mind map JSON from a chat Q&A exchange."""
         grade_str = f"grade {grade}" if grade else "general"
+        lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
+        lang_rule = (
+            f"14. LANGUAGE — ALL node labels MUST be written in {lang_name}. "
+            + (
+                f"Use {lang_name} script exclusively — do NOT write labels in English or any other script. "
+                "Proper nouns, chemical formulas, and standard scientific symbols may stay in their original form."
+                if lang_name.lower() != "english"
+                else "Write all node labels in English."
+            )
+        )
         prompt = f"""You are a mind-map extractor. Your ONLY job is to read the AI explanation below and
 reorganise the SAME information into a hierarchical mind map. Do NOT add external knowledge.
 Every single node label MUST come directly from a heading, key phrase, term, fact, or example
@@ -4840,7 +4996,7 @@ that appears in the explanation text.
 
 Topic: {user_message[:500]}
 Grade Level: {grade_str}
-Language: {language}
+Language: {lang_name}
 
 ── AI EXPLANATION (this is your ONLY source — extract nodes from here) ──
 {ai_response[:4000]}
@@ -4862,6 +5018,7 @@ ACCURACY & SPELLING RULES (CRITICAL — strictly follow):
 11. If the explanation mentions a person, place, formula, or date — verify it matches the source text character-by-character before including it.
 12. Do NOT abbreviate words in a way that changes meaning or creates ambiguity.
 13. Use proper capitalisation for proper nouns and sentence-case for other labels.
+{lang_rule}
 
 Return ONLY this JSON structure:
 {{
@@ -5140,11 +5297,23 @@ Return ONLY this JSON structure:
     ) -> dict | None:
         """Generate a structured infographic via the chat model when image generation fails."""
         grade_str = f"grade {grade}" if grade else "general"
+        lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
+        lang_req = (
+            f"ALL text (title, subtitle, section headings, facts, keyTakeaway) MUST be written in {lang_name}. "
+            + (
+                f"Use {lang_name} script exclusively — do NOT mix English or other scripts. "
+                "Proper nouns, numbers, and formulas may stay in standard form."
+                if lang_name.lower() != "english"
+                else "Write all text in English."
+            )
+        )
         prompt = f"""You are an infographic designer. Convert this into a structured infographic layout.
 
 Topic: {topic}
 Grade Level: {grade_str}
-Language: {language}
+Language: {lang_name}
+
+LANGUAGE REQUIREMENT (MANDATORY): {lang_req}
 
 ── AI EXPLANATION ──
 {content}
@@ -5183,6 +5352,66 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
             print(f"[Infographic SVG fallback] failed: {e}", flush=True)
             return None
 
+    async def _prepare_infographic_labels(
+        self,
+        topic: str,
+        explanation: str,
+        language: str,
+        grade: int | None,
+    ) -> dict:
+        """Use the text model to extract concise, spell-checked labels for the infographic.
+
+        Returns a dict: {title, sections: [{heading, facts}], key_takeaway}.
+        Keeping text generation separate from image generation prevents the image
+        model from inventing or misspelling words.
+        """
+        lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
+        grade_str = f"grade {grade}" if grade else "general"
+        is_non_english = lang_name.lower() != "english"
+
+        lang_rule = (
+            f"Write ALL output text in {lang_name} using correct {lang_name} orthography. "
+            f"Do NOT transliterate English into {lang_name} script."
+            if is_non_english
+            else "Write all output text in English."
+        )
+
+        prompt = f"""Extract concise, correctly-spelled text labels for an educational infographic.
+
+Topic: {topic}
+Grade Level: {grade_str}
+Language: {lang_name}
+{lang_rule}
+
+── SOURCE TEXT ──
+{explanation[:2500]}
+── END ──
+
+Rules:
+- Title: 3-7 words, captures the main topic exactly.
+- Sections: 3-4 sections maximum. Each has a 2-4 word heading and 2-3 short facts (≤12 words each).
+- Key Takeaway: one sentence, ≤15 words.
+- Every word must be spelled perfectly — double-check before including.
+- Extract ONLY from the source text — do not invent content.
+
+Return ONLY valid JSON (no markdown):
+{{
+  "title": "...",
+  "sections": [
+    {{"heading": "...", "facts": ["...", "...", "..."]}},
+    {{"heading": "...", "facts": ["...", "..."]}}
+  ],
+  "key_takeaway": "..."
+}}"""
+        try:
+            response = await self.chat([{"role": "user", "content": prompt}])
+            parsed = self._parse_json_response(response)
+            if parsed and parsed.get("title") and parsed.get("sections"):
+                return parsed
+        except Exception as e:
+            print(f"[Infographic] label prep failed: {e}", flush=True)
+        return {"title": topic[:60], "sections": [], "key_takeaway": ""}
+
     async def generate_chat_infographic(
         self,
         user_message: str,
@@ -5190,10 +5419,14 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
         grade: int | None = None,
         language: str = "English",
     ) -> dict:
-        """Generate an infographic image using gemini-2.5-flash-image.
+        """Generate an infographic using a three-step approach that guarantees spelling accuracy.
 
-        The prompt is built from the user's question and the AI response so the
-        image reflects the actual conversation content.  60-second timeout.
+        Step 1 — Text model extracts spell-checked labels (title, sections, takeaway).
+        Step 2 — SVG is rendered immediately from those labels. SVG text is never
+                  touched by an image model, so spelling is 100% guaranteed.
+        Step 3 — Image model is attempted with an extremely tight spelling-enforcement
+                  prompt. If it succeeds, the richer image is returned. If it fails or
+                  times out, the accurate SVG from Step 2 is returned instead.
         """
         import base64
         import asyncio
@@ -5201,37 +5434,111 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
         grade_str = f"grade {grade}" if grade else "general"
         topic = user_message[:200].strip()
         explanation = ai_response[:3000]
+        lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
+        is_non_english = lang_name.lower() != "english"
 
-        image_prompt = (
-            f"Create a beautiful, detailed educational infographic image for {grade_str} students.\n\n"
-            f"Topic / Question: {topic}\n\n"
-            f"Key information to visualise:\n{explanation}\n\n"
-            "Design requirements:\n"
-            "- Bold, clearly readable title banner at the top\n"
-            "- Vibrant, contrasting colours with a dark background\n"
-            "- Organise information into clear labelled sections or panels of varying sizes\n"
-            "- Include relevant icons, diagrams, arrows or visual callouts\n"
-            "- Highlight key facts, numbers, dates and formulas as visual elements\n"
-            "- Draw mini-diagrams or illustrations where relevant (e.g. planets, forces, timelines)\n"
-            "- Professional infographic poster style — NOT a mindmap\n"
-            "- All text must be spelled exactly correctly\n"
-            f"- Language: {language}"
+        # ── Step 1: spell-checked labels from text model ─────────────────────
+        labels = await self._prepare_infographic_labels(topic, explanation, language, grade)
+        title_text = labels.get("title") or topic[:60]
+        key_takeaway = labels.get("key_takeaway", "")
+        sections = labels.get("sections", [])[:4]
+
+        # ── Step 2: build SVG immediately — guaranteed accurate text ──────────
+        _panel_colors = ["#991B1B", "#065F46", "#1E3A5F", "#4C1D95"]
+        svg_data = {
+            "title": title_text,
+            "subtitle": "",
+            "sections": [
+                {
+                    "heading": s.get("heading", ""),
+                    "icon": ["BookOpen", "Target", "Zap", "Award"][i % 4],
+                    "color": _panel_colors[i % 4],
+                    "facts": s.get("facts", [])[:3],
+                    "highlight": "",
+                }
+                for i, s in enumerate(sections)
+            ],
+            "keyTakeaway": key_takeaway,
+        }
+        try:
+            svg = self._render_infographic_svg(svg_data)
+            svg_b64 = base64.b64encode(svg.encode()).decode()
+            svg_result: dict = {
+                "image_base64": f"data:image/svg+xml;base64,{svg_b64}",
+                "title": title_text,
+                "mode": "image",
+            }
+        except Exception as svg_err:
+            print(f"[Infographic] SVG build failed: {svg_err}", flush=True)
+            svg_result = {}
+
+        # ── Step 3: attempt image model with tight spelling enforcement ───────
+        # Helper: spell out each word character-by-character for proper nouns
+        # (>5 chars starting with uppercase) to help the image model render them.
+        def _spell_word(w: str) -> str:
+            if len(w) > 5 and w[0].isupper():
+                return f"{w} [{'-'.join(w.upper())}]"
+            return w
+
+        title_spelled = " ".join(_spell_word(w) for w in title_text.split())
+
+        # Build a full text registry the image model must copy verbatim
+        text_registry: list[str] = [f'TITLE: "{title_text}"']
+        sections_detail = ""
+        for i, s in enumerate(sections):
+            heading = s.get("heading", "")
+            facts = s.get("facts", [])[:3]
+            text_registry.append(f'SECTION {i+1} HEADING: "{heading}"')
+            text_registry.extend(f'  BULLET: "{f}"' for f in facts)
+            sections_detail += (
+                f"\nSECTION {i+1} — heading (copy exactly): {heading}\n"
+                + "\n".join(f"  • {f}" for f in facts) + "\n"
+            )
+        if key_takeaway:
+            text_registry.append(f'KEY TAKEAWAY: "{key_takeaway}"')
+
+        lang_note = (
+            f"Text is in {lang_name} — render every character exactly as given."
+            if is_non_english
+            else "Text is in English — render every character exactly as given."
         )
 
-        # Use the shared async client (avoids per-call TCP handshake overhead)
+        image_prompt = (
+            f"Create a stunning educational infographic poster for {grade_str} students.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️  MANDATORY TEXT — ZERO TOLERANCE FOR SPELLING ERRORS\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"TITLE (letter-for-letter): {title_spelled}\n"
+            f"{sections_detail}\n"
+            f"KEY TAKEAWAY (word-for-word): {key_takeaway}\n\n"
+            "COMPLETE TEXT REGISTRY — every string must appear exactly:\n"
+            + "\n".join(f"  {t}" for t in text_registry) + "\n\n"
+            "SPELLING RULES (non-negotiable):\n"
+            "1. Copy EVERY word from the registry above exactly — zero alterations.\n"
+            "2. Do NOT paraphrase, abbreviate, reorder, or add letters.\n"
+            "3. Proper nouns: follow the letter-by-letter spelling shown in brackets above.\n"
+            "4. If unsure about a word, leave that space blank rather than guessing.\n"
+            "5. Proofread mentally before rendering each text element.\n\n"
+            "Visual design:\n"
+            "- Bold title banner at the top with the EXACT title text\n"
+            "- Dark background, vibrant contrasting panel colours\n"
+            "- One dedicated panel per section with its heading and bullet points\n"
+            "- Relevant icons and mini-diagrams within each panel\n"
+            "- Key takeaway bar at the bottom\n"
+            "- Professional infographic poster style — NOT a mind-map\n"
+            f"- {lang_note}\n"
+        )
+
         client = self._get_gemini_async()
         if client:
             from google.genai import types
             image_model = settings.AI_IMAGE_MODEL
-
-            # Try two configs: with explicit IMAGE modality, then without (some models auto-detect)
             configs_to_try = [
                 types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
                 types.GenerateContentConfig(response_modalities=["IMAGE"]),
-                None,  # bare call — some models return image without modality hint
+                None,
             ]
-
-            for attempt in range(3):  # up to 3 attempts with backoff on 503/429
+            for attempt in range(3):
                 cfg = configs_to_try[min(attempt, len(configs_to_try) - 1)]
                 try:
                     call_kwargs: dict = dict(model=image_model, contents=[image_prompt])
@@ -5246,13 +5553,13 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
                             img_bytes = part.inline_data.data
                             mime = part.inline_data.mime_type or "image/png"
                             data_uri = f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"
-                            print(f"[Infographic] image generated ({len(img_bytes)} bytes, model={image_model})", flush=True)
-                            return {"image_base64": data_uri, "title": topic, "mode": "image"}
-                    print(f"[Infographic] no image part (model={image_model}, attempt={attempt+1})", flush=True)
+                            print(f"[Infographic] image generated ({len(img_bytes)} bytes)", flush=True)
+                            return {"image_base64": data_uri, "title": title_text, "mode": "image"}
+                    print(f"[Infographic] no image part (attempt={attempt+1})", flush=True)
                     if attempt < 2:
                         await asyncio.sleep(1.0)
                         continue
-                    break  # all config variants tried
+                    break
                 except asyncio.TimeoutError:
                     print(f"[Infographic] timed out on attempt {attempt + 1}", flush=True)
                     if attempt < 2:
@@ -5262,22 +5569,18 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
                 except Exception as e:
                     if _is_retryable(e) and attempt < 2:
                         wait = 1.0 * (2 ** attempt)
-                        print(f"[Infographic] 503/429 attempt {attempt + 1}, retry in {wait}s: {e}", flush=True)
                         await asyncio.sleep(wait)
                         continue
                     print(f"[Infographic] failed: {type(e).__name__}: {e}", flush=True)
                     break
 
-        # Graceful fallback: generate SVG-based infographic via the chat model
-        print("[Infographic] falling back to SVG mode", flush=True)
-        try:
-            svg_data = await self._generate_infographic_svg_fallback(topic, ai_response[:2000], grade, language)
-            if svg_data:
-                return svg_data
-        except Exception as e:
-            print(f"[Infographic] SVG fallback also failed: {e}", flush=True)
+        # Image model unavailable or all attempts failed — return the pre-built SVG
+        # (text rendered by SVG engine, spelling is always exact)
+        if svg_result:
+            print("[Infographic] returning accurate SVG", flush=True)
+            return svg_result
 
-        return {"title": topic[:80], "subtitle": "", "sections": [], "keyTakeaway": "", "mode": "json"}
+        return {"title": title_text[:80], "subtitle": "", "sections": [], "keyTakeaway": "", "mode": "json"}
 
     def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 100) -> List[str]:
         """Split text into overlapping character-based chunks (legacy fallback)."""

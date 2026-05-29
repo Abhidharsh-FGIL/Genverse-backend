@@ -242,7 +242,8 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
         for i, item in enumerate(toc):
             num  = str(item.get("chapter_number", i + 1))
             ttl  = item.get("title", "")
-            pg   = str(first_pg + i * avg)
+            # Use content-aware page_number stored at generation time; fall back to formula
+            pg   = str(item.get("page_number") or (first_pg + i * avg))
             toc_rows.append([
                 Paragraph(f"<b>{_pdf_text(num)}.</b>\u2002{_pdf_text(ttl)}", S["toc_entry"]),
                 Paragraph("." * 50, S["dots"]),
