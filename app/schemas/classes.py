@@ -227,6 +227,7 @@ class LessonPlanRequest(BaseModel):
     class_id: str
     topic: str
     additional_context: Optional[str] = None
+    language: Optional[str] = None
 
 
 class LessonPlanCreateRequest(BaseModel):

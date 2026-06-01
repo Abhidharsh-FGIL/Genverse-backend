@@ -30,7 +30,7 @@ async def generate_lesson_plan(payload: LessonPlanRequest, current_user: Current
         class_name=class_.name,
         class_section=class_.section,
         class_description=class_.description,
-        language=current_user.language or "en",
+        language=payload.language or current_user.language or "en",
     )
 
     lesson_plan = LessonPlan(

@@ -31,6 +31,8 @@ def _build_genai_config(gemini_gen_config: dict | None):
             kwargs["max_output_tokens"] = gemini_gen_config["max_output_tokens"]
         if gemini_gen_config.get("response_mime_type"):
             kwargs["response_mime_type"] = gemini_gen_config["response_mime_type"]
+        if gemini_gen_config.get("system_instruction"):
+            kwargs["system_instruction"] = gemini_gen_config["system_instruction"]
         return _gt.GenerateContentConfig(**kwargs) if kwargs else None
     except Exception:
         return None
@@ -575,26 +577,9 @@ class AIService:
         if language:
             # Resolve language code (e.g. "hi", "ta") to full name ("Hindi", "Tamil")
             lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
-            if lang_name.lower() != "english":
-                # Map language names to their specific scripts to prevent script mixing
-                _script_map = {
-                    "hindi": "Hindi (हिन्दी)",
-                    "tamil": "Tamil (தமிழ்)",
-                    "telugu": "Telugu (తెలుగు)",
-                    "kannada": "Kannada (ಕನ್ನಡ)",
-                    "malayalam": "Malayalam (മലയാളം)",
-                    "bengali": "Bengali (বাংলা)",
-                    "marathi": "Devanagari (मराठी)",
-                    "gujarati": "Gujarati (ગુજરાતી)",
-                    "punjabi": "Gurmukhi (ਪੰਜਾਬੀ)",
-                    "odia": "Odia (ଓଡ଼ିଆ)",
-                    "urdu": "Urdu (اردو)",
-                    "arabic": "Arabic (العربية)",
-                    "french": "Latin",
-                    "spanish": "Latin",
-                    "german": "Latin",
-                }
-                script = _script_map.get(lang_name.lower(), lang_name)
+            _base_name = lang_name.split("(")[0].strip().lower()
+            if _base_name != "english":
+                script = self._SCRIPT_MAP.get(_base_name, lang_name)
                 parts.append(
                     f"RESPONSE LANGUAGE: {lang_name}. Write your ENTIRE response using ONLY {script} script. "
                     f"Do NOT mix characters from other Indian/foreign scripts. "
@@ -2079,17 +2064,28 @@ Return ONLY valid JSON in this exact structure:
     }}
   ]
 }}"""
-        response = await self.chat([{"role": "user", "content": prompt}])
-        try:
-            cleaned = response.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-            data = json.loads(cleaned)
-            return data.get("chapters", [])
-        except Exception:
-            return []
+        for attempt in range(3):
+            try:
+                response = await self._ebook_llm_call(prompt, max_tokens=2048)
+                parsed = self._parse_json_response(response)
+                if parsed and isinstance(parsed.get("chapters"), list) and len(parsed["chapters"]) > 0:
+                    return parsed["chapters"]
+                print(f"[Outline] attempt {attempt+1}: empty or missing chapters. Raw: {response[:300]}", flush=True)
+            except Exception as e:
+                print(f"[Outline] attempt {attempt+1} error: {type(e).__name__}: {e}", flush=True)
+
+        # All attempts failed — build a safe fallback outline
+        print(f"[Outline] all attempts failed, returning fallback for '{title}'", flush=True)
+        num_chapters = (min_ch + max_ch) // 2
+        fallback = []
+        for i in range(num_chapters):
+            if i == 0:
+                fallback.append({"title": f"Introduction to {title}", "description": f"An overview of {title} and what this book covers."})
+            elif i == num_chapters - 1:
+                fallback.append({"title": "Conclusion and Key Takeaways", "description": "A summary of everything covered in this book."})
+            else:
+                fallback.append({"title": f"Chapter {i + 1}: {title}", "description": f"Core concepts and topics for chapter {i + 1}."})
+        return fallback
 
     async def generate_ebook_images(
         self,
@@ -2296,9 +2292,32 @@ Return ONLY valid JSON in this exact structure:
     }
 
     _LANGUAGE_NAMES = {
-        "en": "English", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
-        "fr": "French", "de": "German", "es": "Spanish", "zh": "Chinese",
-        "ar": "Arabic", "pt": "Portuguese",
+        "en": "English",
+        "hi": "Hindi (हिन्दी)",
+        "ta": "Tamil (தமிழ்)",
+        "te": "Telugu (తెలుగు)",
+        "fr": "French",
+        "de": "German",
+        "es": "Spanish",
+        "zh": "Chinese (中文)",
+        "ar": "Arabic (عربي)",
+        "pt": "Portuguese",
+    }
+
+    # Maps language name → its writing script (used for strong script-enforcement instructions)
+    _SCRIPT_MAP = {
+        "hindi": "Devanagari (हिन्दी)",
+        "tamil": "Tamil (தமிழ்)",
+        "telugu": "Telugu (తెలుగు)",
+        "kannada": "Kannada (ಕನ್ನಡ)",
+        "malayalam": "Malayalam (മലയാളം)",
+        "bengali": "Bengali (বাংলা)",
+        "marathi": "Devanagari (मराठी)",
+        "gujarati": "Gujarati (ગુજરાતી)",
+        "punjabi": "Gurmukhi (ਪੰਜਾਬੀ)",
+        "urdu": "Urdu (اردو)",
+        "arabic": "Arabic (العربية)",
+        "chinese": "Chinese characters (中文)",
     }
 
     _HTML_FORMAT_RULES = (
@@ -2311,10 +2330,34 @@ Return ONLY valid JSON in this exact structure:
         "  - Code blocks: <pre><code class=\"language-python\">code here</code></pre> (use the correct language class).\n"
         "    IMPORTANT: Preserve proper indentation and newlines inside code blocks.\n"
         "  - Inline code: <code>variable_name</code>\n"
-        "  - Math/equations: Use LaTeX notation — inline: $E = mc^2$ , block: $$\\int_0^\\infty e^{-x} dx = 1$$\n"
+        "  - Math/equations: Use LaTeX — inline: $E = mc^2$, block: $$\\\\int_0^\\\\infty e^{-x}\\\\,dx = 1$$\n"
+        "  - Trig/log operators: use \\\\sin, \\\\cos, \\\\tan, \\\\cot, \\\\sec, \\\\csc, \\\\log, \\\\ln, \\\\exp, \\\\lim — NEVER \\\\text{sin} or \\\\operatorname{sin}\n"
+        "  - Fractions: \\\\frac{numerator}{denominator}  — e.g. $\\\\frac{\\\\pi}{2}$\n"
+        "  - Greek letters: \\\\pi, \\\\theta, \\\\alpha, \\\\beta, \\\\gamma, \\\\delta, \\\\omega, \\\\Sigma, etc.\n"
+        "  - CRITICAL — JSON ESCAPING: ALL LaTeX backslashes in the JSON string MUST be double-escaped.\n"
+        "    Write \\\\\\\\sin  not  \\\\sin  (the JSON decoder halves every double-backslash).\n"
+        "    Example correct: \"$y = \\\\\\\\sin(x)$\"   → after JSON decode → $y = \\\\sin(x)$ → KaTeX renders correctly.\n"
+        "    Example WRONG:   \"$y = \\\\sin(x)$\"       → \\\\s is invalid JSON / \\\\t becomes a tab character.\n"
         "  - Do NOT wrap paragraphs in <p> tags — just use blank lines between them.\n"
         "  - NEVER use markdown: no **bold**, no *italic*, no # headings, no - bullet lists, no ```code fences```."
     )
+
+    # LaTeX commands that start with a JSON-valid escape character.
+    # \t (tab) starts: \text, \textbf, \textit, \textrm, \texttt, \textsf, \top, \tilde, \to
+    # \f (form-feed) starts: \frac, \forall, \fbox
+    # \b (backspace) starts: \begin, \bar, \binom, \boldsymbol, \beta
+    # These must be double-escaped in JSON strings (\\text{} → \text{} after decode).
+    # We fix single-backslash occurrences here so json.loads always succeeds.
+    _LATEX_JSON_FIX = [
+        # \text, \textbf, \textit, \textrm, \texttt, \textsf, \textsc, \textsl
+        (re.compile(r'(?<!\\)\\t(?=ext(?:bf|it|rm|sf|tt|sc|sl)?\{|ext\b)'), r'\\\\t'),
+        # \top, \tilde, \to
+        (re.compile(r'(?<!\\)\\t(?=op\b|ilde\b|o\b)'), r'\\\\t'),
+        # \frac, \forall, \fbox
+        (re.compile(r'(?<!\\)\\f(?=rac\{|orall\b|box\{)'), r'\\\\f'),
+        # \begin, \bar, \binom, \boldsymbol, \beta, \bf
+        (re.compile(r'(?<!\\)\\b(?=egin\{|ar\{|inom\{|oldsymbol\{|eta\b|f\b)'), r'\\\\b'),
+    ]
 
     @staticmethod
     def _parse_json_response(response: str) -> dict | None:
@@ -2334,6 +2377,12 @@ Return ONLY valid JSON in this exact structure:
             brace_end = cleaned.rfind("}")
             if brace_end != -1:
                 cleaned = cleaned[: brace_end + 1]
+
+        # Fix LaTeX backslashes that conflict with JSON escape sequences before parsing.
+        # e.g. \text{sin} → \\text{sin} so json.loads decodes it as \text{sin} not [TAB]ext{sin}
+        for _pat, _rep in AIService._LATEX_JSON_FIX:
+            cleaned = _pat.sub(_rep, cleaned)
+
         try:
             return json.loads(cleaned)
         except Exception:
@@ -2373,18 +2422,58 @@ Return ONLY valid JSON in this exact structure:
         language_name = self._LANGUAGE_NAMES.get(language.lower(), language)
         toc_list = "\n".join(f"  {i+1}. {ch.get('title', f'Chapter {i+1}')}" for i, ch in enumerate(chapter_list))
         is_non_english = language_name.lower() != "english"
-        lang_enforcement = (
-            f"\n\n⚠️ CRITICAL LANGUAGE REQUIREMENT — {language_name.upper()} ONLY:\n"
-            f"- The 'subtitle', 'description', 'book_summary', and 'thank_you_message' fields MUST be written entirely in {language_name}.\n"
-            f"- Do NOT write any of these fields in English — use {language_name} script exclusively.\n"
-            f"- Use correct {language_name} orthography: proper character combinations, vowel signs, and conjuncts. No spelling mistakes.\n"
-            f"- Use genuine {language_name} vocabulary — do NOT transliterate English words into {language_name} script.\n"
-            f"- The 'title' and 'author' fields are kept as-is from the input.\n"
-            f"- Chapter titles in 'table_of_contents' are already set — copy them exactly as provided.\n"
-            f"- LaTeX math, chemical formulas, and scientific symbols (if any) stay in standard notation."
-            if is_non_english else
-            "\n\nLANGUAGE: Write all generated content in English."
-        )
+        if is_non_english:
+            lang_enforcement = (
+                f"\n\n⚠️ CRITICAL LANGUAGE REQUIREMENT — {language_name.upper()} ONLY:\n"
+                f"- The 'title' in title_page MUST be a fluent {language_name} translation of: \"{title}\".\n"
+                f"- ALL text fields (subtitle, description, book_summary, thank_you_message, ui_labels) MUST be in {language_name}.\n"
+                f"- Do NOT write any of these fields in English — use {language_name} script exclusively.\n"
+                f"- Use correct {language_name} orthography: proper character combinations, vowel signs, and conjuncts. No spelling mistakes.\n"
+                f"- Use genuine {language_name} vocabulary — do NOT transliterate English words into {language_name} script.\n"
+                f"- The 'author' field is kept as-is from the input.\n"
+                f"- Chapter titles in 'table_of_contents' are already set — copy them exactly as provided.\n"
+                f"- LaTeX math, chemical formulas, and scientific symbols stay in standard notation."
+            )
+            ui_labels_template = (
+                f'"ui_labels": {{\n'
+                f'    "about_this_book": "<translate \'About This Book\' to {language_name}>",\n'
+                f'    "table_of_contents": "<translate \'Table of Contents\' to {language_name}>",\n'
+                f'    "chapter": "<translate \'Chapter\' to {language_name}>",\n'
+                f'    "key_points": "<translate \'Key Points\' to {language_name}>",\n'
+                f'    "assessment_questions": "<translate \'Assessment Questions\' to {language_name}>",\n'
+                f'    "multiple_choice_questions": "<translate \'Multiple Choice Questions\' to {language_name}>",\n'
+                f'    "fill_in_the_blanks": "<translate \'Fill in the Blanks\' to {language_name}>",\n'
+                f'    "short_answer_questions": "<translate \'Short Answer Questions\' to {language_name}>",\n'
+                f'    "long_answer_questions": "<translate \'Long Answer Questions\' to {language_name}>",\n'
+                f'    "thank_you": "<translate \'Thank You\' to {language_name}>",\n'
+                f'    "answer": "<translate \'Answer\' to {language_name}>",\n'
+                f'    "questions": "<translate \'Questions\' to {language_name}>",\n'
+                f'    "figure": "<translate \'Figure\' to {language_name}>",\n'
+                f'    "by": "<translate \'by\' (as in \'written by\') to {language_name}>"\n'
+                f'  }}'
+            )
+            title_field = f'"title": "<fluent {language_name} translation of: {title}>"'
+        else:
+            lang_enforcement = "\n\nLANGUAGE: Write all generated content in English."
+            ui_labels_template = (
+                '"ui_labels": {'
+                '"about_this_book": "About This Book",'
+                '"table_of_contents": "Table of Contents",'
+                '"chapter": "Chapter",'
+                '"key_points": "Key Points",'
+                '"assessment_questions": "Assessment Questions",'
+                '"multiple_choice_questions": "Multiple Choice Questions",'
+                '"fill_in_the_blanks": "Fill in the Blanks",'
+                '"short_answer_questions": "Short Answer Questions",'
+                '"long_answer_questions": "Long Answer Questions",'
+                '"thank_you": "Thank You",'
+                '"answer": "Answer",'
+                '"questions": "Questions",'
+                '"figure": "Figure",'
+                '"by": "by"'
+                '}'
+            )
+            title_field = f'"title": "{title}"'
 
         prompt = f"""Generate the metadata for an educational eBook. Return ONLY valid JSON (no markdown fences).
 
@@ -2404,7 +2493,7 @@ Chapters in this book:
 Return this exact JSON structure (fill every string field with {language_name} content):
 {{
   "title_page": {{
-    "title": "{title}",
+    {title_field},
     "author": "{author}",
     "subtitle": "<write a compelling subtitle in {language_name}>",
     "description": "<write 2-3 sentence overview of the entire book in {language_name}>"
@@ -2413,7 +2502,8 @@ Return this exact JSON structure (fill every string field with {language_name} c
   "table_of_contents": [
     {", ".join(f'{{"chapter_number": {i+1}, "title": "{ch.get("title", f"Chapter {i+1}")}"}}' for i, ch in enumerate(chapter_list))}
   ],
-  "thank_you_message": "<write 2-3 warm, encouraging sentences in {language_name} wishing the reader well after completing the book>"
+  "thank_you_message": "<write 2-3 warm, encouraging sentences in {language_name} wishing the reader well after completing the book>",
+  {ui_labels_template}
 }}"""
         print(f"[Ebook] Generating metadata for '{title}'...", flush=True)
         response = await self._ebook_llm_call(prompt, max_tokens=2048)
@@ -2429,6 +2519,7 @@ Return this exact JSON structure (fill every string field with {language_name} c
                 for i, ch in enumerate(chapter_list)
             ],
             "thank_you_message": f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you.",
+            "ui_labels": {},
         }
 
     # ── Step 2: Generate a single chapter (called in parallel) ───────────
@@ -2576,20 +2667,28 @@ Return ONLY valid JSON (no markdown fences):
         blooms = assessment_config.get("bloomsLevel", "understand")
         q_types_str = ", ".join(q_types)
 
+        # Normalise to lowercase for matching (frontend may send "mcq" or "MCQ")
+        q_types_lower = [q.lower().replace(" ", "") for q in q_types]
+
         type_instructions = []
         json_fields = []
-        if "MCQ" in q_types:
+        if any(q in q_types_lower for q in ["mcq", "multiplechoice"]):
             type_instructions.append('- For MCQ: include in "mcq_questions" with "chapter_number", "question", "options" (4 choices), "answer" (correct option text).')
             json_fields.append('    "mcq_questions": [{ "chapter_number": 1, "question": "...", "options": ["A", "B", "C", "D"], "answer": "..." }]')
-        if "Fill in Blank" in q_types:
+        if any(q in q_types_lower for q in ["fillinblank", "fill_in_blank", "fillintheblank"]):
             type_instructions.append('- For Fill in Blank: include in "fill_in_blank_questions" with "chapter_number", "question" (with ___), "answer".')
             json_fields.append('    "fill_in_blank_questions": [{ "chapter_number": 1, "question": "The ___ process...", "answer": "..." }]')
-        if "Short Answer" in q_types:
+        if any(q in q_types_lower for q in ["shortanswer", "short_answer", "short"]):
             type_instructions.append('- For Short Answer: include in "short_answer_questions" with "chapter_number", "question", "answer" (2-3 sentences).')
             json_fields.append('    "short_answer_questions": [{ "chapter_number": 1, "question": "...", "answer": "..." }]')
-        if "Long Answer" in q_types:
+        if any(q in q_types_lower for q in ["longanswer", "long_answer", "long"]):
             type_instructions.append('- For Long Answer: include in "long_answer_questions" with "chapter_number", "question", "answer" (detailed).')
             json_fields.append('    "long_answer_questions": [{ "chapter_number": 1, "question": "...", "answer": "..." }]')
+
+        # If no types matched (e.g. empty or unknown), default to MCQ so the page is never blank
+        if not json_fields:
+            type_instructions.append('- For MCQ: include in "mcq_questions" with "chapter_number", "question", "options" (4 choices), "answer" (correct option text).')
+            json_fields.append('    "mcq_questions": [{ "chapter_number": 1, "question": "...", "options": ["A", "B", "C", "D"], "answer": "..." }]')
 
         # Build chapter summaries for context
         chapter_context = "\n".join(
@@ -2607,6 +2706,14 @@ Return ONLY valid JSON (no markdown fences):
         prompt = f"""Generate assessment questions for an educational eBook titled "{title}".
 
 LANGUAGE — STRICT: Write ALL questions, options, and answers ENTIRELY in {language_name}.{lang_assess_note}
+
+MATH FORMATTING (mandatory):
+- Wrap ALL mathematical expressions in LaTeX delimiters: inline $...$ or block $$...$$
+- Use proper LaTeX operators: \\\\sin, \\\\cos, \\\\tan, \\\\log, \\\\frac{{a}}{{b}}, \\\\sqrt{{x}}
+- Greek letters: \\\\theta, \\\\pi, \\\\alpha, \\\\beta — NOT Unicode θ, π, α
+- Superscripts/subscripts: $x^{{2}}$, $x_{{n}}$ (always with braces in LaTeX)
+- Example question: "Which identity is correct? A) $\\\\sin^{{2}}(\\\\theta) + \\\\cos^{{2}}(\\\\theta) = 1$"
+- ALL backslashes in JSON strings MUST be double-escaped (\\\\\\\\sin not \\\\sin)
 
 Chapter summaries:
 {chapter_context}
@@ -2812,6 +2919,7 @@ Return ONLY valid JSON (no markdown fences):
             "final_assessment": final_assessment,
             "thank_you_message": metadata.get("thank_you_message",
                 f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you."),
+            "ui_labels": metadata.get("ui_labels", {}),
         }
 
         print(f"[Ebook] All {total_chapters} chapters assembled successfully", flush=True)
@@ -3017,8 +3125,24 @@ Return ONLY valid JSON.
             class_context_parts.append(f"Class notes: {class_description}")
         class_context_str = "\n".join(class_context_parts)
 
+        lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
+        _base_lang = lang_name.split("(")[0].strip().lower()
+        _script = self._SCRIPT_MAP.get(_base_lang, lang_name)
+        if _base_lang == "english":
+            _lang_block = ""
+        else:
+            _lang_block = (
+                f"LANGUAGE REQUIREMENT (mandatory — follow exactly)\n"
+                f"Write ALL content values in: {lang_name}\n"
+                f"Use {_script} script for all text values — titles, objectives, step descriptions, tasks, homework, differentiation text.\n"
+                f"JSON field names (keys) MUST stay in English exactly as shown in the schema below.\n"
+                f"Do NOT transliterate English words into {lang_name.split('(')[0].strip()} script.\n"
+                f"EXCEPTIONS — keep in original form: LaTeX math ($...$), code, proper nouns with no {lang_name.split('(')[0].strip()} equivalent.\n"
+            )
+
         prompt = f"""You are an expert teacher creating a lesson plan. Use every detail below to calibrate the plan.
 
+{_lang_block}
 CLASS DETAILS
 ─────────────
 Subject      : {subject}
@@ -3047,9 +3171,13 @@ GRADE-CALIBRATION RULES (follow strictly)
 • Homework must be achievable in 15-30 minutes by a {grade_label} student.
 • Differentiation: easy = scaffolded/simplified for below-grade learners; standard = grade-level; advanced = extension/enrichment for above-grade learners.
 
-OUTPUT LANGUAGE
-───────────────
-{self._LANGUAGE_NAMES.get(language.lower(), language)} — Write ALL content in this language. Do NOT use English unless it is the selected language.
+MATH FORMATTING (JSON-safe LaTeX)
+──────────────────────────────────
+• Wrap every mathematical expression in $...$ (inline) or $$...$$ (display/block).
+• Use proper LaTeX operator names: \\sin \\cos \\tan \\log \\ln — NOT \\text{{sin}}.
+• Greek letters: \\alpha \\beta \\theta \\pi etc.
+• Fractions: \\frac{{a}}{{b}} — double every backslash inside JSON strings.
+• Do NOT write math as plain text like "sin^2(x)"; write "$\\sin^2 x$" instead.
 
 OUTPUT
 ──────
@@ -3072,33 +3200,22 @@ Return ONLY valid JSON matching this schema exactly:
   }}
 }}
 """
-        response = await self.chat([{"role": "user", "content": prompt}])
+        _cfg = _build_genai_config({
+            "max_output_tokens": 4096,
+            "response_mime_type": "application/json",
+        })
+        response = ""
         try:
-            cleaned = response.strip()
-            # Strip markdown code fences (```json ... ``` or ``` ... ```)
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
-                if cleaned.rstrip().endswith("```"):
-                    cleaned = cleaned.rstrip()[:-3]
-            # Extract the outermost JSON object if any prose surrounds it
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                cleaned = cleaned[start:end + 1]
-            try:
-                return json.loads(cleaned)
-            except json.JSONDecodeError:
-                # AI sometimes emits LaTeX (\frac, \(, \sqrt) which are invalid JSON escapes.
-                # Escape any backslash not followed by a valid JSON escape character.
-                import re
-                sanitized = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', cleaned)
-                return json.loads(sanitized)
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                "Lesson plan JSON parse failed: %s | raw response: %s", e, response[:500]
-            )
-            return {"title": f"Lesson Plan: {topic}", "objectives": [topic], "timeEstimate": 45, "steps": []}
+            _gc = self._get_gemini_async()
+            if _gc:
+                _r = await _gemini_generate_with_retry(_gc, settings.AI_PRIMARY_MODEL, prompt, _cfg)
+                response = _r.text or ""
+        except Exception as _e:
+            print(f"[LessonPlan] Gemini failed: {type(_e).__name__}: {_e}", flush=True)
+        parsed = self._parse_json_response(response)
+        if parsed:
+            return parsed
+        return {"title": f"Lesson Plan: {topic}", "objectives": [topic], "timeEstimate": 45, "steps": []}
 
     async def generate_rubric(
         self, board: str, grade: int, subject: str, topic: str, criteria_count: int,
@@ -5412,6 +5529,152 @@ Return ONLY valid JSON (no markdown):
             print(f"[Infographic] label prep failed: {e}", flush=True)
         return {"title": topic[:60], "sections": [], "key_takeaway": ""}
 
+    def _infer_topic_visual_hints(self, title: str, explanation: str) -> dict:
+        combined = (title + " " + explanation[:600]).lower()
+
+        math_kw = [
+            "theorem", "equation", "formula", "triangle", "geometry", "algebra",
+            "calculus", "proof", "angle", "circle", "polygon", "arithmetic",
+            "derivative", "integral", "matrix", "vector", "probability", "statistics",
+            "hypotenuse", "pythagoras", "quadratic", "fraction", "ratio", "exponent",
+        ]
+        science_kw = [
+            "cell", "atom", "molecule", "organism", "photosynthesis", "evolution",
+            "ecosystem", "chemical", "reaction", "force", "energy", "wave", "light",
+            "gravity", "electric", "magnetic", "dna", "gene", "protein", "virus",
+            "bacteria", "periodic", "element", "compound", "physics", "biology",
+            "chemistry", "nucleus", "electron", "osmosis", "mitosis",
+        ]
+        history_kw = [
+            "war", "revolution", "empire", "dynasty", "century", "ancient", "medieval",
+            "civilization", "king", "queen", "battle", "treaty", "independence",
+            "colonial", "historical", "period", "era", "decade", "event", "reign",
+            "republic", "democracy", "constitution", "freedom", "liberation",
+        ]
+        geo_kw = [
+            "continent", "country", "capital", "ocean", "mountain", "river", "climate",
+            "population", "region", "map", "latitude", "longitude", "biome",
+            "volcano", "earthquake", "weather", "atmosphere", "soil", "erosion",
+            "desert", "rainfall", "tundra", "tropical",
+        ]
+        lang_kw = [
+            "grammar", "vocabulary", "sentence", "verb", "noun", "adjective", "tense",
+            "literature", "poetry", "writing", "reading", "comprehension", "metaphor",
+            "simile", "narrative", "prose", "essay", "dialogue", "author", "clause",
+            "punctuation", "phonics", "rhyme",
+        ]
+        econ_kw = [
+            "supply", "demand", "market", "price", "economy", "trade", "gdp",
+            "inflation", "tax", "budget", "profit", "cost", "investment", "bank",
+            "currency", "stock", "entrepreneurship", "goods", "services", "scarcity",
+        ]
+
+        if any(k in combined for k in math_kw):
+            return {
+                "category": "mathematics",
+                "color_scheme": "Deep navy (#0F172A) background with gold (#F59E0B), cyan (#06B6D4), and white text.",
+                "layout_desc": (
+                    "Large central diagram or formula occupying ~40% of the poster (e.g. labelled triangle, "
+                    "graph, number line, or geometric figure). Surrounding info panels for definitions, "
+                    "worked-example steps, and real-world applications."
+                ),
+                "visual_hint": (
+                    "Draw mathematically accurate diagrams: labelled triangles with sides a/b/c, graphs with axes, "
+                    "geometric shapes with angle marks. Color-code variables (e.g. hypotenuse in gold). "
+                    "Render key formulas in large, clear typography — e.g. a² + b² = c². "
+                    "Add small step-by-step worked example box. No generic clipart."
+                ),
+            }
+        elif any(k in combined for k in science_kw):
+            return {
+                "category": "science",
+                "color_scheme": "Dark (#111827) background with green (#10B981), blue (#3B82F6), and white text.",
+                "layout_desc": (
+                    "Central annotated scientific diagram (cell, atom, food chain, circuit, etc.) with "
+                    "leader-line labels. Surrounding panels explain stages/parts, examples, and significance."
+                ),
+                "visual_hint": (
+                    "Draw a detailed, realistic scientific illustration specific to the topic — e.g. a plant cell "
+                    "with labelled organelles, an atom with electron shells, or a food web with arrows. "
+                    "Use leader lines for all labels. Show cause-and-effect with directional arrows. "
+                    "Include a process-flow diagram if the topic involves stages (e.g. mitosis, photosynthesis)."
+                ),
+            }
+        elif any(k in combined for k in history_kw):
+            return {
+                "category": "history",
+                "color_scheme": "Dark sepia (#1C1410) background with amber (#D97706), cream (#FEF3C7), and white text.",
+                "layout_desc": (
+                    "Horizontal or vertical timeline spine as the central visual. Event cards with dates branch "
+                    "off the spine. Side panels provide context, key figures, causes, and consequences."
+                ),
+                "visual_hint": (
+                    "Draw a clear dated timeline with event markers. Add small silhouette illustrations: "
+                    "period maps, flags, monuments, or portrait silhouettes of key figures. "
+                    "Use parchment-textured panels for event cards. Show cause → event → consequence flow."
+                ),
+            }
+        elif any(k in combined for k in geo_kw):
+            return {
+                "category": "geography",
+                "color_scheme": "Dark ocean (#0C1A2E) background with teal (#0D9488), earth-tone (#92400E), and white text.",
+                "layout_desc": (
+                    "Central map or topographic diagram with annotations. Surrounding panels for climate data, "
+                    "key statistics, comparisons, and significance."
+                ),
+                "visual_hint": (
+                    "Draw a simplified map or geographic cross-section relevant to the topic. "
+                    "Add compass rose, scale bar, elevation shading, or climate zone color bands. "
+                    "Use icons for key geographic features (mountains, rivers, volcanoes). "
+                    "Include a small data chart (e.g. rainfall bar chart, population graph) if relevant."
+                ),
+            }
+        elif any(k in combined for k in lang_kw):
+            return {
+                "category": "language",
+                "color_scheme": "Deep purple (#1E1B4B) background with rose (#F43F5E), yellow (#FCD34D), and white text.",
+                "layout_desc": (
+                    "Typography-led layout. Large example sentences or text excerpts in highlighted boxes. "
+                    "Sentence-structure diagrams or word-tree branching diagrams as the central visual."
+                ),
+                "visual_hint": (
+                    "Use large, beautiful typography as a design element. Draw sentence structure diagrams "
+                    "with labeled parts (subject/verb/object). Show example sentences in speech-bubble or "
+                    "highlighted-quote style. Use word-web or tree diagram to show relationships. "
+                    "Color-code grammar components (verbs in red, nouns in blue, etc.)."
+                ),
+            }
+        elif any(k in combined for k in econ_kw):
+            return {
+                "category": "economics",
+                "color_scheme": "Dark (#0F172A) background with emerald (#059669), orange (#EA580C), and white text.",
+                "layout_desc": (
+                    "Central economic diagram: supply-demand curve, flow cycle, or bar/pie chart. "
+                    "Surrounding panels explain key concepts, real-world examples, and impacts."
+                ),
+                "visual_hint": (
+                    "Draw accurate economic diagrams: supply-demand curves with labeled axes (Price vs Quantity), "
+                    "circular flow of income diagram, or comparative bar charts. "
+                    "Show economic relationships with directional arrows. "
+                    "Use icons (coins, factories, shopping carts) to make abstract concepts concrete."
+                ),
+            }
+        else:
+            return {
+                "category": "general",
+                "color_scheme": "Dark (#111827) background with vibrant contrasting accent colours per section.",
+                "layout_desc": (
+                    "Strong title banner at top. 3-4 distinct content panels, each with a unique topic-relevant "
+                    "icon or mini-diagram. Key takeaway bar at the bottom."
+                ),
+                "visual_hint": (
+                    "Create specific, meaningful visuals tied to the topic — flowcharts for processes, "
+                    "comparison tables for contrasting concepts, numbered steps for procedures, "
+                    "or annotated diagrams for structures. Avoid generic clipart. "
+                    "Each panel should contain a distinct visual element, not just text."
+                ),
+            }
+
     async def generate_chat_infographic(
         self,
         user_message: str,
@@ -5498,35 +5761,44 @@ Return ONLY valid JSON (no markdown):
             text_registry.append(f'KEY TAKEAWAY: "{key_takeaway}"')
 
         lang_note = (
-            f"Text is in {lang_name} — render every character exactly as given."
+            f"All text is in {lang_name} — render every character exactly as given, "
+            f"using correct {lang_name} script/orthography."
             if is_non_english
-            else "Text is in English — render every character exactly as given."
+            else "All text is in English — render every character exactly as given."
         )
 
+        visual_hints = self._infer_topic_visual_hints(title_text, explanation)
+
         image_prompt = (
-            f"Create a stunning educational infographic poster for {grade_str} students.\n\n"
+            f"Create a high-quality educational infographic poster for {grade_str} students.\n"
+            f"TOPIC: {title_text}\n"
+            f"SUBJECT: {visual_hints['category'].upper()}\n\n"
+            f"TOPIC CONTEXT (use this to draw accurate, content-specific visuals):\n{explanation[:500]}\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "⚠️  MANDATORY TEXT — ZERO TOLERANCE FOR SPELLING ERRORS\n"
+            "VISUAL DESIGN (follow precisely)\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Layout: {visual_hints['layout_desc']}\n"
+            f"Color scheme: {visual_hints['color_scheme']}\n"
+            f"Illustrations: {visual_hints['visual_hint']}\n"
+            "- Title banner at the very top — bold, large, exact title text\n"
+            "- Key takeaway highlighted bar pinned at the very bottom\n"
+            "- High information density — every panel must contain topic-specific visuals, not generic shapes\n"
+            "- Academically accurate — diagrams, labels, and data must be factually correct\n"
+            "- Student-friendly and visually engaging — designed for classroom use\n"
+            f"- {lang_note}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️  MANDATORY TEXT — COPY VERBATIM, ZERO SPELLING ERRORS\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"TITLE (letter-for-letter): {title_spelled}\n"
             f"{sections_detail}\n"
             f"KEY TAKEAWAY (word-for-word): {key_takeaway}\n\n"
-            "COMPLETE TEXT REGISTRY — every string must appear exactly:\n"
+            "Complete text registry — every string must appear exactly as listed:\n"
             + "\n".join(f"  {t}" for t in text_registry) + "\n\n"
-            "SPELLING RULES (non-negotiable):\n"
+            "Text rules:\n"
             "1. Copy EVERY word from the registry above exactly — zero alterations.\n"
-            "2. Do NOT paraphrase, abbreviate, reorder, or add letters.\n"
-            "3. Proper nouns: follow the letter-by-letter spelling shown in brackets above.\n"
-            "4. If unsure about a word, leave that space blank rather than guessing.\n"
-            "5. Proofread mentally before rendering each text element.\n\n"
-            "Visual design:\n"
-            "- Bold title banner at the top with the EXACT title text\n"
-            "- Dark background, vibrant contrasting panel colours\n"
-            "- One dedicated panel per section with its heading and bullet points\n"
-            "- Relevant icons and mini-diagrams within each panel\n"
-            "- Key takeaway bar at the bottom\n"
-            "- Professional infographic poster style — NOT a mind-map\n"
-            f"- {lang_note}\n"
+            "2. Do NOT paraphrase, abbreviate, reorder, or add/remove letters.\n"
+            "3. Proper nouns: follow the letter-by-letter spelling shown in brackets.\n"
+            "4. If unsure about a word, leave the space blank rather than guessing.\n"
         )
 
         client = self._get_gemini_async()

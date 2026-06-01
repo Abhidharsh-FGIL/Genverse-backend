@@ -10,10 +10,11 @@ Start the worker:
 """
 import asyncio
 import json
+import time
 import uuid
 
 import redis as sync_redis
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.celery_app import celery
@@ -192,31 +193,49 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
         },
     }
 
-    db = SyncSessionLocal()
+    # ── Dedup guard: acquire Redis lock before DB write ──────────────────────
+    # Prevents duplicate rows when React StrictMode (dev) or a network retry
+    # causes two tasks to fire within 120 seconds for the same user+title+language.
+    dedup_key = f"ebook:save_lock:{user_id}:{params['title']}:{params['language']}"
+    lock_acquired = r.set(dedup_key, "1", nx=True, ex=120)
+
     saved_id = None
-    try:
-        ebook = Ebook(
-            user_id=user_id,
-            org_id=org_id,
-            title=params["title"],
-            subject=params.get("subject") or params.get("topic"),
-            grade=params.get("grade"),
-            language=params["language"],
-            source_type=params.get("source_type", "topic"),
-            ebook_json=ebook_json_with_config,
-            page_count=page_count,
-            points_used=cost,
-        )
-        db.add(ebook)
-        db.commit()
-        db.refresh(ebook)
-        saved_id = str(ebook.id)
-        print(f"[EbookTask] Saved to DB: {saved_id}", flush=True)
-    except Exception as save_err:
-        db.rollback()
-        print(f"[EbookTask] DB save failed: {save_err}", flush=True)
-    finally:
-        db.close()
+    if not lock_acquired:
+        # Another task already has the lock — wait up to 10 s for it to publish saved_id
+        result_key = f"ebook:saved_id:{dedup_key}"
+        for _ in range(20):
+            saved_id = r.get(result_key)
+            if saved_id:
+                print(f"[EbookTask] Dedup: reusing saved_id={saved_id}", flush=True)
+                break
+            time.sleep(0.5)
+    else:
+        db = SyncSessionLocal()
+        try:
+            ebook = Ebook(
+                user_id=user_id,
+                org_id=org_id,
+                title=params["title"],
+                subject=params.get("subject") or params.get("topic"),
+                grade=params.get("grade"),
+                language=params["language"],
+                source_type=params.get("source_type", "topic"),
+                ebook_json=ebook_json_with_config,
+                page_count=page_count,
+                points_used=cost,
+            )
+            db.add(ebook)
+            db.commit()
+            db.refresh(ebook)
+            saved_id = str(ebook.id)
+            # Publish saved_id so any concurrent dedup-waiting task can pick it up
+            r.set(f"ebook:saved_id:{dedup_key}", saved_id, ex=120)
+            print(f"[EbookTask] Saved to DB: {saved_id}", flush=True)
+        except Exception as save_err:
+            db.rollback()
+            print(f"[EbookTask] DB save failed: {save_err}", flush=True)
+        finally:
+            db.close()
 
     _publish(r, channel, {
         "stage": "complete",
