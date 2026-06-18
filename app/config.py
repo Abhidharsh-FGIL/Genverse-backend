@@ -91,17 +91,13 @@ class Settings(BaseSettings):
     PHONEPE_CLIENT_ID: str = ""
     PHONEPE_CLIENT_SECRET: str = ""
     PHONEPE_CLIENT_VERSION: int = 1
-    PHONEPE_ENV: str = "SANDBOX"  # SANDBOX or PRODUCTION
+    PHONEPE_ENV: str = "PRODUCTION"
+    PHONEPE_TOKEN_URL: str = ""
+    PHONEPE_BASE_URL: str = ""
 
     # Stripe (international cards)
     STRIPE_API_KEY: str = ""
     STRIPE_ENDPOINT_SECRET: str = ""
-
-    @property
-    def phonepe_base_url(self) -> str:
-        if self.PHONEPE_ENV == "PRODUCTION":
-            return "https://api.phonepe.com/apis/pg"
-        return "https://api-preprod.phonepe.com/apis/pg-sandbox"
 
     # Frontend / Backend URLs
     FRONTEND_URL: str = "http://localhost:4200"

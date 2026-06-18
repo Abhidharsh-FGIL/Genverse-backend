@@ -123,10 +123,9 @@ async def _get_phonepe_access_token() -> str:
     if _phonepe_token_cache["token"] and _phonepe_token_cache["expires_at"] > now + 60:
         return _phonepe_token_cache["token"]
 
-    token_url = f"{settings.phonepe_base_url}/v1/oauth/token"
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            token_url,
+            settings.PHONEPE_TOKEN_URL,
             data={
                 "grant_type": "client_credentials",
                 "client_id": settings.PHONEPE_CLIENT_ID,
@@ -154,7 +153,7 @@ async def _create_phonepe_order(
 ) -> dict:
     """Create a PhonePe Standard Checkout order."""
     access_token = await _get_phonepe_access_token()
-    order_url = f"{settings.phonepe_base_url}/checkout/v2/pay"
+    order_url = f"{settings.PHONEPE_BASE_URL}/checkout/v2/pay"
 
     payload = {
         "merchantOrderId": merchant_order_id,
@@ -193,7 +192,7 @@ async def _create_phonepe_order(
 async def _get_phonepe_order_status(merchant_order_id: str) -> dict:
     """Check the status of a PhonePe order."""
     access_token = await _get_phonepe_access_token()
-    status_url = f"{settings.phonepe_base_url}/checkout/v2/order/{merchant_order_id}/status"
+    status_url = f"{settings.PHONEPE_BASE_URL}/checkout/v2/order/{merchant_order_id}/status"
 
     async with httpx.AsyncClient() as client:
         resp = await client.get(
@@ -221,7 +220,7 @@ async def _create_phonepe_subscription(
 ) -> dict:
     """Create a PhonePe recurring subscription (UPI AutoPay mandate)."""
     access_token = await _get_phonepe_access_token()
-    sub_url = f"{settings.phonepe_base_url}/v3/recurring/subscription/create"
+    sub_url = f"{settings.PHONEPE_BASE_URL}/v3/recurring/subscription/create"
 
     payload = {
         "merchantSubscriptionId": merchant_subscription_id,
@@ -261,7 +260,7 @@ async def _create_phonepe_subscription(
 async def _cancel_phonepe_subscription(merchant_subscription_id: str) -> bool:
     """Cancel a PhonePe recurring subscription."""
     access_token = await _get_phonepe_access_token()
-    cancel_url = f"{settings.phonepe_base_url}/v3/recurring/subscription/{merchant_subscription_id}/cancel"
+    cancel_url = f"{settings.PHONEPE_BASE_URL}/v3/recurring/subscription/{merchant_subscription_id}/cancel"
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -286,7 +285,7 @@ async def _execute_phonepe_recurring_debit(
     to auto-charge the user's linked UPI account.
     """
     access_token = await _get_phonepe_access_token()
-    debit_url = f"{settings.phonepe_base_url}/v3/recurring/debit/execute"
+    debit_url = f"{settings.PHONEPE_BASE_URL}/v3/recurring/debit/execute"
 
     payload = {
         "merchantSubscriptionId": merchant_subscription_id,
