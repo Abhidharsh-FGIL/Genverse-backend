@@ -150,6 +150,12 @@ async def _create_phonepe_order(
     amount_inr: int,
     merchant_order_id: str,
     redirect_url: str,
+    user_id: uuid.UUID | None = None,
+    item_type: str = "",
+    item_id: str = "",
+    org_id: str = "",
+    promo_code: str = "",
+    promo_discount: int = 0,
 ) -> dict:
     """Create a PhonePe Standard Checkout order."""
     access_token = await _get_phonepe_access_token()
@@ -160,7 +166,12 @@ async def _create_phonepe_order(
         "amount": amount_inr * 100,  # paise
         "expireAfter": 1200,  # 20 minutes
         "metaInfo": {
-            "udf1": merchant_order_id,
+            # udf fields carry order context for the server-side webhook
+            "udf1": str(user_id) if user_id else "",
+            "udf2": item_type,
+            "udf3": item_id,
+            "udf4": org_id or "",
+            "udf5": f"{promo_code}|{promo_discount}",
         },
         "paymentFlow": {
             "type": "PG_CHECKOUT",
@@ -736,6 +747,12 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
                 amount_inr=actual_amount,
                 merchant_order_id=merchant_order_id,
                 redirect_url=redirect_url,
+                user_id=current_user.id,
+                item_type=payload.item_type,
+                item_id=payload.item_id,
+                org_id=payload.org_id or "",
+                promo_code=promo_code_str,
+                promo_discount=promo_discount,
             )
             checkout_url = order.get("redirectUrl") or order.get("data", {}).get("redirectUrl", "")
             if not checkout_url:
@@ -1201,3 +1218,75 @@ async def phonepe_recurring_webhook(request: Request, db: DBSession):
         return {"status": "ok"}
 
     return {"status": "pending"}
+
+
+# ---------------------------------------------------------------------------
+# PhonePe Standard Checkout Webhook — server-to-server payment notification
+# ---------------------------------------------------------------------------
+
+@router.post("/phonepe/webhook")
+async def phonepe_standard_webhook(request: Request, db: DBSession, background_tasks: BackgroundTasks):
+    """Server-to-server webhook for PhonePe Standard Checkout.
+
+    Configure this URL in the PhonePe merchant dashboard:
+        https://app.genverse.ai/api/v1/payments/phonepe/webhook
+
+    PhonePe calls this endpoint when a payment completes. The handler verifies
+    the payment directly with PhonePe and fulfils the subscription/add-on,
+    so the DB is updated even if the user's browser never loads the success page.
+    _fulfil_purchase is idempotent, so a duplicate call from the frontend is safe.
+    """
+    body = await request.json()
+    print(f"[PhonePe Webhook] Received: {body}", flush=True)
+
+    merchant_order_id = body.get("merchantOrderId", "")
+    if not merchant_order_id:
+        return {"status": "ignored", "reason": "no merchantOrderId"}
+
+    # Verify payment state directly with PhonePe — do not trust webhook body alone
+    try:
+        order_status = await _get_phonepe_order_status(merchant_order_id)
+    except Exception as e:
+        print(f"[PhonePe Webhook] Status check failed for {merchant_order_id}: {e}", flush=True)
+        return {"status": "error", "reason": "status check failed"}
+
+    state = order_status.get("state") or order_status.get("data", {}).get("state", "")
+    if state != "COMPLETED":
+        print(f"[PhonePe Webhook] Order {merchant_order_id} state={state}, skipping", flush=True)
+        return {"status": "pending"}
+
+    # Extract order context from metaInfo udf fields (stored at checkout creation)
+    meta = order_status.get("metaInfo", {})
+    user_id_str = meta.get("udf1", "")
+    item_type   = meta.get("udf2", "")
+    item_id     = meta.get("udf3", "")
+    org_id      = meta.get("udf4", "") or None
+    promo_raw   = meta.get("udf5", "|0").split("|", 1)
+    promo_code  = promo_raw[0] or None
+    promo_discount = int(promo_raw[1]) if len(promo_raw) > 1 and promo_raw[1].isdigit() else 0
+
+    if not user_id_str or not item_type or not item_id:
+        print(f"[PhonePe Webhook] Missing context for {merchant_order_id}: meta={meta}", flush=True)
+        return {"status": "error", "reason": "missing order context"}
+
+    try:
+        user_id = uuid.UUID(user_id_str)
+    except ValueError:
+        print(f"[PhonePe Webhook] Invalid user_id '{user_id_str}' for {merchant_order_id}", flush=True)
+        return {"status": "error", "reason": "invalid user_id"}
+
+    print(f"[PhonePe Webhook] Fulfilling {item_type}/{item_id} for user {user_id}", flush=True)
+    await _fulfil_purchase(
+        item_type=item_type,
+        item_id=item_id,
+        user_id=user_id,
+        org_id=org_id,
+        db=db,
+        merchant_order_id=merchant_order_id,
+        gateway="phonepe",
+        promo_code=promo_code,
+        promo_discount=promo_discount,
+        background_tasks=background_tasks,
+    )
+
+    return {"status": "ok"}
