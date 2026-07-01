@@ -36,22 +36,34 @@ ORG = {
     "max_seats": 1000,
 }
 
+_TEACHER_NAMES = [
+    "Sanjana", "Reeba", "Gowri", "Sowthaman", "Aravindh",
+    "Abhi", "Sakthi", "Siva", "Priya", "Nisha",
+]
+
+_STUDENT_NAMES = [
+    "Arjun", "Karthik", "Deepa", "Meena", "Ramya",
+    "Vishnu", "Ajith", "Divya", "Harish", "Kavya",
+    "Manoj", "Pooja", "Rahul", "Sneha", "Surya",
+    "Vidya", "Anand", "Bhavya", "Dinesh", "Geetha",
+]
+
 TEACHERS = [
     {
-        "email": f"sai.teacher{i}@genverse.dev",
-        "password": f"Sai@Teacher{i}",
-        "name": f"SAI Teacher {i}",
+        "email": f"{name.lower()}@genverse.dev",
+        "password": f"{name}@{i}",
+        "name": name,
     }
-    for i in range(1, 11)
+    for i, name in enumerate(_TEACHER_NAMES, start=1)
 ]
 
 STUDENTS = [
     {
-        "email": f"sai.student{i}@genverse.dev",
-        "password": f"Sai@Student{i}",
-        "name": f"SAI Student {i}",
+        "email": f"{name.lower()}.student@genverse.dev",
+        "password": f"{name}@{i}",
+        "name": name,
     }
-    for i in range(1, 21)
+    for i, name in enumerate(_STUDENT_NAMES, start=1)
 ]
 
 
