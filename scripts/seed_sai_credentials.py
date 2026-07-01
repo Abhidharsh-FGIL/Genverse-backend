@@ -1,5 +1,5 @@
 """
-Seed script: creates SAI org credentials — 1 admin, 2 teachers, 2 students.
+Seed script: creates SAI org credentials — 1 admin, 10 teachers, 20 students.
 All email addresses contain "sai".
 
 Run from the project root:
@@ -37,13 +37,21 @@ ORG = {
 }
 
 TEACHERS = [
-    {"email": "sai.teacher1@genverse.dev", "password": "Sai@Teacher1", "name": "SAI Teacher 1"},
-    {"email": "sai.teacher2@genverse.dev", "password": "Sai@Teacher2", "name": "SAI Teacher 2"},
+    {
+        "email": f"sai.teacher{i}@genverse.dev",
+        "password": f"Sai@Teacher{i}",
+        "name": f"SAI Teacher {i}",
+    }
+    for i in range(1, 11)
 ]
 
 STUDENTS = [
-    {"email": "sai.student1@genverse.dev", "password": "Sai@Student1", "name": "SAI Student 1"},
-    {"email": "sai.student2@genverse.dev", "password": "Sai@Student2", "name": "SAI Student 2"},
+    {
+        "email": f"sai.student{i}@genverse.dev",
+        "password": f"Sai@Student{i}",
+        "name": f"SAI Student {i}",
+    }
+    for i in range(1, 21)
 ]
 
 
