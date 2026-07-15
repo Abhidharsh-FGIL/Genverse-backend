@@ -296,14 +296,22 @@ async def _build_rag_context(
     return "\n\n".join(c.chunk_text for c in chunks)
 
 
-def _inject_rag(messages: list[dict], question: str, rag_text: str) -> list[dict]:
+def _lang_instruction(language: str | None) -> str:
+    """Return a language instruction clause for RAG prompts."""
+    if not language or language.lower() in ("en", "english"):
+        return ""
+    return f" Respond in {language}."
+
+
+def _inject_rag(messages: list[dict], question: str, rag_text: str, language: str | None = None) -> list[dict]:
     """Replace the last user message with a RAG-enriched version."""
+    lang_note = _lang_instruction(language)
     enriched_question = (
         "The user has selected specific document(s) from their Knowledge Vault. "
         "Answer ONLY using the excerpts below — do NOT use any external knowledge, training data, or information outside these excerpts.\n"
         "If the answer cannot be found in the excerpts, respond with: "
         "'I couldn't find information about that in your selected document(s). "
-        "Try rephrasing your question or selecting a different file.'\n\n"
+        f"Try rephrasing your question or selecting a different file.'{lang_note}\n\n"
         f"--- DOCUMENT EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
         f"Question: {question}"
     )
@@ -315,14 +323,15 @@ def _inject_rag(messages: list[dict], question: str, rag_text: str) -> list[dict
     return updated
 
 
-def _inject_no_rag_results(messages: list[dict], question: str) -> list[dict]:
+def _inject_no_rag_results(messages: list[dict], question: str, language: str | None = None) -> list[dict]:
     """Inject a constraint when files are selected but no relevant chunks were found."""
+    lang_note = _lang_instruction(language)
     enriched_question = (
         "The user has selected specific document(s) from their Knowledge Vault, "
         "but no relevant content was found in those documents for this query.\n"
         "Do NOT answer from your own knowledge. Respond with: "
         "'I couldn't find information about that in your selected document(s). "
-        "Try rephrasing your question or selecting a different file.'\n\n"
+        f"Try rephrasing your question or selecting a different file.'{lang_note}\n\n"
         f"Question: {question}"
     )
     updated = list(messages)
@@ -425,14 +434,15 @@ async def _build_library_rag_context(
     return "\n\n".join(c.chunk_text for c in chunks)
 
 
-def _inject_library_rag(messages: list[dict], question: str, rag_text: str, book_title: str) -> list[dict]:
+def _inject_library_rag(messages: list[dict], question: str, rag_text: str, book_title: str, language: str | None = None) -> list[dict]:
     """Replace the last user message with library-book-RAG-enriched version."""
+    lang_note = _lang_instruction(language)
     enriched_question = (
         f"The user is studying from the book '{book_title}' in the public library.\n"
         "Answer ONLY using the excerpts from this book below — do NOT use any external knowledge or training data outside these excerpts.\n"
         "If the answer cannot be found in the excerpts, respond with: "
         f"'I couldn't find information about that in \"{book_title}\". "
-        "Try rephrasing your question or check a different section of the book.'\n\n"
+        f"Try rephrasing your question or check a different section of the book.'{lang_note}\n\n"
         f"--- BOOK EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
         f"Question: {question}"
     )
@@ -729,6 +739,7 @@ async def send_message_stream(
         or []
     )
     library_file_id: str | None = (payload.context or {}).get("library_file_id")
+    rag_language: str | None = (payload.context or {}).get("language")
     is_summary = _is_summary_intent(payload.message)
 
     if selected_files:
@@ -766,9 +777,9 @@ async def send_message_stream(
                     ai=ai,
                 )
                 if rag_text:
-                    messages = _inject_rag(messages, payload.message, rag_text)
+                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language)
                 else:
-                    messages = _inject_no_rag_results(messages, payload.message)
+                    messages = _inject_no_rag_results(messages, payload.message, language=rag_language)
         except Exception as e:
             print(f"[StreamChat] RAG context build failed: {e}", flush=True)
 
@@ -802,10 +813,10 @@ async def send_message_stream(
                 if lib_rag_text:
                     messages = _inject_library_rag(
                         messages, payload.message, lib_rag_text,
-                        book_title=book_title,
+                        book_title=book_title, language=rag_language,
                     )
                 else:
-                    messages = _inject_no_rag_results(messages, payload.message)
+                    messages = _inject_no_rag_results(messages, payload.message, language=rag_language)
         except Exception as e:
             print(f"[StreamChat] Library RAG context build failed: {e}", flush=True)
 
@@ -968,6 +979,7 @@ async def send_message(
         or []
     )
     library_file_id_sync: str | None = (payload.context or {}).get("library_file_id")
+    rag_language_sync: str | None = (payload.context or {}).get("language")
     is_summary_sync = _is_summary_intent(payload.message)
 
     if selected_files:
@@ -1001,9 +1013,9 @@ async def send_message(
                     ai=ai,
                 )
                 if rag_text:
-                    messages = _inject_rag(messages, payload.message, rag_text)
+                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language_sync)
                 else:
-                    messages = _inject_no_rag_results(messages, payload.message)
+                    messages = _inject_no_rag_results(messages, payload.message, language=rag_language_sync)
         except Exception as e:
             print(f"[SendMessage] RAG context build failed: {e}", flush=True)
 
@@ -1034,10 +1046,10 @@ async def send_message(
                 if lib_rag_text_sync:
                     messages = _inject_library_rag(
                         messages, payload.message, lib_rag_text_sync,
-                        book_title=book_title_sync,
+                        book_title=book_title_sync, language=rag_language_sync,
                     )
                 else:
-                    messages = _inject_no_rag_results(messages, payload.message)
+                    messages = _inject_no_rag_results(messages, payload.message, language=rag_language_sync)
         except Exception as e:
             print(f"[SendMessage] Library RAG context build failed: {e}", flush=True)
 
