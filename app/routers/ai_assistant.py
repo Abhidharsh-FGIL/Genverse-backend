@@ -303,15 +303,34 @@ def _lang_instruction(language: str | None) -> str:
     return f" Respond in {language}."
 
 
-def _inject_rag(messages: list[dict], question: str, rag_text: str, language: str | None = None) -> list[dict]:
+def _grade_calibration_note(grade: str | None, board: str | None) -> str:
+    """Return a grade/board calibration reminder to embed in RAG injection prompts."""
+    parts = []
+    if grade:
+        parts.append(f"Grade {grade}")
+    if board:
+        parts.append(board)
+    if not parts:
+        return ""
+    profile = " / ".join(parts)
+    return (
+        f"\nIMPORTANT: While answering from the excerpts, calibrate your explanation "
+        f"for a {profile} student — use vocabulary, depth, and examples appropriate for their level. "
+        f"Do not copy document text verbatim; re-explain it in language the student can understand."
+    )
+
+
+def _inject_rag(messages: list[dict], question: str, rag_text: str, language: str | None = None, grade: str | None = None, board: str | None = None) -> list[dict]:
     """Replace the last user message with a RAG-enriched version."""
     lang_note = _lang_instruction(language)
+    grade_note = _grade_calibration_note(grade, board)
     enriched_question = (
         "The user has selected specific document(s) from their Knowledge Vault. "
         "Answer ONLY using the excerpts below — do NOT use any external knowledge, training data, or information outside these excerpts.\n"
         "If the answer cannot be found in the excerpts, respond with: "
         "'I couldn't find information about that in your selected document(s). "
-        f"Try rephrasing your question or selecting a different file.'{lang_note}\n\n"
+        f"Try rephrasing your question or selecting a different file.'{lang_note}"
+        f"{grade_note}\n\n"
         f"--- DOCUMENT EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
         f"Question: {question}"
     )
@@ -434,15 +453,17 @@ async def _build_library_rag_context(
     return "\n\n".join(c.chunk_text for c in chunks)
 
 
-def _inject_library_rag(messages: list[dict], question: str, rag_text: str, book_title: str, language: str | None = None) -> list[dict]:
+def _inject_library_rag(messages: list[dict], question: str, rag_text: str, book_title: str, language: str | None = None, grade: str | None = None, board: str | None = None) -> list[dict]:
     """Replace the last user message with library-book-RAG-enriched version."""
     lang_note = _lang_instruction(language)
+    grade_note = _grade_calibration_note(grade, board)
     enriched_question = (
         f"The user is studying from the book '{book_title}' in the public library.\n"
         "Answer ONLY using the excerpts from this book below — do NOT use any external knowledge or training data outside these excerpts.\n"
         "If the answer cannot be found in the excerpts, respond with: "
         f"'I couldn't find information about that in \"{book_title}\". "
-        f"Try rephrasing your question or check a different section of the book.'{lang_note}\n\n"
+        f"Try rephrasing your question or check a different section of the book.'{lang_note}"
+        f"{grade_note}\n\n"
         f"--- BOOK EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
         f"Question: {question}"
     )
@@ -740,6 +761,8 @@ async def send_message_stream(
     )
     library_file_id: str | None = (payload.context or {}).get("library_file_id")
     rag_language: str | None = (payload.context or {}).get("language")
+    rag_grade: str | None = (payload.context or {}).get("grade")
+    rag_board: str | None = (payload.context or {}).get("board")
     is_summary = _is_summary_intent(payload.message)
 
     if selected_files:
@@ -777,7 +800,7 @@ async def send_message_stream(
                     ai=ai,
                 )
                 if rag_text:
-                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language)
+                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language, grade=rag_grade, board=rag_board)
                 else:
                     messages = _inject_no_rag_results(messages, payload.message, language=rag_language)
         except Exception as e:
@@ -813,7 +836,7 @@ async def send_message_stream(
                 if lib_rag_text:
                     messages = _inject_library_rag(
                         messages, payload.message, lib_rag_text,
-                        book_title=book_title, language=rag_language,
+                        book_title=book_title, language=rag_language, grade=rag_grade, board=rag_board,
                     )
                 else:
                     messages = _inject_no_rag_results(messages, payload.message, language=rag_language)
@@ -980,6 +1003,8 @@ async def send_message(
     )
     library_file_id_sync: str | None = (payload.context or {}).get("library_file_id")
     rag_language_sync: str | None = (payload.context or {}).get("language")
+    rag_grade_sync: str | None = (payload.context or {}).get("grade")
+    rag_board_sync: str | None = (payload.context or {}).get("board")
     is_summary_sync = _is_summary_intent(payload.message)
 
     if selected_files:
@@ -1013,7 +1038,7 @@ async def send_message(
                     ai=ai,
                 )
                 if rag_text:
-                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language_sync)
+                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language_sync, grade=rag_grade_sync, board=rag_board_sync)
                 else:
                     messages = _inject_no_rag_results(messages, payload.message, language=rag_language_sync)
         except Exception as e:
@@ -1046,7 +1071,7 @@ async def send_message(
                 if lib_rag_text_sync:
                     messages = _inject_library_rag(
                         messages, payload.message, lib_rag_text_sync,
-                        book_title=book_title_sync, language=rag_language_sync,
+                        book_title=book_title_sync, language=rag_language_sync, grade=rag_grade_sync, board=rag_board_sync,
                     )
                 else:
                     messages = _inject_no_rag_results(messages, payload.message, language=rag_language_sync)
