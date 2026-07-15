@@ -299,9 +299,30 @@ async def _build_rag_context(
 def _inject_rag(messages: list[dict], question: str, rag_text: str) -> list[dict]:
     """Replace the last user message with a RAG-enriched version."""
     enriched_question = (
-        "Use the following excerpts from the user's selected documents to answer accurately.\n"
-        "If the answer is not in the excerpts, say so and answer from general knowledge.\n\n"
+        "The user has selected specific document(s) from their Knowledge Vault. "
+        "Answer ONLY using the excerpts below — do NOT use any external knowledge, training data, or information outside these excerpts.\n"
+        "If the answer cannot be found in the excerpts, respond with: "
+        "'I couldn't find information about that in your selected document(s). "
+        "Try rephrasing your question or selecting a different file.'\n\n"
         f"--- DOCUMENT EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
+        f"Question: {question}"
+    )
+    updated = list(messages)
+    if updated and updated[-1]["role"] == "user":
+        updated[-1] = {"role": "user", "content": enriched_question}
+    else:
+        updated.append({"role": "user", "content": enriched_question})
+    return updated
+
+
+def _inject_no_rag_results(messages: list[dict], question: str) -> list[dict]:
+    """Inject a constraint when files are selected but no relevant chunks were found."""
+    enriched_question = (
+        "The user has selected specific document(s) from their Knowledge Vault, "
+        "but no relevant content was found in those documents for this query.\n"
+        "Do NOT answer from your own knowledge. Respond with: "
+        "'I couldn't find information about that in your selected document(s). "
+        "Try rephrasing your question or selecting a different file.'\n\n"
         f"Question: {question}"
     )
     updated = list(messages)
@@ -408,8 +429,10 @@ def _inject_library_rag(messages: list[dict], question: str, rag_text: str, book
     """Replace the last user message with library-book-RAG-enriched version."""
     enriched_question = (
         f"The user is studying from the book '{book_title}' in the public library.\n"
-        "Use the following excerpts from this book to answer accurately.\n"
-        "If the answer is not in the excerpts, say so and answer from general knowledge.\n\n"
+        "Answer ONLY using the excerpts from this book below — do NOT use any external knowledge or training data outside these excerpts.\n"
+        "If the answer cannot be found in the excerpts, respond with: "
+        f"'I couldn't find information about that in \"{book_title}\". "
+        "Try rephrasing your question or check a different section of the book.'\n\n"
         f"--- BOOK EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
         f"Question: {question}"
     )
@@ -744,6 +767,8 @@ async def send_message_stream(
                 )
                 if rag_text:
                     messages = _inject_rag(messages, payload.message, rag_text)
+                else:
+                    messages = _inject_no_rag_results(messages, payload.message)
         except Exception as e:
             print(f"[StreamChat] RAG context build failed: {e}", flush=True)
 
@@ -779,6 +804,8 @@ async def send_message_stream(
                         messages, payload.message, lib_rag_text,
                         book_title=book_title,
                     )
+                else:
+                    messages = _inject_no_rag_results(messages, payload.message)
         except Exception as e:
             print(f"[StreamChat] Library RAG context build failed: {e}", flush=True)
 
@@ -789,6 +816,25 @@ async def send_message_stream(
 
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id)
+
+    # If no files are selected this turn, but a previous assistant message in history
+    # carried a document-only constraint, the model may repeat "I couldn't find
+    # information in your selected document(s)" by following the conversation pattern.
+    # Inject a brief override into the current user message to break out of that pattern.
+    if not has_files and messages:
+        prior_assistant_text = " ".join(
+            m.get("content", "") for m in messages[:-1] if m.get("role") == "assistant"
+        )
+        if "selected document" in prior_assistant_text or "couldn't find information" in prior_assistant_text:
+            if messages[-1]["role"] == "user":
+                messages[-1] = {
+                    "role": "user",
+                    "content": (
+                        messages[-1]["content"]
+                        + "\n\n[No files are selected for this message. "
+                        "Ignore any previous document-only constraints and answer freely from your general knowledge.]"
+                    ),
+                }
 
     # --- Instant greeting responses (no LLM call, zero tokens) ---
     canned = _get_canned_response(payload.message)
@@ -956,6 +1002,8 @@ async def send_message(
                 )
                 if rag_text:
                     messages = _inject_rag(messages, payload.message, rag_text)
+                else:
+                    messages = _inject_no_rag_results(messages, payload.message)
         except Exception as e:
             print(f"[SendMessage] RAG context build failed: {e}", flush=True)
 
@@ -988,6 +1036,8 @@ async def send_message(
                         messages, payload.message, lib_rag_text_sync,
                         book_title=book_title_sync,
                     )
+                else:
+                    messages = _inject_no_rag_results(messages, payload.message)
         except Exception as e:
             print(f"[SendMessage] Library RAG context build failed: {e}", flush=True)
 
@@ -998,6 +1048,22 @@ async def send_message(
 
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id_sync)
+
+    # Break out of any lingering document-only constraint from a previous turn
+    if not has_files and messages:
+        prior_assistant_text = " ".join(
+            m.get("content", "") for m in messages[:-1] if m.get("role") == "assistant"
+        )
+        if "selected document" in prior_assistant_text or "couldn't find information" in prior_assistant_text:
+            if messages[-1]["role"] == "user":
+                messages[-1] = {
+                    "role": "user",
+                    "content": (
+                        messages[-1]["content"]
+                        + "\n\n[No files are selected for this message. "
+                        "Ignore any previous document-only constraints and answer freely from your general knowledge.]"
+                    ),
+                }
 
     response_text = await ai.chat(messages=messages, context=payload.context, has_files=has_files)
 

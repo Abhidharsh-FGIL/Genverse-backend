@@ -851,10 +851,11 @@ class AIService:
             "   - Substantive academic questions → Detailed, structured response with examples.\n"
             "   NEVER pad short inputs with unsolicited examples, subject lists, exam tips, or motivational filler. "
             "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default.\n"
-            "9. NEVER mention the student's grade level in your response. Do NOT say things like "
-            "'As a Grade 5 student…', 'For your grade level…', 'Since you are in Grade 8…'. "
-            "Just answer naturally — the grade context shapes your tone and depth internally, "
-            "but should never appear in the output."
+            "9. NEVER mention the student's grade level or curriculum board in your response. "
+            "Do NOT say things like 'As a Grade 5 student…', 'For your grade level…', "
+            "'Since you are in Grade 8…', 'According to CBSE…', 'In the ICSE curriculum…', "
+            "'Based on your board…'. Just answer naturally — the grade and board context shapes "
+            "your tone, depth, and curriculum focus internally, but must never appear in the output."
         )
         if context_str:
             system_prompt += f"\n{context_str}"
@@ -1327,10 +1328,11 @@ class AIService:
             "   - Substantive academic questions → Detailed, structured response with examples.\n"
             "   NEVER pad short inputs with unsolicited examples, subject lists, exam tips, or motivational filler. "
             "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default.\n"
-            "9. NEVER mention the student's grade level in your response. Do NOT say things like "
-            "'As a Grade 5 student…', 'For your grade level…', 'Since you are in Grade 8…'. "
-            "Just answer naturally — the grade context shapes your tone and depth internally, "
-            "but should never appear in the output."
+            "9. NEVER mention the student's grade level or curriculum board in your response. "
+            "Do NOT say things like 'As a Grade 5 student…', 'For your grade level…', "
+            "'Since you are in Grade 8…', 'According to CBSE…', 'In the ICSE curriculum…', "
+            "'Based on your board…'. Just answer naturally — the grade and board context shapes "
+            "your tone, depth, and curriculum focus internally, but must never appear in the output."
         )
         if context_str:
             system_prompt += f"\n{context_str}"
@@ -5410,7 +5412,7 @@ Return ONLY this JSON structure:
         return "\n".join(o)
 
     async def _generate_infographic_svg_fallback(
-        self, topic: str, content: str, grade: int | None, language: str = "English"
+        self, topic: str, content: str, grade: int | None, language: str = "English",
     ) -> dict | None:
         """Generate a structured infographic via the chat model when image generation fails."""
         grade_str = f"grade {grade}" if grade else "general"
@@ -5736,8 +5738,6 @@ Return ONLY valid JSON (no markdown):
             svg_result = {}
 
         # ── Step 3: attempt image model with tight spelling enforcement ───────
-        # Helper: spell out each word character-by-character for proper nouns
-        # (>5 chars starting with uppercase) to help the image model render them.
         def _spell_word(w: str) -> str:
             if len(w) > 5 and w[0].isupper():
                 return f"{w} [{'-'.join(w.upper())}]"
@@ -5745,7 +5745,6 @@ Return ONLY valid JSON (no markdown):
 
         title_spelled = " ".join(_spell_word(w) for w in title_text.split())
 
-        # Build a full text registry the image model must copy verbatim
         text_registry: list[str] = [f'TITLE: "{title_text}"']
         sections_detail = ""
         for i, s in enumerate(sections):
@@ -5847,7 +5846,6 @@ Return ONLY valid JSON (no markdown):
                     break
 
         # Image model unavailable or all attempts failed — return the pre-built SVG
-        # (text rendered by SVG engine, spelling is always exact)
         if svg_result:
             print("[Infographic] returning accurate SVG", flush=True)
             return svg_result
@@ -6089,6 +6087,10 @@ Return ONLY valid JSON (no markdown):
     # ------------------------------------------------------------------
     # Single-page OCR via Gemini vision
     # ------------------------------------------------------------------
+    # Ordered list of models to try for vision OCR — first one that succeeds wins.
+    # gemini-2.0-flash is the guaranteed multimodal fallback.
+    _OCR_MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-1.5-flash"]
+
     async def _ocr_single_image(
         self, image_data: bytes, language: str, page_label: str = "",
     ) -> str:
@@ -6096,19 +6098,31 @@ Return ONLY valid JSON (no markdown):
         import google.generativeai as genai
         api_key = settings.GEMINI_API_KEY or settings.GOOGLE_GEMINI_API_KEY
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(settings.AI_PRIMARY_MODEL)
 
         lang_hint = f"The text may be in {language} language. " if language != "en" else ""
         prompt = f"{lang_hint}{self._OCR_PROMPT}"
 
-        resp = await asyncio.to_thread(
-            model.generate_content,
-            [prompt, {"mime_type": "image/jpeg", "data": image_data}],
-        )
-        text = resp.text or ""
-        if page_label:
-            print(f"[OCR] {page_label}: extracted {len(text)} chars")
-        return text
+        # Try the configured primary model first; fall back to known vision-capable models.
+        candidates = [settings.AI_PRIMARY_MODEL] + [
+            m for m in self._OCR_MODEL_CANDIDATES if m != settings.AI_PRIMARY_MODEL
+        ]
+        for model_name in candidates:
+            try:
+                model = genai.GenerativeModel(model_name)
+                resp = await asyncio.to_thread(
+                    model.generate_content,
+                    [prompt, {"mime_type": "image/jpeg", "data": image_data}],
+                )
+                text = resp.text or ""
+                if page_label:
+                    print(f"[OCR] {page_label} ({model_name}): extracted {len(text)} chars")
+                return text
+            except Exception as exc:
+                print(f"[OCR] {page_label} model={model_name} failed: {exc}")
+                continue
+
+        print(f"[OCR] {page_label}: all vision models failed, returning empty")
+        return ""
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -6154,73 +6168,66 @@ Return ONLY valid JSON (no markdown):
                     print(f"[OCR] Native PDF extraction failed: {e}")
                     native_pages = ["" for _ in range(page_count)]
 
-                # Pages with very little native text are likely image-heavy (diagrams,
-                # scanned figures, equations rendered as images). Run vision OCR on those.
-                _PER_PAGE_TEXT_THRESHOLD = 80  # chars
+                # Pages with very little native text are likely scanned / image-heavy.
+                # Threshold is intentionally high (300 chars ≈ 2-3 real sentences) so
+                # that watermark-only text ("Downloaded from studiestoday.com" ≈ 40 chars)
+                # never passes as "real content" and always triggers vision OCR.
+                _PER_PAGE_TEXT_THRESHOLD = 300  # chars
                 pages_needing_ocr = [
                     i for i, t in enumerate(native_pages) if len(t.strip()) < _PER_PAGE_TEXT_THRESHOLD
                 ]
 
-                # If every page has plenty of native text, return immediately (fastest path)
-                if not pages_needing_ocr:
+                # If every page has plenty of native text, return immediately (fastest path).
+                # Also guard against the "watermarks only" case: if the entire document
+                # yields fewer than 300 chars per page on average, force OCR regardless.
+                avg_chars_per_page = total_native_chars / page_count if page_count else 0
+                if not pages_needing_ocr and avg_chars_per_page >= _PER_PAGE_TEXT_THRESHOLD:
                     merged = "\n\n---\n\n".join(
                         f"**Page {i+1}:**\n\n{t}" for i, t in enumerate(native_pages) if t.strip()
                     )
                     print(f"[OCR] PDF fully covered by native text ({len(merged)} chars), skipping OCR")
                     return merged
+                elif not pages_needing_ocr:
+                    # Every page passed the per-page check individually, but overall
+                    # average is suspiciously low — likely all watermarks.  Force all pages.
+                    print(f"[OCR] Avg {avg_chars_per_page:.0f} chars/page — likely watermarks only, forcing full OCR")
+                    pages_needing_ocr = list(range(page_count))
 
                 print(f"[OCR] {len(pages_needing_ocr)}/{page_count} pages need vision OCR for images/diagrams")
 
-                # Render only the pages that need OCR (image-heavy / scanned pages)
-                from pdf2image import convert_from_path
-                import shutil, sys
-                poppler_path = None
-                if sys.platform.startswith("linux") or sys.platform == "darwin":
-                    for candidate in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]:
-                        if shutil.which("pdfinfo", path=candidate):
-                            poppler_path = candidate
-                            break
-                kwargs = {"poppler_path": poppler_path} if poppler_path else {}
-
-                # Render each needed page individually (1-indexed for pdf2image)
+                # Render pages using PyMuPDF (fitz) — no poppler needed, already installed.
+                import fitz as _fitz  # PyMuPDF
                 import io, tempfile, os
                 ocr_pages_text: dict[int, str] = {}
                 tmp_dir = tempfile.mkdtemp(prefix="ocr_pages_")
                 try:
                     detected_lang = None
                     page_data_list: list[tuple[int, bytes]] = []
+                    fitz_doc = _fitz.open(file_path)
                     for page_idx in pages_needing_ocr:
                         try:
-                            page_images = await asyncio.to_thread(
-                                convert_from_path,
-                                file_path,
-                                first_page=page_idx + 1,
-                                last_page=page_idx + 1,
-                                **kwargs,
-                            )
+                            fitz_page = fitz_doc[page_idx]
+                            # 2× zoom → ~144 DPI, good balance of quality vs size
+                            mat = _fitz.Matrix(2, 2)
+                            pix = fitz_page.get_pixmap(matrix=mat)
+                            jpeg_bytes = pix.tobytes("jpeg")
                         except Exception as e:
-                            print(f"[OCR] Failed to render page {page_idx + 1}: {e}")
+                            print(f"[OCR] Failed to render page {page_idx + 1} with PyMuPDF: {e}")
                             continue
-                        if not page_images:
-                            continue
-                        pil_img = page_images[0]
+
                         page_path = os.path.join(tmp_dir, f"page_{page_idx}.jpg")
-                        pil_img.save(page_path, "JPEG")
+                        with open(page_path, "wb") as f:
+                            f.write(jpeg_bytes)
 
                         # Detect language from first OCR'd page
                         if detected_lang is None:
-                            buf = io.BytesIO()
-                            pil_img.save(buf, format="JPEG")
-                            detected_lang = await self._detect_image_language(buf.getvalue())
+                            detected_lang = await self._detect_image_language(jpeg_bytes)
 
                         preprocessed = await asyncio.to_thread(self._preprocess_image, page_path)
-                        if preprocessed:
-                            page_data_list.append((page_idx, preprocessed))
-                        else:
-                            buf = io.BytesIO()
-                            pil_img.save(buf, format="JPEG")
-                            page_data_list.append((page_idx, buf.getvalue()))
+                        page_data_list.append((page_idx, preprocessed if preprocessed else jpeg_bytes))
+                    fitz_doc.close()
                 finally:
+                    import shutil
                     shutil.rmtree(tmp_dir, ignore_errors=True)
 
                 effective_lang = detected_lang if (detected_lang and language == "en") else language
