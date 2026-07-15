@@ -332,7 +332,8 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
                 ]
                 if qtype == "mcq":
                     for k, opt in enumerate(q.get("options") or []):
-                        blk.append(Paragraph(f"{chr(65 + k)})\u2002{_pdf_text(opt)}", S["aq_opt"]))
+                        opt_text = re.sub(r'^[A-Da-d][)\.]\s*', '', str(opt))
+                        blk.append(Paragraph(f"{chr(65 + k)})\u2002{_pdf_text(opt_text)}", S["aq_opt"]))
                 if q.get("answer"):
                     blk.append(Paragraph(f"Answer:\u2002{_pdf_text(q['answer'])}", S["aq_ans"]))
                 story.append(KeepTogether(blk))
@@ -667,7 +668,8 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
                 _sp(doc, f"{j + 1}. {q.get('question', '')}", bold=True, size=12, after=4)
                 if qtype == "mcq":
                     for k, opt in enumerate(q.get("options") or []):
-                        _sp(doc, f"   {chr(65 + k)}) {opt}", size=11, after=2)
+                        opt_text = re.sub(r'^[A-Da-d][)\.]\s*', '', str(opt))
+                        _sp(doc, f"   {chr(65 + k)}) {opt_text}", size=11, after=2)
                 if q.get("answer"):
                     _sp(doc, f"Answer: {q['answer']}", italic=True, size=10,
                         color=(85, 85, 85), after=8)

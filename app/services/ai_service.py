@@ -2152,18 +2152,16 @@ Return ONLY valid JSON in this exact structure:
 
         def _build_cover_prompt() -> str:
             return (
-                f"Create a professional, visually stunning book cover image for an educational eBook.\n\n"
-                f"Book Title: {title}\n"
+                f"Create a professional, visually stunning cover art illustration for an educational eBook.\n\n"
                 f"Subject: {subj_str}\n"
                 f"Grade Level: {grade_str}\n\n"
                 "Design requirements:\n"
-                "- Clean, modern book cover design\n"
-                "- Bold, prominent title text at the center\n"
-                "- Use vibrant, appealing colors related to the subject\n"
-                "- Include relevant icons or illustrations related to the topic\n"
+                "- Pure visual illustration — NO text, NO words, NO letters, NO title in the image\n"
+                "- Rich, vibrant colors and icons directly related to the subject matter\n"
+                "- Include relevant subject-specific illustrations, diagrams, icons, or symbols\n"
                 "- Professional educational style suitable for students\n"
-                "- No blank or empty spaces — fill with relevant visual elements\n"
-                "- The image should look like a real book cover"
+                "- High information density — fill the frame with relevant visual elements\n"
+                "- Think book cover art: striking, colourful, thematic — no text overlay"
             )
 
         def _build_chapter_prompt(ch: dict, img_idx: int) -> str:
@@ -2675,8 +2673,8 @@ Return ONLY valid JSON (no markdown fences):
         type_instructions = []
         json_fields = []
         if any(q in q_types_lower for q in ["mcq", "multiplechoice"]):
-            type_instructions.append('- For MCQ: include in "mcq_questions" with "chapter_number", "question", "options" (4 choices), "answer" (correct option text).')
-            json_fields.append('    "mcq_questions": [{ "chapter_number": 1, "question": "...", "options": ["A", "B", "C", "D"], "answer": "..." }]')
+            type_instructions.append('- For MCQ: include in "mcq_questions" with "chapter_number", "question", "options" (4 plain text choices, NO letter prefixes like "A)" or "1."), "answer" (exact option text, no prefix).')
+            json_fields.append('    "mcq_questions": [{ "chapter_number": 1, "question": "...", "options": ["Dependency Injection", "Data Validation", "Routing", "Middleware"], "answer": "Dependency Injection" }]')
         if any(q in q_types_lower for q in ["fillinblank", "fill_in_blank", "fillintheblank"]):
             type_instructions.append('- For Fill in Blank: include in "fill_in_blank_questions" with "chapter_number", "question" (with ___), "answer".')
             json_fields.append('    "fill_in_blank_questions": [{ "chapter_number": 1, "question": "The ___ process...", "answer": "..." }]')
@@ -2689,8 +2687,8 @@ Return ONLY valid JSON (no markdown fences):
 
         # If no types matched (e.g. empty or unknown), default to MCQ so the page is never blank
         if not json_fields:
-            type_instructions.append('- For MCQ: include in "mcq_questions" with "chapter_number", "question", "options" (4 choices), "answer" (correct option text).')
-            json_fields.append('    "mcq_questions": [{ "chapter_number": 1, "question": "...", "options": ["A", "B", "C", "D"], "answer": "..." }]')
+            type_instructions.append('- For MCQ: include in "mcq_questions" with "chapter_number", "question", "options" (4 plain text choices, NO letter prefixes like "A)" or "1."), "answer" (exact option text, no prefix).')
+            json_fields.append('    "mcq_questions": [{ "chapter_number": 1, "question": "...", "options": ["Dependency Injection", "Data Validation", "Routing", "Middleware"], "answer": "Dependency Injection" }]')
 
         # Build chapter summaries for context
         chapter_context = "\n".join(
