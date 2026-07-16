@@ -212,6 +212,76 @@ async def _collect_chunk_ids_recursive(db: AsyncSession, folder_id: uuid.UUID) -
 
 # ── Files (one per subject inside a grade folder) ───────────────────────────
 
+@router.get("/files/by-class")
+async def list_files_by_class(
+    grade: str = Query(..., description="Grade number (e.g. '5', '10')"),
+    board: str = Query(..., description="Board name (e.g. 'CBSE', 'ICSE')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return processed public library files matching a class's grade and board.
+
+    Traverses the two-level folder hierarchy: Board → Grade.
+    Board and grade names are matched case-insensitively and by substring.
+    """
+    board_upper = board.strip().upper()
+    grade_str = str(grade).strip()
+
+    # Step 1: find the matching board folder (parent_id IS NULL)
+    boards_result = await db.execute(
+        select(PublicFolder).where(PublicFolder.parent_id == None)  # noqa: E711
+    )
+    board_folder = None
+    for bf in boards_result.scalars().all():
+        if board_upper in bf.name.upper() or bf.name.upper() in board_upper:
+            board_folder = bf
+            break
+
+    if not board_folder:
+        return {"files": [], "board_folder": None, "grade_folder": None}
+
+    # Step 2: find the matching grade folder under this board
+    grades_result = await db.execute(
+        select(PublicFolder).where(PublicFolder.parent_id == board_folder.id)
+    )
+    grade_folder = None
+    for gf in grades_result.scalars().all():
+        name_clean = gf.name.strip().lower().replace("grade", "").strip()
+        if name_clean == grade_str or gf.name.strip() == grade_str:
+            grade_folder = gf
+            break
+
+    if not grade_folder:
+        return {
+            "files": [],
+            "board_folder": {"id": str(board_folder.id), "name": board_folder.name},
+            "grade_folder": None,
+        }
+
+    # Step 3: return processed files in this grade folder
+    files_result = await db.execute(
+        select(PublicFile)
+        .where(PublicFile.folder_id == grade_folder.id, PublicFile.is_processed == True)  # noqa: E712
+        .order_by(PublicFile.title)
+    )
+    files = files_result.scalars().all()
+
+    return {
+        "files": [
+            {
+                "id": str(f.id),
+                "title": f.title,
+                "subject": f.subject,
+                "file_type": f.file_type,
+                "file_size_mb": f.file_size_mb,
+                "chunks_embedded": f.chunks_embedded,
+            }
+            for f in files
+        ],
+        "board_folder": {"id": str(board_folder.id), "name": board_folder.name},
+        "grade_folder": {"id": str(grade_folder.id), "name": grade_folder.name},
+    }
+
+
 @router.post("/files", status_code=status.HTTP_201_CREATED)
 async def upload_file(
     file: UploadFile = File(...),
@@ -387,6 +457,29 @@ async def get_task_status(task_id: str):
     if result.ready():
         response["result"] = result.result if result.successful() else str(result.result)
     return response
+
+
+@router.get("/files/{file_id}/text")
+async def get_public_file_text(
+    file_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the full text of a processed public library file by joining its chunks in order."""
+    fid = uuid.UUID(file_id)
+    pub_file = await db.get(PublicFile, fid)
+    if not pub_file:
+        raise HTTPException(status_code=404, detail="File not found")
+    if not pub_file.is_processed:
+        raise HTTPException(status_code=202, detail="File is still being processed")
+
+    chunks_result = await db.execute(
+        select(PublicFileChunk)
+        .where(PublicFileChunk.file_id == fid)
+        .order_by(PublicFileChunk.chunk_order)
+    )
+    chunks = chunks_result.scalars().all()
+    full_text = "\n\n".join(c.chunk_text for c in chunks)
+    return {"text": full_text, "title": pub_file.title, "subject": pub_file.subject}
 
 
 @router.get("/files/{file_id}/status")
