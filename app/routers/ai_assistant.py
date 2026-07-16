@@ -361,12 +361,18 @@ def _inject_no_rag_results(messages: list[dict], question: str, language: str | 
     return updated
 
 
-def _inject_inline_docs(messages: list[dict], question: str, inline_docs: list[dict]) -> list[dict]:
+def _inject_inline_docs(
+    messages: list[dict],
+    question: str,
+    inline_docs: list[dict],
+    grade: str | None = None,
+    board: str | None = None,
+) -> list[dict]:
     """Inject device-attached file content into the last user message.
 
-    inline_docs is a list of {"filename": str, "text": str} dicts sent by the
-    frontend when the user attaches a file from their device (not the vault).
-    The original question is preserved for display; only the AI sees the file content.
+    The model is strictly constrained to answer ONLY from the attached file(s).
+    If the requested information is not present in the file it must say so clearly
+    rather than drawing on its general knowledge.
     """
     doc_block = "\n\n".join(
         f"[ATTACHED FILE: {doc['filename']}]\n{doc['text']}\n[END OF FILE]"
@@ -376,9 +382,25 @@ def _inject_inline_docs(messages: list[dict], question: str, inline_docs: list[d
     if not doc_block:
         return messages
 
+    filenames = ", ".join(
+        f'"{doc["filename"]}"' for doc in inline_docs if doc.get("filename")
+    )
+
+    calibration = ""
+    if grade and board:
+        calibration = (
+            f"\nIMPORTANT: Calibrate your explanation for a Grade {grade} / {board} student "
+            f"— use age-appropriate language and relatable examples from the document.\n"
+        )
+
     enriched = (
-        "The user has attached the following file(s). "
-        "Use the content to answer their question accurately.\n\n"
+        f"The user has uploaded the following file(s): {filenames}.\n"
+        "STRICT RULE: Answer the question ONLY using information from the attached file(s) above. "
+        "Do NOT use your general knowledge or training data. "
+        "If the answer to the question is not present in the file, respond with exactly: "
+        f'"This information is not available in the uploaded file ({filenames})." '
+        "Do not guess, infer, or supplement with outside knowledge."
+        f"{calibration}\n\n"
         f"{doc_block}\n\n"
         f"Question: {question}"
     )
@@ -846,7 +868,7 @@ async def send_message_stream(
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
     if inline_docs:
-        messages = _inject_inline_docs(messages, payload.message, inline_docs)
+        messages = _inject_inline_docs(messages, payload.message, inline_docs, grade=rag_grade, board=rag_board)
 
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id)
@@ -1081,7 +1103,7 @@ async def send_message(
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
     if inline_docs:
-        messages = _inject_inline_docs(messages, payload.message, inline_docs)
+        messages = _inject_inline_docs(messages, payload.message, inline_docs, grade=rag_grade_sync, board=rag_board_sync)
 
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id_sync)
