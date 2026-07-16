@@ -394,6 +394,13 @@ async def vault_events_stream(token: str = Query(..., description="Bearer JWT (E
     )
 
 
+# Inline attachment limits — kept intentionally lower than vault upload limits
+# so the AI assistant stays fast. Large files should go to the Knowledge Vault.
+_INLINE_MAX_BYTES = 8 * 1024 * 1024   # 8 MB hard cap
+_INLINE_MAX_WORDS = 6_000             # truncate extracted text after this many words
+_INLINE_MAX_PDF_PAGES = 15            # only process first N pages inline
+
+
 @router.post("/extract-text-inline")
 async def extract_text_inline(
     file: UploadFile = File(...),
@@ -403,29 +410,48 @@ async def extract_text_inline(
 
     Used by the AI assistant 'From Device' attachment feature so users can ask
     questions about a document without it being stored in the Knowledge Vault.
+    Files above 8 MB or beyond 15 PDF pages are rejected / truncated to keep
+    extraction fast. Large files should use the Knowledge Vault instead.
     """
     import tempfile
     import os
     from pathlib import Path as _Path
 
+    content = await file.read()
+    if len(content) > _INLINE_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File is too large for direct AI chat "
+                f"({len(content) / (1024*1024):.1f} MB — limit is 8 MB). "
+                "Upload it to your Knowledge Vault and select it from there instead."
+            ),
+        )
+
     ai = get_ai_service()
     suffix = _Path(file.filename or "file").suffix.lower() or ".tmp"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        text = await ai.extract_text_from_file(tmp_path)
+        text = await ai.extract_text_from_file(tmp_path, inline_page_limit=_INLINE_MAX_PDF_PAGES)
     finally:
         os.unlink(tmp_path)
 
-    word_count = len(text.split()) if text else 0
+    truncated = False
+    words = text.split() if text else []
+    if len(words) > _INLINE_MAX_WORDS:
+        text = " ".join(words[:_INLINE_MAX_WORDS])
+        truncated = True
+
     return {
         "text": text or "",
-        "word_count": word_count,
+        "word_count": len(words[:_INLINE_MAX_WORDS]),
         "filename": file.filename,
+        "truncated": truncated,
+        "page_limit_hit": not text and bool(content),  # True when PDF was too long
     }
 
 

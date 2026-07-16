@@ -6020,7 +6020,7 @@ Return ONLY valid JSON (no markdown):
     )
 
     _MAX_PDF_PAGES = 50
-    _PDF_PARALLEL_WORKERS = 4
+    _PDF_PARALLEL_WORKERS = 8
 
     # ------------------------------------------------------------------
     # Image preprocessing (OpenCV) — improves OCR on scanned/handwritten
@@ -6125,7 +6125,9 @@ Return ONLY valid JSON (no markdown):
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
-    async def extract_text_from_file(self, file_path: str, language: str = "en") -> str:
+    async def extract_text_from_file(
+        self, file_path: str, language: str = "en", inline_page_limit: int | None = None
+    ) -> str:
         """Extract text from a file (PDF, DOCX, image, etc.).
 
         Implements the legacy GenVerse OCR pipeline:
@@ -6133,12 +6135,17 @@ Return ONLY valid JSON (no markdown):
         - Language auto-detection
         - Vision-based OCR via Gemini (works on scanned/handwritten docs)
         - Parallel page processing for multi-page PDFs
+
+        Args:
+            inline_page_limit: When set (inline AI chat use), overrides _MAX_PDF_PAGES
+                so only the first N pages are processed, keeping extraction fast.
         """
         path = Path(file_path)
         if not path.exists():
             return ""
 
         ext = path.suffix.lower()
+        effective_page_limit = inline_page_limit if inline_page_limit is not None else self._MAX_PDF_PAGES
         try:
             # ── PDF: try fast text-layer extraction first, OCR only as fallback ──
             if ext == ".pdf":
@@ -6147,14 +6154,17 @@ Return ONLY valid JSON (no markdown):
                 reader = PdfReader(file_path)
                 page_count = len(reader.pages)
 
-                if page_count > self._MAX_PDF_PAGES:
-                    print(f"[OCR] PDF has {page_count} pages (limit {self._MAX_PDF_PAGES}), skipping")
-                    return ""
+                if page_count > effective_page_limit:
+                    print(f"[OCR] PDF has {page_count} pages, processing first {effective_page_limit} only")
+                    page_count = effective_page_limit
+
+                # Slice to the pages we'll actually process
+                pages_to_process = list(reader.pages[:page_count])
 
                 # Fast path: native text-layer extraction (works for digital PDFs)
                 native_pages: list[str] = []
                 try:
-                    for i, page in enumerate(reader.pages):
+                    for i, page in enumerate(pages_to_process):
                         try:
                             t = page.extract_text() or ""
                         except Exception:
