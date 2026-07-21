@@ -1,8 +1,8 @@
 """
 Public Library — no authentication required.
 
-Two-level folder structure: Board → Grade.
-Files (one per subject) are uploaded into grade folders with a subject tag.
+Three-level folder structure: Board → Grade → Subject.
+Files (textbooks/notes) are uploaded into subject folders.
 Text extraction, semantic chunking, and FAISS embedding are processed in the
 background via Celery.
 
@@ -37,21 +37,27 @@ def _faiss() -> FAISSService:
 
 @router.post("/folders", status_code=status.HTTP_201_CREATED)
 async def create_folder(
-    name: str = Query(..., description="Folder name (e.g. 'CBSE', 'Grade 10')"),
-    parent_id: Optional[str] = Query(None, description="Parent folder ID. Omit for board (root), provide board ID for grade."),
-    folder_type: Optional[str] = Query(None, description="'board' for root folders, 'grade' for grade folders inside a board"),
+    name: str = Query(..., description="Folder name (e.g. 'CBSE', 'Grade 10', 'Mathematics')"),
+    parent_id: Optional[str] = Query(None, description="Parent folder ID. Omit for board (root)."),
+    folder_type: Optional[str] = Query(None, description="'board' | 'grade' | 'subject'. Auto-detected from depth if omitted."),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a Board or Grade folder. Only two levels allowed: Board (root) → Grade (child)."""
+    """Create a folder in the three-level hierarchy: Board (root) → Grade → Subject."""
     parsed_parent = uuid.UUID(parent_id) if parent_id else None
 
-    # Enforce two-level hierarchy
+    # Enforce three-level hierarchy: board → grade → subject (no deeper)
     if parsed_parent:
         parent = await db.get(PublicFolder, parsed_parent)
         if not parent:
             raise HTTPException(status_code=404, detail="Parent folder not found")
         if parent.parent_id is not None:
-            raise HTTPException(status_code=400, detail="Only two levels allowed: Board → Grade. Cannot nest deeper.")
+            # parent is already a grade (depth-2); check it's not itself a subject (depth-3)
+            grandparent = await db.get(PublicFolder, parent.parent_id)
+            if grandparent and grandparent.parent_id is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Only three levels allowed: Board → Grade → Subject. Cannot nest deeper.",
+                )
 
     # Check duplicate name under same parent
     existing = await db.execute(
@@ -63,9 +69,15 @@ async def create_folder(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail=f"Folder '{name}' already exists in this location")
 
-    # Auto-detect folder_type if not provided
+    # Auto-detect folder_type from depth if not provided
     if not folder_type:
-        folder_type = "grade" if parsed_parent else "board"
+        if not parsed_parent:
+            folder_type = "board"
+        else:
+            parent = parent if parsed_parent else None
+            if parent is None:
+                parent = await db.get(PublicFolder, parsed_parent)
+            folder_type = "subject" if parent and parent.parent_id else "grade"
 
     folder = PublicFolder(
         name=name,
@@ -220,8 +232,11 @@ async def list_files_by_class(
 ):
     """Return processed public library files matching a class's grade and board.
 
-    Traverses the two-level folder hierarchy: Board → Grade.
+    Traverses the three-level folder hierarchy: Board → Grade → Subject.
     Board and grade names are matched case-insensitively and by substring.
+    Returns all files across all subject folders under the matching grade,
+    each annotated with its subject folder name.
+    Falls back to files directly in the grade folder for backwards compatibility.
     """
     board_upper = board.strip().upper()
     grade_str = str(grade).strip()
@@ -257,26 +272,52 @@ async def list_files_by_class(
             "grade_folder": None,
         }
 
-    # Step 3: return processed files in this grade folder
-    files_result = await db.execute(
-        select(PublicFile)
-        .where(PublicFile.folder_id == grade_folder.id, PublicFile.is_processed == True)  # noqa: E712
-        .order_by(PublicFile.title)
+    # Step 3: find all subject folders under this grade
+    subjects_result = await db.execute(
+        select(PublicFolder).where(PublicFolder.parent_id == grade_folder.id).order_by(PublicFolder.name)
     )
-    files = files_result.scalars().all()
+    subject_folders = subjects_result.scalars().all()
 
-    return {
-        "files": [
-            {
+    all_files = []
+
+    if subject_folders:
+        # New 3-level structure: collect files from each subject folder
+        subject_ids = [sf.id for sf in subject_folders]
+        subject_map = {sf.id: sf.name for sf in subject_folders}
+
+        files_result = await db.execute(
+            select(PublicFile)
+            .where(PublicFile.folder_id.in_(subject_ids), PublicFile.is_processed == True)  # noqa: E712
+            .order_by(PublicFile.title)
+        )
+        for f in files_result.scalars().all():
+            all_files.append({
+                "id": str(f.id),
+                "title": f.title,
+                "subject": subject_map.get(f.folder_id, f.subject),
+                "file_type": f.file_type,
+                "file_size_mb": f.file_size_mb,
+                "chunks_embedded": f.chunks_embedded,
+            })
+    else:
+        # Fallback: old 2-level structure — files directly in grade folder
+        files_result = await db.execute(
+            select(PublicFile)
+            .where(PublicFile.folder_id == grade_folder.id, PublicFile.is_processed == True)  # noqa: E712
+            .order_by(PublicFile.title)
+        )
+        for f in files_result.scalars().all():
+            all_files.append({
                 "id": str(f.id),
                 "title": f.title,
                 "subject": f.subject,
                 "file_type": f.file_type,
                 "file_size_mb": f.file_size_mb,
                 "chunks_embedded": f.chunks_embedded,
-            }
-            for f in files
-        ],
+            })
+
+    return {
+        "files": all_files,
         "board_folder": {"id": str(board_folder.id), "name": board_folder.name},
         "grade_folder": {"id": str(grade_folder.id), "name": grade_folder.name},
     }
