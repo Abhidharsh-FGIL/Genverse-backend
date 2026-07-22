@@ -3651,6 +3651,34 @@ For example, if there are 10 questions total and Topic A has 60% weight, generat
             or f"Generate ALL question text, options, explanations, model answers, match pairs and any other content strictly in {language_label}. Do not mix languages. Even fixed/templated option sets (True/False, Assertion-Reason choices) MUST be translated into {language_label}. For Tamil specifically, use correct natural Tamil script — do NOT transliterate, do NOT mix English words. Proper nouns and standard scientific/mathematical symbols may remain in English."
         )
 
+        # Grade-band cognitive rigor calibration
+        grade_rigor_section = ""
+        if grade and grade >= 7:
+            if grade <= 9:
+                grade_rigor_section = """
+GRADE-BAND RIGOR (Grades 7–9 — Intermediate):
+You MUST go beyond simple recall. Every question must demand reasoning, not just memory retrieval.
+- MCQ: All four options must be plausible. The wrong options (distractors) must represent genuine misconceptions or near-correct answers that expose gaps in understanding — NOT obviously wrong choices.
+- Short/Long answer: Students must justify, explain the "why", or apply the concept to an unfamiliar context — not merely define or list.
+- Include scenario-based or data-based questions where students must interpret a situation and apply the concept.
+- At least one-third of questions should require multi-step thinking (e.g., chain two concepts, interpret a given scenario, identify cause-effect relationships).
+- Avoid questions answerable by copying a single sentence from the textbook. Test understanding, not text recall.
+"""
+            else:  # grades 10-12
+                grade_rigor_section = """
+GRADE-BAND RIGOR (Grades 10–12 — Advanced / Board Level):
+These students are preparing for board examinations and competitive assessments. Questions MUST be at that standard.
+- COGNITIVE DEPTH: Every question must demand Analysis, Evaluation, or Synthesis (upper Bloom's levels). Recall-only questions are unacceptable.
+- MCQ: Craft options that expose deep misconceptions. All distractors must be conceptually close — a student who only partially understands will pick the wrong one. Never use obviously false distractors.
+- SHORT ANSWER: Require students to connect two or more concepts, derive a result, or justify a conclusion with evidence. Model answers must show this reasoning chain.
+- LONG ANSWER: Frame as structured analytical tasks — compare and contrast, critically evaluate, argue a position with evidence, or solve a multi-step problem. Model answer must include a reasoning scaffold, not just a conclusion.
+- FILL-IN-THE-BLANK: Test precise conceptual vocabulary or a calculated value, not generic words.
+- TRUE/FALSE: Include nuanced statements where the answer depends on a specific condition or context — avoid black-and-white trivial facts.
+- MATCH: Use higher-order pairs (e.g., concept ↔ implication, formula ↔ application scenario) rather than simple term ↔ definition.
+- Difficulty MUST reflect board-exam or competitive-entrance-exam standard (CBSE Class 10–12, ICSE, JEE Foundation, NEET Foundation level as applicable).
+- Every MCQ's correct answer should require working through the problem, not just recognising a keyword.
+"""
+
         prompt = f"""Generate assignment questions for a Grade {grade} {subject} class.
 
 OUTPUT LANGUAGE — STRICT: {language_label}
@@ -3658,7 +3686,7 @@ OUTPUT LANGUAGE — STRICT: {language_label}
 
 Topic: {topic}
 {difficulty_instruction}
-{blooms_section}Question breakdown: {types_str}
+{blooms_section}{grade_rigor_section}Question breakdown: {types_str}
 {source_section}{lesson_plan_section}{rubric_section}{weightage_section}
 Return a JSON object with a "questions" array. Each question MUST follow this schema exactly:
 - type: one of "mcq", "fill-blank", "short-answer", "long-answer", "true-false", "match"
