@@ -54,6 +54,7 @@ async def _get_active_subscription(
         result = await db.execute(
             select(Subscription).where(
                 Subscription.org_id == org_id,
+                Subscription.workspace_type == "organization",
                 Subscription.status.in_(["active", "trialing"]),
             ).order_by(Subscription.updated_at.desc())
         )
@@ -65,7 +66,14 @@ async def _get_active_subscription(
                 Subscription.status.in_(["active", "trialing"]),
             ).order_by(Subscription.updated_at.desc())
         )
-    return result.scalars().first()
+    sub = result.scalars().first()
+    if sub:
+        plan_def = await db.scalar(
+            select(PlanDefinition).where(PlanDefinition.plan == sub.plan)
+        )
+        if plan_def:
+            sub.max_file_size_mb = plan_def.max_file_size_mb
+    return sub
 
 
 @router.get("", response_model=SubscriptionResponse)

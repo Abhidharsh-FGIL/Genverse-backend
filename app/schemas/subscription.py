@@ -14,6 +14,7 @@ class SubscriptionResponse(BaseModel):
     points_balance: int
     points_monthly_quota: int
     storage_limit_mb: int
+    max_file_size_mb: int = 5
     max_seats: Optional[int] = None
     trial_ends_at: Optional[datetime] = None
     current_period_start: Optional[datetime] = None
