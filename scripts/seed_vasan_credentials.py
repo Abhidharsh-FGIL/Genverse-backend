@@ -157,10 +157,11 @@ async def seed():
             # Org already exists — update name + config
             org = await db.scalar(select(Organization).where(Organization.id == org_id))
             if org:
-                org.name           = ORG["org_name"]
-                org.product_type   = ORG["product_type"]
-                org.has_genverse   = ORG["has_genverse"]
-                org.has_evaluation = ORG["has_evaluation"]
+                org.name             = ORG["org_name"]
+                org.product_type     = ORG["product_type"]
+                org.has_genverse     = ORG["has_genverse"]
+                org.has_evaluation   = ORG["has_evaluation"]
+                org.branding_enabled = True
                 print(f"  [update] org name → '{ORG['org_name']}'")
 
             sub = await db.scalar(
@@ -203,6 +204,7 @@ async def seed():
                 product_type=ORG["product_type"],
                 has_genverse=ORG["has_genverse"],
                 has_evaluation=ORG["has_evaluation"],
+                branding_enabled=True,
             ))
             await db.flush()
 
