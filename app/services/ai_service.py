@@ -3707,16 +3707,45 @@ Return ONLY valid JSON, no markdown fences.
 Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A","B","C","D"], "correctAnswer": 0, "points": 5, "explanation": "Because ..."}}, {{"type": "true-false", "text": "The earth is flat.", "correctAnswer": "False", "points": 2, "explanation": "The earth is an oblate spheroid."}}, {{"type": "short-answer", "text": "Explain photosynthesis.", "correctAnswer": "Photosynthesis is the process by which plants convert sunlight into energy.", "points": 5, "explanation": "Key concepts: light energy, chlorophyll, glucose production."}}, {{"type": "long-answer", "text": "Discuss the causes of World War I.", "correctAnswer": "World War I was caused by a combination of factors including militarism, alliances, imperialism, and nationalism...", "points": 10, "explanation": "Should cover at least 3 major causes with examples."}}, {{"type": "match", "text": "Match the following terms with their definitions.", "matchPairs": [{{"left": "Mitosis", "right": "Cell division"}}, {{"left": "Meiosis", "right": "Reproductive cell division"}}], "points": 10, "explanation": "Mitosis produces identical cells while meiosis produces gametes."}}]}}
 """
         try:
-            response = await self.chat([{"role": "user", "content": prompt}])
+            response = await self.chat(
+                [{"role": "user", "content": prompt}],
+                json_mode=True,
+            )
             cleaned = response.strip()
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
             parsed = json.loads(cleaned)
-            return parsed.get("questions", parsed) if isinstance(parsed, dict) else parsed
+            questions = parsed.get("questions", parsed) if isinstance(parsed, dict) else parsed
+            if not isinstance(questions, list):
+                return []
+            return [q for q in questions if self._is_valid_assignment_question(q)]
         except Exception:
             return []
+
+    @staticmethod
+    def _is_valid_assignment_question(question: Any) -> bool:
+        if not isinstance(question, dict):
+            return False
+        if not str(question.get("text") or "").strip():
+            return False
+        if question.get("type") == "mcq":
+            options = question.get("options")
+            if not isinstance(options, list) or len(options) != 4:
+                return False
+            if any(not str(opt or "").strip() for opt in options):
+                return False
+        elif question.get("type") == "match":
+            pairs = question.get("matchPairs")
+            if not isinstance(pairs, list) or len(pairs) < 2:
+                return False
+            if any(
+                not isinstance(p, dict) or not str(p.get("left") or "").strip() or not str(p.get("right") or "").strip()
+                for p in pairs
+            ):
+                return False
+        return True
 
     async def stream_playground(
         self,
