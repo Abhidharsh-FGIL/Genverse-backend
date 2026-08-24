@@ -788,6 +788,7 @@ class AIService:
         grade_context_instruction = None
         guard = None
         is_user_chat = context is not None or chat_settings is not None
+        language = (context or {}).get("language")
 
         if is_user_chat:
             from app.services.content_guard import ContentGuardService, GuardAction
@@ -797,7 +798,7 @@ class AIService:
                 or (context or {}).get("student_mode")
             )
             grade = (context or {}).get("grade")
-            guard = ContentGuardService(student_mode=student_mode, grade=grade)
+            guard = ContentGuardService(student_mode=student_mode, grade=grade, language=language)
 
             user_query = ""
             for m in reversed(messages):
@@ -866,7 +867,7 @@ class AIService:
 
         _conv = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
         _lang_tag = ""
-        _rlang = (context or {}).get("language")
+        _rlang = language
         if _rlang:
             _rlang_name = self._LANGUAGE_NAMES.get(_rlang.lower(), _rlang)
             if _rlang_name.lower() != "english":
@@ -962,7 +963,7 @@ class AIService:
                 print(f"[AIService] OpenAI chat fallback failed: {e}", flush=True)
 
         if response_text is None:
-            return "AI service is not configured or all providers failed. Please check your API keys."
+            return self.error_message("not_configured", language)
 
         # --- Content Guard: post-generation output check ---
         if guard is not None:
@@ -1280,7 +1281,8 @@ class AIService:
             or (context or {}).get("student_mode")
         )
         grade = (context or {}).get("grade")
-        guard = ContentGuardService(student_mode=student_mode, grade=grade)
+        _stream_language = (context or {}).get("language")
+        guard = ContentGuardService(student_mode=student_mode, grade=grade, language=_stream_language)
 
         user_query = ""
         for m in reversed(messages):
@@ -1341,7 +1343,7 @@ class AIService:
 
         _conv = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
         _lang_tag = ""
-        _rlang = (context or {}).get("language")
+        _rlang = _stream_language
         if _rlang:
             _rlang_name = self._LANGUAGE_NAMES.get(_rlang.lower(), _rlang)
             if _rlang_name.lower() != "english":
@@ -1417,7 +1419,7 @@ class AIService:
                             return
                     except Exception as e:
                         print(f"[AIService] OpenAI fallback failed: {e}", flush=True)
-                await _queue.put("AI service is temporarily unavailable. Please try again in a moment.")
+                await _queue.put(self.error_message("temporarily_unavailable", _stream_language))
             except asyncio.CancelledError:
                 pass
             except Exception as e:
@@ -2303,6 +2305,29 @@ Return ONLY valid JSON in this exact structure:
         "ar": "Arabic (عربي)",
         "pt": "Portuguese",
     }
+
+    # Fallback/error text shown when generation fails outright (bypasses the LLM,
+    # so it must be pre-translated rather than relying on the language-instruction prompt).
+    _ERROR_MESSAGES: dict[str, dict[str, str]] = {
+        "generation_failed": {
+            "en": "Sorry, I encountered an issue generating a response. Please try again.",
+            "ar": "عذرًا، واجهت مشكلة أثناء إنشاء الرد. يرجى المحاولة مرة أخرى.",
+        },
+        "not_configured": {
+            "en": "AI service is not configured or all providers failed. Please check your API keys.",
+            "ar": "خدمة الذكاء الاصطناعي غير مهيأة حاليًا أو فشلت جميع مزودي الخدمة. يرجى المحاولة لاحقًا.",
+        },
+        "temporarily_unavailable": {
+            "en": "AI service is temporarily unavailable. Please try again in a moment.",
+            "ar": "خدمة الذكاء الاصطناعي غير متاحة مؤقتًا. يرجى المحاولة مرة أخرى بعد قليل.",
+        },
+    }
+
+    @classmethod
+    def error_message(cls, key: str, language: str | None = None) -> str:
+        """Localized fallback text for failure paths that bypass the LLM entirely."""
+        entry = cls._ERROR_MESSAGES.get(key, cls._ERROR_MESSAGES["generation_failed"])
+        return entry.get((language or "en").lower(), entry["en"])
 
     # Maps language name → its writing script (used for strong script-enforcement instructions)
     _SCRIPT_MAP = {
@@ -4976,8 +5001,18 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             print(f"[AIService] Raw AI response (first 500 chars): {response[:500]}", flush=True)
             raise ValueError(f"Failed to generate evaluation paper: {e}")
 
+    def _enhancement_language_note(self, language: str | None) -> str:
+        """Language instruction appended to enhancement-generation prompts (follow-ups,
+        next steps, practice exercises) that call chat() without a context dict."""
+        if not language:
+            return ""
+        lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
+        if lang_name.lower() == "english":
+            return ""
+        return f"\n\nWrite your entire response in {lang_name}, using its native script.\n"
+
     async def generate_follow_up_questions(
-        self, user_message: str, ai_response: str, count: int = 4
+        self, user_message: str, ai_response: str, count: int = 4, language: str | None = None
     ) -> List[str]:
         """Generate questions that dive deeper into the same topic — clarifying or expanding the previous answer."""
         prompt = (
@@ -4993,6 +5028,7 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             f"AI responded: {ai_response[:1200]}\n\n"
             f"Return ONLY a JSON array of {count} question strings that go deeper into this specific topic. "
             'Example: ["Why did X happen?", "How exactly does Y work?", "What is the difference between X and Z?"]'
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -5009,7 +5045,7 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
         return []
 
     async def generate_next_steps(
-        self, user_message: str, ai_response: str, count: int = 4
+        self, user_message: str, ai_response: str, count: int = 4, language: str | None = None
     ) -> list[str]:
         """Generate actionable prompts that move the student forward — broader topics or direct actions."""
         prompt = (
@@ -5027,6 +5063,7 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             f"AI responded: {ai_response[:1200]}\n\n"
             f"Return ONLY a JSON array of {count} short action-oriented strings the student can send as their next message. "
             'Example: ["Summarize this in simple terms", "Give me 5 practice questions on this", "Compare X and Y"]'
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -5049,6 +5086,7 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
         count: int = 3,
         grade: int | None = None,
         difficulty: str = "medium",
+        language: str | None = None,
     ) -> list[dict]:
         """Generate quick practice exercises from a chat Q&A exchange.
 
@@ -5075,6 +5113,9 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             "- Questions must be directly based on the content discussed\n"
             f"- Generate exactly {count} exercises\n"
             "- Return ONLY the JSON array, no markdown fences or extra text"
+            "- The 'question' and 'answer'/'options' text must be written in the response language noted below; "
+            "keep JSON keys and the mcq answer letter (A/B/C/D) / true_false value ('True'/'False') exactly as specified"
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -5119,7 +5160,7 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 "suitable for students.\n"
             )
 
-        lang_map = {"en": "English", "hi": "Hindi", "ta": "Tamil"}
+        lang_map = {"en": "English", "hi": "Hindi", "ta": "Tamil", "ar": "Arabic"}
         lang_name = lang_map.get((language or "").lower())
         language_instruction = ""
         if lang_name and lang_name.lower() != "english":

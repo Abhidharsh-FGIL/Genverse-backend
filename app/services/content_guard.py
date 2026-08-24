@@ -111,36 +111,66 @@ OUTPUT_UNSAFE_PATTERNS: list[re.Pattern] = [
 # ---------------------------------------------------------------------------
 
 BLOCK_MESSAGES = {
-    "harmful": (
-        "I can’t help with that topic. This assistant is designed to help students with learning and school subjects. 📚\n\n"
-        "If you have a question about maths, science, history, or any topic you're studying, "
-        "I’ll be happy to help!"
-    ),
-
-    "sensitive": (
-        "That topic isn’t something I can discuss here. Let’s keep our conversation focused on learning. 😊\n\n"
-        "What subject or topic would you like help with?"
-    ),
+    "harmful": {
+        "en": (
+            "I can’t help with that topic. This assistant is designed to help students with learning and school subjects. 📚\n\n"
+            "If you have a question about maths, science, history, or any topic you're studying, "
+            "I’ll be happy to help!"
+        ),
+        "ar": (
+            "لا يمكنني المساعدة في هذا الموضوع. هذا المساعد مُصمم لمساعدة الطلاب في التعلم والمواد الدراسية. 📚\n\n"
+            "إذا كان لديك سؤال حول الرياضيات أو العلوم أو التاريخ أو أي موضوع تدرسه، يسعدني مساعدتك!"
+        ),
+    },
+    "sensitive": {
+        "en": (
+            "That topic isn’t something I can discuss here. Let’s keep our conversation focused on learning. 😊\n\n"
+            "What subject or topic would you like help with?"
+        ),
+        "ar": (
+            "هذا الموضوع ليس شيئًا يمكنني مناقشته هنا. لنُبقِ حديثنا مُركّزًا على التعلم. 😊\n\n"
+            "ما المادة أو الموضوع الذي تودّ المساعدة فيه؟"
+        ),
+    },
 }
 
 REDIRECT_MESSAGES = {
-    "non_educational": (
-        "Hey! That sounds interesting, but I'm your study buddy — I'm best at helping you "
-        "with learning and school stuff. Here's what I can do for you:\n\n"
-        "📚 **Explain any concept** — from any subject, at your level\n"
-        "✏️ **Help with homework** — walk through problems step by step\n"
-        "🧠 **Practice & revision** — create questions to test yourself\n"
-        "🔍 **Break down tough topics** — make hard things simple\n"
-        "🎯 **Exam prep** — tips, important questions, and quick revision\n\n"
-        "So, what are you studying today? I'm ready to help! 🚀"
-    ),
+    "non_educational": {
+        "en": (
+            "Hey! That sounds interesting, but I'm your study buddy — I'm best at helping you "
+            "with learning and school stuff. Here's what I can do for you:\n\n"
+            "📚 **Explain any concept** — from any subject, at your level\n"
+            "✏️ **Help with homework** — walk through problems step by step\n"
+            "🧠 **Practice & revision** — create questions to test yourself\n"
+            "🔍 **Break down tough topics** — make hard things simple\n"
+            "🎯 **Exam prep** — tips, important questions, and quick revision\n\n"
+            "So, what are you studying today? I'm ready to help! 🚀"
+        ),
+        "ar": (
+            "مرحبًا! يبدو هذا مثيرًا للاهتمام، لكنني رفيقك الدراسي — أنا هنا لمساعدتك في التعلم والمواد الدراسية. "
+            "إليك ما يمكنني فعله من أجلك:\n\n"
+            "📚 **شرح أي مفهوم** — من أي مادة، وبما يناسب مستواك\n"
+            "✏️ **المساعدة في الواجبات** — حل المسائل خطوة بخطوة\n"
+            "🧠 **التدريب والمراجعة** — إنشاء أسئلة لاختبار نفسك\n"
+            "🔍 **تبسيط المواضيع الصعبة** — جعل الأمور الصعبة سهلة\n"
+            "🎯 **التحضير للامتحانات** — نصائح وأسئلة مهمة ومراجعة سريعة\n\n"
+            "إذن، ماذا تدرس اليوم؟ أنا جاهز للمساعدة! 🚀"
+        ),
+    },
 }
 
-OUTPUT_REPLACEMENT_MESSAGE = (
-    "I generated a response, but upon review it contained content that isn't appropriate "
-    "for an educational setting. Let me try again with a better answer.\n\n"
-    "Could you rephrase your question? I'm here to help with your learning!"
-)
+OUTPUT_REPLACEMENT_MESSAGE = {
+    "en": (
+        "I generated a response, but upon review it contained content that isn't appropriate "
+        "for an educational setting. Let me try again with a better answer.\n\n"
+        "Could you rephrase your question? I'm here to help with your learning!"
+    ),
+    "ar": (
+        "لقد أنشأت ردًا، لكن عند المراجعة تبيّن أنه يحتوي على محتوى غير مناسب لبيئة تعليمية. "
+        "دعني أحاول مرة أخرى بإجابة أفضل.\n\n"
+        "هل يمكنك إعادة صياغة سؤالك؟ أنا هنا لمساعدتك في تعلّمك!"
+    ),
+}
 
 # ---------------------------------------------------------------------------
 # Grade-relevance prompt templates (injected into system prompt)
@@ -246,12 +276,17 @@ Respond with ONLY this JSON (no markdown, no explanation):
 class ContentGuardService:
     """Multi-stage content safety pipeline for the AI assistant."""
 
-    def __init__(self, student_mode: bool = False, grade: int | None = None):
+    def __init__(self, student_mode: bool = False, grade: int | None = None, language: str | None = None):
         self.student_mode = student_mode
         self.grade = grade
         self.grade_band = self._get_grade_band(grade) if grade else None
+        self.language = language
 
     # -- helpers ------------------------------------------------------------
+
+    def _localize(self, messages: dict[str, str]) -> str:
+        """Pick the message variant for self.language, defaulting to English."""
+        return messages.get((self.language or "en").lower(), messages["en"])
 
     @staticmethod
     def _get_grade_band(grade: int | None) -> str | None:
@@ -275,7 +310,7 @@ class ContentGuardService:
                 return GuardResult(
                     action=GuardAction.BLOCK,
                     category="harmful",
-                    message=BLOCK_MESSAGES["harmful"],
+                    message=self._localize(BLOCK_MESSAGES["harmful"]),
                     trigger=f"keyword: {m.group(0)[:60]}",
                 )
         for pat in SENSITIVE_PATTERNS:
@@ -284,7 +319,7 @@ class ContentGuardService:
                 return GuardResult(
                     action=GuardAction.BLOCK,
                     category="sensitive",
-                    message=BLOCK_MESSAGES["sensitive"],
+                    message=self._localize(BLOCK_MESSAGES["sensitive"]),
                     trigger=f"keyword: {m.group(0)[:60]}",
                 )
         return GuardResult(action=GuardAction.ALLOW, category="educational", message=None)
@@ -351,14 +386,14 @@ class ContentGuardService:
             if category == "harmful":
                 return GuardResult(
                     action=GuardAction.BLOCK, category="harmful",
-                    message=BLOCK_MESSAGES["harmful"],
+                    message=self._localize(BLOCK_MESSAGES["harmful"]),
                     confidence=confidence,
                     trigger=f"llm_classifier: {reason}",
                 )
             if category == "sensitive":
                 return GuardResult(
                     action=GuardAction.BLOCK, category="sensitive",
-                    message=BLOCK_MESSAGES["sensitive"],
+                    message=self._localize(BLOCK_MESSAGES["sensitive"]),
                     confidence=confidence,
                     trigger=f"llm_classifier: {reason}",
                 )
@@ -367,7 +402,7 @@ class ContentGuardService:
                     # Strict: hard redirect back to learning
                     return GuardResult(
                         action=GuardAction.REDIRECT, category="non_educational",
-                        message=REDIRECT_MESSAGES["non_educational"],
+                        message=self._localize(REDIRECT_MESSAGES["non_educational"]),
                         confidence=confidence,
                         trigger=f"llm_classifier: {reason}",
                     )
@@ -404,7 +439,7 @@ class ContentGuardService:
                 return GuardResult(
                     action=GuardAction.BLOCK,
                     category="output_unsafe",
-                    message=OUTPUT_REPLACEMENT_MESSAGE,
+                    message=self._localize(OUTPUT_REPLACEMENT_MESSAGE),
                     trigger=f"output_filter: {m.group(0)[:50]}",
                 )
         return GuardResult(action=GuardAction.ALLOW, category="educational", message=None)

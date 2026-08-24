@@ -300,7 +300,8 @@ def _lang_instruction(language: str | None) -> str:
     """Return a language instruction clause for RAG prompts."""
     if not language or language.lower() in ("en", "english"):
         return ""
-    return f" Respond in {language}."
+    lang_name = AIService._LANGUAGE_NAMES.get(language.lower(), language)
+    return f" Respond in {lang_name}."
 
 
 def _grade_calibration_note(grade: str | None, board: str | None) -> str:
@@ -367,6 +368,7 @@ def _inject_inline_docs(
     inline_docs: list[dict],
     grade: str | None = None,
     board: str | None = None,
+    language: str | None = None,
 ) -> list[dict]:
     """Inject device-attached file content into the last user message.
 
@@ -392,13 +394,15 @@ def _inject_inline_docs(
             f"\nIMPORTANT: Calibrate your explanation for a Grade {grade} / {board} student "
             f"— use age-appropriate language and relatable examples from the document.\n"
         )
+    lang_note = _lang_instruction(language)
 
     enriched = (
         f"The user has uploaded the following file(s): {filenames}.\n"
         "STRICT RULE: Answer the question ONLY using information from the attached file(s) above. "
         "Do NOT use your general knowledge or training data. "
         "If the answer to the question is not present in the file, respond with exactly: "
-        f'"This information is not available in the uploaded file ({filenames})." '
+        f'"This information is not available in the uploaded file ({filenames})."'
+        f"{lang_note} "
         "Do not guess, infer, or supplement with outside knowledge."
         f"{calibration}\n\n"
         f"{doc_block}\n\n"
@@ -868,7 +872,7 @@ async def send_message_stream(
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
     if inline_docs:
-        messages = _inject_inline_docs(messages, payload.message, inline_docs, grade=rag_grade, board=rag_board)
+        messages = _inject_inline_docs(messages, payload.message, inline_docs, grade=rag_grade, board=rag_board, language=rag_language)
 
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id)
@@ -893,7 +897,11 @@ async def send_message_stream(
                 }
 
     # --- Instant greeting responses (no LLM call, zero tokens) ---
-    canned = _get_canned_response(payload.message)
+    # Canned replies are English-only text — only use the fast path when the
+    # user's selected language is English (or unset); otherwise fall through
+    # to the LLM so the greeting reply honors the selected language (e.g. Arabic).
+    _canned_ok_language = not rag_language or rag_language.lower() in ("en", "english")
+    canned = _get_canned_response(payload.message) if _canned_ok_language else None
 
     async def event_stream():
         full_response = ""
@@ -916,7 +924,7 @@ async def send_message_stream(
                 traceback.print_exc()
                 # Send a user-visible error so the chat doesn't appear blank
                 if not full_response:
-                    error_msg = "Sorry, I encountered an issue generating a response. Please try again."
+                    error_msg = AIService.error_message("generation_failed", rag_language)
                     yield f"data: {error_msg}\n\n"
                     full_response = error_msg
 
@@ -1103,7 +1111,7 @@ async def send_message(
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
     if inline_docs:
-        messages = _inject_inline_docs(messages, payload.message, inline_docs, grade=rag_grade_sync, board=rag_board_sync)
+        messages = _inject_inline_docs(messages, payload.message, inline_docs, grade=rag_grade_sync, board=rag_board_sync, language=rag_language_sync)
 
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id_sync)
@@ -1248,6 +1256,7 @@ async def generate_follow_ups(
         user_message=payload.message,
         ai_response=payload.response,
         count=payload.count,
+        language=payload.language,
     )
     await _persist_enhancement(db, chat_id, "follow_ups", questions)
     return FollowUpResponse(questions=questions)
@@ -1308,6 +1317,7 @@ async def get_next_steps(
         user_message=payload.message,
         ai_response=payload.response,
         count=payload.count,
+        language=payload.language,
     )
     await _persist_enhancement(db, chat_id, "next_steps", steps)
     return NextStepsResponse(steps=steps)
@@ -1334,6 +1344,7 @@ async def generate_chat_practice_exercises(
         count=payload.count,
         grade=payload.grade,
         difficulty=payload.difficulty,
+        language=payload.language,
     )
     exercises = [PracticeExercise(**ex) for ex in raw_exercises]
     await _persist_enhancement(

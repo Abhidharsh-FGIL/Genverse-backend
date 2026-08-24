@@ -140,6 +140,7 @@ class FollowUpRequest(BaseModel):
     message: str
     response: str
     count: int = 4
+    language: Optional[str] = None
 
 
 class FollowUpResponse(BaseModel):
@@ -170,6 +171,7 @@ class NextStepsRequest(BaseModel):
     message: str
     response: str
     count: int = 4
+    language: Optional[str] = None
 
 
 class NextStepsResponse(BaseModel):
@@ -182,6 +184,7 @@ class PracticeExercisesRequest(BaseModel):
     count: int = 3
     grade: Optional[int] = None
     difficulty: str = "medium"
+    language: Optional[str] = None
 
 
 class PracticeExercise(BaseModel):
