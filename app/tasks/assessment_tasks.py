@@ -33,7 +33,7 @@ def generate_assessment_task(self, params: dict):
     params dict keys:
         subject, topics, grade, board, difficulty, question_count,
         question_types, mode, blooms_level, mcq_subtypes, type_weightage,
-        topic_weightage, negative_marking, source_text,
+        topic_weightage, negative_marking, source_text, exam_type,
         allowed_types, user_id, org_id
     """
     task_id = self.request.id
@@ -71,7 +71,6 @@ async def _generate_assessment_async(params: dict, channel: str, r: sync_redis.R
 async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
     """Inner generation logic."""
     import logging
-    import uuid as _uuid
 
     _log = logging.getLogger(__name__)
     question_count = params["question_count"]
@@ -113,6 +112,7 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
         negative_marking=params.get("negative_marking", False),
         source_text=params.get("source_text"),
         language=params.get("language"),
+        exam_type=params.get("exam_type"),
     )
 
     _log.info("[Assessment-Celery] LLM returned %d raw questions", len(raw))
@@ -124,37 +124,12 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
     })
 
     # Post-process: filter by allowed types, build question_json + answer_key_json
+    # (shared with the in-process SSE fallback in ai_assistant.py so the two paths
+    # can't drift apart — see AIService.finalize_generated_questions).
     allowed_types = set(params.get("allowed_types", ["mcq"]))
     _log.info("[Assessment-Celery] Filtering by allowed_types=%s", allowed_types)
 
-    question_json = []
-    answer_key_json = []
-    for q in raw:
-        qid = q.get("id") or str(_uuid.uuid4())
-        q_type = (q.get("type") or "mcq").lower()
-
-        if q_type not in allowed_types:
-            continue
-
-        opts = q.get("options")
-        if isinstance(opts, dict):
-            opts = list(opts.values())
-
-        question_json.append({
-            "id": qid,
-            "type": q_type,
-            "subtype": q.get("subtype"),
-            "text": q.get("text") or q.get("question", ""),
-            "options": opts,
-            "pairs": q.get("pairs"),
-            "points": q.get("marks") or q.get("points") or 1,
-            "blooms_level": q.get("blooms_level"),
-        })
-        answer_key_json.append({
-            "id": qid,
-            "correctAnswer": q.get("correct_answer") or q.get("correctAnswer", ""),
-            "explanation": q.get("explanation", ""),
-        })
+    question_json, answer_key_json = ai.finalize_generated_questions(raw, allowed_types)
 
     _log.info("[Assessment-Celery] After filtering: %d questions passed (from %d raw)", len(question_json), len(raw))
 

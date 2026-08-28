@@ -222,6 +222,7 @@ class GeneratePracticeAssessmentRequest(BaseModel):
     chapter_weightage: Optional[dict] = None
     language: Optional[str] = None  # Response language (e.g. "Tamil", "Hindi")
     org_id: Optional[str] = None  # Org workspace: deduct from org subscription
+    exam_type: Optional[str] = None  # Competitive-exam prompt conditioning: "jee" | "neet" | None
     # Accept remaining extra fields from the frontend without validation errors
     model_config = {"extra": "ignore"}
 

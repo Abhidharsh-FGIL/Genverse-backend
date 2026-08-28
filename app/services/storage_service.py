@@ -23,6 +23,7 @@ class StorageService:
         "chat-attachments": "chat-attachments",
         "public-library": "public-library",
         "org-logos": "org-logos",
+        "assessment-images": "assessment-images",
     }
 
     def _get_bucket_path(self, bucket: str) -> Path:
@@ -83,6 +84,27 @@ class StorageService:
             "size_mb": round(file_size_mb, 4),
             "type": file.content_type,
             "original_name": file.filename,
+        }
+
+    async def save_bytes(self, data: bytes, bucket: str, ext: str = ".png") -> dict:
+        """
+        Save raw bytes generated in-process (e.g. an AI-generated image) to local
+        storage, following the same path/URL convention as upload_file.
+        Returns a dict with {path, url, size_mb}.
+        """
+        bucket_dir = self._get_bucket_path(bucket)
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+        unique_name = f"{uuid.uuid4()}{ext}"
+        full_path = bucket_dir / unique_name
+
+        async with aiofiles.open(full_path, "wb") as f:
+            await f.write(data)
+
+        url = f"/uploads/{self.BUCKET_DIRS.get(bucket, bucket)}/{unique_name}"
+        return {
+            "path": str(full_path),
+            "url": url,
+            "size_mb": round(len(data) / (1024 * 1024), 4),
         }
 
     async def delete_file(self, file_path: str) -> bool:

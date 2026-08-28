@@ -12,6 +12,7 @@ API keys:
 import json
 import re
 import asyncio
+import random
 from typing import AsyncIterator, List, Optional, Any, Dict
 from pathlib import Path
 
@@ -33,6 +34,8 @@ def _build_genai_config(gemini_gen_config: dict | None):
             kwargs["response_mime_type"] = gemini_gen_config["response_mime_type"]
         if gemini_gen_config.get("system_instruction"):
             kwargs["system_instruction"] = gemini_gen_config["system_instruction"]
+        if gemini_gen_config.get("response_schema") is not None:
+            kwargs["response_schema"] = gemini_gen_config["response_schema"]
         return _gt.GenerateContentConfig(**kwargs) if kwargs else None
     except Exception:
         return None
@@ -1587,9 +1590,70 @@ Answer:"""
         negative_marking: bool = False,
         source_text: str | None = None,
         language: str | None = None,
+        exam_type: str | None = None,
     ) -> List[dict]:
-        """Generate practice assessment questions as JSON — respects all config options."""
-        print(f"[Assessment] language={language}, grade={grade}, board={board}, subject={subject}, subtypes={mcq_subtypes}, question_types={question_types}", flush=True)
+        """Generate practice assessment questions as JSON — respects all config options.
+
+        When exam_type is "jee"/"neet", delegates to _generate_exam_track_assessment
+        (structured-output + image-generation pipeline) instead. exam_type=None/"none"
+        (the default) runs the exact same single-pass flow as before this param
+        existed — zero behavior change for existing callers (e.g. the Daily Challenge
+        quiz on the Student Dashboard, which never sets exam_type).
+        """
+        print(f"[Assessment] language={language}, grade={grade}, board={board}, subject={subject}, subtypes={mcq_subtypes}, question_types={question_types}, exam_type={exam_type}", flush=True)
+
+        if exam_type and exam_type.lower() in ("jee", "neet"):
+            return await self._generate_exam_track_assessment(
+                subject=subject, topics=topics, grade=grade, board=board,
+                difficulty=difficulty, question_count=question_count,
+                question_types=question_types, mode=mode, blooms_level=blooms_level,
+                mcq_subtypes=mcq_subtypes, type_weightage=type_weightage,
+                topic_weightage=topic_weightage, negative_marking=negative_marking,
+                source_text=source_text, language=language, exam_type=exam_type.lower(),
+            )
+
+        prompt = self._build_assessment_prompt(
+            subject=subject, topics=topics, grade=grade, board=board,
+            difficulty=difficulty, question_count=question_count,
+            question_types=question_types, mode=mode, blooms_level=blooms_level,
+            mcq_subtypes=mcq_subtypes, type_weightage=type_weightage,
+            topic_weightage=topic_weightage, negative_marking=negative_marking,
+            source_text=source_text, language=language,
+        )
+        response = await self.chat([{"role": "user", "content": prompt}])
+        try:
+            result = self._extract_json_array(response)
+            if result:
+                return result
+        except Exception:
+            import logging as _logging
+            _logging.getLogger(__name__).exception(
+                "[generate_practice_assessment] Failed to parse LLM response"
+            )
+        return []
+
+    def _build_assessment_prompt(
+        self,
+        subject: str,
+        topics: List[str] | None,
+        grade: int | None,
+        board: str | None,
+        difficulty: str,
+        question_count: int,
+        question_types: List[str] | None,
+        mode: str,
+        blooms_level: str = "mixed",
+        mcq_subtypes: List[str] | None = None,
+        type_weightage: dict | None = None,
+        topic_weightage: dict | None = None,
+        negative_marking: bool = False,
+        source_text: str | None = None,
+        language: str | None = None,
+        exam_type: str | None = None,
+    ) -> str:
+        """Build the assessment-generation prompt. Shared by the standard single-pass
+        path and the JEE/NEET structured-output path so the two never drift apart.
+        exam_type=None produces byte-identical output to the pre-refactor prompt."""
         types = question_types or ["mcq"]
 
         # ── Compute exact counts per question type ──────────────────────────
@@ -1690,6 +1754,9 @@ Answer:"""
             if negative_marking else ""
         )
 
+        # ── Competitive-exam conditioning (JEE/NEET) — "" for the standard path ──
+        exam_type_section = self._build_exam_type_profile(exam_type) if exam_type else ""
+
         allowed_types_str = " | ".join(f'"{t}"' for t in types)
 
         # ── Language instruction ─────────────────────────────────────────────
@@ -1729,6 +1796,7 @@ DIFFICULTY: {difficulty}
 MODE: {mode}{lang_section}
 {blooms_section}
 {neg_section}
+{exam_type_section}
 
 ALLOWED QUESTION TYPES — STRICTLY: {allowed_types_str}
 You MUST NOT generate any question with a "type" outside this list. Every single question must use only these types.
@@ -1809,42 +1877,356 @@ MATH NOTATION — CRITICAL:
 ⚠️ CRITICAL LANGUAGE REQUIREMENT: Every single "text", "options" array element, "correct_answer", and "explanation" value MUST be written in {lang_name} using its native script. NOT in English. If any value is in English, rewrite it in {lang_name} before returning. Only JSON keys remain in English.""" if is_non_english else ""}
 Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""
 
-        response = await self.chat([{"role": "user", "content": prompt}])
+        return prompt
+
+    @staticmethod
+    def _extract_json_array(response: str) -> list:
+        """Parse a JSON array from a model response, tolerating markdown fences,
+        surrounding prose, and LaTeX-escape JSON conflicts. Returns [] rather than
+        raising if nothing parseable is found — callers treat [] as "generation
+        failed" (matching generate_practice_assessment's pre-existing contract)."""
+        cleaned = (response or "").strip()
+
+        if cleaned.startswith("```"):
+            parts = cleaned.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                if part.startswith("["):
+                    cleaned = part
+                    break
+
+        if not cleaned.startswith("["):
+            match = re.search(r'\[[\s\S]*\]', cleaned)
+            if match:
+                cleaned = match.group(0)
+
         try:
-            cleaned = response.strip()
-
-            # Extract JSON from markdown code fences
-            if cleaned.startswith("```"):
-                parts = cleaned.split("```")
-                for part in parts:
-                    part = part.strip()
-                    if part.startswith("json"):
-                        part = part[4:].strip()
-                    if part.startswith("["):
-                        cleaned = part
-                        break
-
-            # Fallback: find JSON array anywhere in the response
-            if not cleaned.startswith("["):
-                import re as _re
-                match = _re.search(r'\[[\s\S]*\]', cleaned)
-                if match:
-                    cleaned = match.group(0)
-
+            result = json.loads(cleaned, strict=False)
+        except json.JSONDecodeError:
             try:
-                result = json.loads(cleaned, strict=False)
-            except json.JSONDecodeError:
-                cleaned = AIService._fix_json_escapes(cleaned)
-                result = json.loads(cleaned, strict=False)
-
-            if isinstance(result, list):
-                return result
+                result = json.loads(AIService._fix_json_escapes(cleaned), strict=False)
+            except Exception:
+                return []
         except Exception:
-            import logging as _logging
-            _logging.getLogger(__name__).exception(
-                "[generate_practice_assessment] Failed to parse LLM response"
-            )
-        return []
+            return []
+
+        return result if isinstance(result, list) else []
+
+    def _build_exam_type_profile(self, exam_type: str | None) -> str:
+        """Prompt-conditioning block for competitive-exam-style assessments.
+        Returns "" for None/"none" so the standard assessment prompt is unaffected."""
+        if not exam_type or exam_type.lower() == "none":
+            return ""
+        profiles = {
+            "jee": (
+                "COMPETITIVE EXAM MODE: JEE (Joint Entrance Examination)\n"
+                "This assessment must match JEE Main/Advanced standard:\n"
+                "- Mathematics: heavy emphasis on rigorous problem-solving — calculus, algebra, coordinate "
+                "geometry, trigonometry, probability, vectors. Multi-step numerical problems, not simple recall.\n"
+                "- Physics/Chemistry: multi-concept application questions that combine 2-3 principles in one "
+                "problem (e.g. combine kinematics with energy conservation, or thermodynamics with equilibrium) "
+                "rather than testing a single isolated fact.\n"
+                "- Bloom's levels must skew toward Apply/Analyze/Evaluate — avoid pure Remember/Understand questions.\n"
+                "- For roughly 20-30% of questions — especially Physics circuits, Chemistry structures/mechanisms, "
+                "or Math coordinate-geometry/graph problems — set \"requires_question_image\": true and write a "
+                "precise \"question_image_prompt\" describing exactly what the diagram/circuit/graph must show "
+                "(labeled axes, values, components) so it can be rendered accurately. Only set this for questions "
+                "that genuinely need a visual to be answered correctly — do not force images onto plain numerical "
+                "or theory questions.\n"
+                "- Where an MCQ option is itself best expressed as a diagram (e.g. \"which graph correctly shows "
+                "...\"), set that option's \"image_prompt\" instead of describing the graph in text."
+            ),
+            "neet": (
+                "COMPETITIVE EXAM MODE: NEET (National Eligibility cum Entrance Test)\n"
+                "This assessment must match NEET standard:\n"
+                "- Strictly align with NCERT textbook content and terminology — NEET questions are drawn almost "
+                "entirely from the NCERT syllabus, not generic curriculum content.\n"
+                "- Biology (Botany/Zoology) must be conceptual, not just definitional — test understanding of "
+                "processes, structures, and their functional significance, not isolated terminology.\n"
+                "- Include multi-statement verification questions (\"How many of the following statements are "
+                "correct?\") and Assertion-Reasoning MCQs in NCERT's standard four-option format:\n"
+                "  \"Both A and R are true, and R is the correct explanation of A\" / \"Both A and R are true, but "
+                "R is not the correct explanation of A\" / \"A is true but R is false\" / \"A is false but R is true\"\n"
+                "- For roughly 20-30% of questions — especially Biology diagrams (cell structures, plant/animal "
+                "anatomy, physiological processes, life cycles) — set \"requires_question_image\": true and write "
+                "a precise \"question_image_prompt\" describing exactly what the labeled biological diagram must "
+                "show, so it can be rendered accurately. Only set this for questions that genuinely need a visual — "
+                "do not force images onto plain conceptual questions.\n"
+                "- Where an MCQ option is itself best expressed as a diagram (e.g. identifying a labeled structure "
+                "from an image), set that option's \"image_prompt\" instead of describing it in text."
+            ),
+        }
+        profile = profiles.get(exam_type.lower(), "")
+        if not profile:
+            return ""
+        # Shared reinforcement: multi-statement / assertion-reason MCQs (both profiles
+        # above ask for these) must still carry a populated "options" array like any
+        # other MCQ — never leave it empty just because the question format is more
+        # complex than a standard single-fact MCQ.
+        return profile + (
+            "\n- CRITICAL: Every question with \"type\": \"mcq\" — including multi-statement "
+            "verification and Assertion-Reasoning questions — MUST have a populated \"options\" "
+            "array with the full set of answer choices (4 entries for standard/assertion-reason "
+            "MCQs). NEVER return \"options\": [] for an MCQ question, even when the question text "
+            "itself already states the statements or assertion/reason being evaluated — the "
+            "options array must still list the actual answer choices the student picks from."
+        )
+
+    async def _generate_exam_track_assessment(
+        self,
+        subject: str,
+        topics: List[str] | None,
+        grade: int | None,
+        board: str | None,
+        difficulty: str,
+        question_count: int,
+        question_types: List[str] | None,
+        mode: str,
+        blooms_level: str,
+        mcq_subtypes: List[str] | None,
+        type_weightage: dict | None,
+        topic_weightage: dict | None,
+        negative_marking: bool,
+        source_text: str | None,
+        language: str | None,
+        exam_type: str,
+    ) -> List[dict]:
+        """JEE/NEET two-pass pipeline: Pass 1 generates questions via Gemini structured
+        output (response_schema), flagging which need a diagram/figure; Pass 2 generates
+        those images and attaches URLs. Never raises — any failure degrades to [],
+        matching generate_practice_assessment's existing empty-result contract."""
+        prompt = self._build_assessment_prompt(
+            subject=subject, topics=topics, grade=grade, board=board,
+            difficulty=difficulty, question_count=question_count,
+            question_types=question_types, mode=mode, blooms_level=blooms_level,
+            mcq_subtypes=mcq_subtypes, type_weightage=type_weightage,
+            topic_weightage=topic_weightage, negative_marking=negative_marking,
+            source_text=source_text, language=language, exam_type=exam_type,
+        )
+
+        from google.genai import types as _gt
+
+        option_schema = _gt.Schema(
+            type=_gt.Type.OBJECT,
+            properties={
+                "text": _gt.Schema(type=_gt.Type.STRING),
+                "image_prompt": _gt.Schema(type=_gt.Type.STRING),
+            },
+            required=["text"],
+        )
+        question_schema = _gt.Schema(
+            type=_gt.Type.OBJECT,
+            properties={
+                "id": _gt.Schema(type=_gt.Type.STRING),
+                "type": _gt.Schema(type=_gt.Type.STRING),
+                "subtype": _gt.Schema(type=_gt.Type.STRING),
+                "text": _gt.Schema(type=_gt.Type.STRING),
+                # min_items enforces at the schema level that MCQ questions can't come
+                # back with an empty options array — observed in testing where the
+                # model would emit "type": "mcq" with options: [] for some NEET-style
+                # multi-statement/assertion-reason questions, producing an unusable,
+                # choice-less MCQ in the review UI. Non-MCQ question types (fill/
+                # short/long) may end up with harmless unused placeholder options —
+                # the frontend renders those types without ever reading "options".
+                "options": _gt.Schema(type=_gt.Type.ARRAY, items=option_schema, min_items=2),
+                "pairs": _gt.Schema(
+                    type=_gt.Type.ARRAY,
+                    items=_gt.Schema(
+                        type=_gt.Type.OBJECT,
+                        properties={
+                            "left": _gt.Schema(type=_gt.Type.STRING),
+                            "right": _gt.Schema(type=_gt.Type.STRING),
+                        },
+                    ),
+                ),
+                "correct_answer": _gt.Schema(type=_gt.Type.STRING),
+                "explanation": _gt.Schema(type=_gt.Type.STRING),
+                "marks": _gt.Schema(type=_gt.Type.INTEGER),
+                "blooms_level": _gt.Schema(type=_gt.Type.STRING),
+                "requires_question_image": _gt.Schema(type=_gt.Type.BOOLEAN),
+                "question_image_prompt": _gt.Schema(type=_gt.Type.STRING),
+            },
+            required=[
+                "id", "type", "text", "correct_answer", "explanation",
+                "marks", "blooms_level", "requires_question_image",
+            ],
+        )
+        array_schema = _gt.Schema(type=_gt.Type.ARRAY, items=question_schema)
+
+        # JEE/NEET questions are far more verbose (detailed explanations, image
+        # prompts) than the standard path's — scale the token budget with
+        # question_count rather than using a flat cap that truncates output.
+        max_tokens = min(4096 + question_count * 2500, 65536)
+        cfg = _build_genai_config({
+            "max_output_tokens": max_tokens,
+            "response_mime_type": "application/json",
+            "response_schema": array_schema,
+        })
+
+        raw_text = ""
+        try:
+            client = self._get_gemini_async()
+            if client:
+                resp = await _gemini_generate_with_retry(client, settings.AI_PRIMARY_MODEL, prompt, cfg)
+                raw_text = resp.text or ""
+        except Exception as e:
+            print(f"[ExamAssessment:{exam_type}] Pass 1 failed: {type(e).__name__}: {e}", flush=True)
+            return []
+
+        questions = self._extract_json_array(raw_text)
+        if not questions:
+            print(f"[ExamAssessment:{exam_type}] Pass 1 returned no parseable questions", flush=True)
+            return []
+
+        # ── Pass 2: generate images for whichever questions/options were flagged.
+        # Jobs run concurrently (capped) rather than one-at-a-time — sequential
+        # generation at high question counts with many flagged images could
+        # otherwise take many minutes and risk hitting Celery's task time limit. ──
+        image_jobs: list[tuple[int, int | None, str]] = []  # (question_idx, option_idx_or_None, prompt)
+
+        for qi, q in enumerate(questions):
+            if not isinstance(q, dict):
+                continue
+            if q.get("requires_question_image") and q.get("question_image_prompt"):
+                image_jobs.append((qi, None, q["question_image_prompt"]))
+
+            opts = q.get("options")
+            if isinstance(opts, list):
+                flat_options = []
+                for oi, opt in enumerate(opts):
+                    if isinstance(opt, dict):
+                        opt_text = opt.get("text", "")
+                        opt_prompt = opt.get("image_prompt")
+                        if opt_prompt:
+                            image_jobs.append((qi, oi, opt_prompt))
+                        flat_options.append(opt_text)
+                    else:
+                        flat_options.append(opt)
+                q["options"] = flat_options
+
+        if image_jobs:
+            semaphore = asyncio.Semaphore(4)
+
+            async def _run_image_job(qi: int, oi: int | None, img_prompt: str):
+                async with semaphore:
+                    try:
+                        url = await self._generate_exam_diagram_image(img_prompt)
+                    except Exception as e:
+                        print(f"[ExamAssessment:{exam_type}] image job failed (q={qi}, opt={oi}): {type(e).__name__}: {e}", flush=True)
+                        url = None
+                    return qi, oi, url
+
+            job_results = await asyncio.gather(*[_run_image_job(qi, oi, p) for qi, oi, p in image_jobs])
+            for qi, oi, url in job_results:
+                if not url:
+                    continue
+                if oi is None:
+                    questions[qi]["image_url"] = url
+                else:
+                    opt_text = questions[qi]["options"][oi]
+                    questions[qi].setdefault("option_images", {})[opt_text] = url
+
+        # ── Shuffle the MCQ option order for a meaningful subset (>=40%, never
+        # all of them) so the correct answer isn't predictably placed by whatever
+        # ordering bias the model has. correct_answer is matched by exact string
+        # content, not position, so reordering "options" needs no other bookkeeping. ──
+        mcq_indices = [
+            i for i, q in enumerate(questions)
+            if isinstance(q, dict) and (q.get("type") or "").lower() == "mcq"
+            and isinstance(q.get("options"), list) and len(q["options"]) > 1
+        ]
+        if mcq_indices:
+            shuffle_count = max(1, round(len(mcq_indices) * 0.5))
+            for idx in random.sample(mcq_indices, min(shuffle_count, len(mcq_indices))):
+                random.shuffle(questions[idx]["options"])
+
+        return questions
+
+    async def _generate_exam_diagram_image(self, image_prompt: str) -> str | None:
+        """Generate one diagram/figure for an exam question via Gemini's multimodal
+        image output, save it, and return a servable /uploads/... URL. Returns None
+        on any failure (rate-limit, timeout, no image part) — callers must treat
+        None as "skip the image, keep the question text-only", never raise further."""
+        client = self._get_gemini_async()
+        if not client:
+            return None
+
+        from google.genai import types
+
+        full_prompt = (
+            "Generate a clear, textbook-style educational diagram for a competitive exam question. "
+            "Clean lines, minimal correctly-spelled labels, high contrast, no watermarks, no decorative border.\n\n"
+            f"{image_prompt}"
+        )
+        configs_to_try = [
+            types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
+            types.GenerateContentConfig(response_modalities=["IMAGE"]),
+        ]
+        for attempt, cfg in enumerate(configs_to_try):
+            try:
+                resp = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=settings.AI_IMAGE_MODEL, contents=[full_prompt], config=cfg,
+                    ),
+                    timeout=45.0,
+                )
+                for part in resp.parts:
+                    if getattr(part, "inline_data", None) is not None:
+                        from app.services.storage_service import StorageService
+                        mime = part.inline_data.mime_type or "image/png"
+                        ext = "." + mime.split("/")[-1].split(";")[0] if "/" in mime else ".png"
+                        if ext == ".jpg":
+                            ext = ".jpeg"
+                        saved = await StorageService().save_bytes(
+                            part.inline_data.data, "assessment-images", ext=ext
+                        )
+                        return saved["url"]
+            except asyncio.TimeoutError:
+                print(f"[ExamAssessment] image gen timed out on attempt {attempt + 1}", flush=True)
+            except Exception as e:
+                print(f"[ExamAssessment] image gen failed on attempt {attempt + 1}: {type(e).__name__}: {e}", flush=True)
+        return None
+
+    @staticmethod
+    def finalize_generated_questions(raw: list, allowed_types: set) -> tuple[list, list]:
+        """Shared post-processing: filter generated questions by allowed type and
+        build the (question_json, answer_key_json) pair the router/Celery task and
+        the DB expect. Used by both the Celery task and the in-process SSE fallback
+        so the two code paths can't drift apart."""
+        import uuid as _uuid
+        question_json = []
+        answer_key_json = []
+        for q in raw:
+            qid = q.get("id") or str(_uuid.uuid4())
+            q_type = (q.get("type") or "mcq").lower()
+            if q_type not in allowed_types:
+                continue
+            opts = q.get("options")
+            if isinstance(opts, dict):
+                opts = list(opts.values())
+            # Safety net: an MCQ/true-false question with no (or a single) option
+            # is unusable in the review/take UI — it renders a choice-less answer
+            # list. Drop it rather than shipping a broken question, regardless of
+            # whether the generation prompt/schema should have prevented this.
+            if q_type in ("mcq", "true_false") and (not opts or len(opts) < 2):
+                continue
+            question_json.append({
+                "id": qid, "type": q_type, "subtype": q.get("subtype"),
+                "text": q.get("text") or q.get("question", ""),
+                "options": opts, "pairs": q.get("pairs"),
+                "points": q.get("marks") or q.get("points") or 1,
+                "blooms_level": q.get("blooms_level"),
+                "image_url": q.get("image_url"),
+                "option_images": q.get("option_images"),
+            })
+            answer_key_json.append({
+                "id": qid,
+                "correctAnswer": q.get("correct_answer") or q.get("correctAnswer", ""),
+                "explanation": q.get("explanation", ""),
+            })
+        return question_json, answer_key_json
 
     async def auto_evaluate_attempt(self, questions: List[dict], responses: dict) -> dict:
         """Auto-score an assessment attempt."""

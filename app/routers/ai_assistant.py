@@ -1624,6 +1624,7 @@ async def generate_practice_assessment_stream(
         "negative_marking": payload.negative_marking,
         "source_text": resolved_source_text,
         "language": payload.language,
+        "exam_type": payload.exam_type,
         "allowed_types": list(allowed_types),
         "user_id": str(current_user.id),
         "org_id": str(org_id) if org_id else None,
@@ -1715,33 +1716,12 @@ async def generate_practice_assessment_stream(
                     negative_marking=payload.negative_marking,
                     source_text=resolved_source_text,
                     language=payload.language,
+                    exam_type=payload.exam_type,
                 )
 
                 yield f"data: {json.dumps({'stage': 'processing', 'progress': 80, 'message': 'Processing and validating questions...'})}\n\n"
 
-                import uuid as _uuid
-                question_json = []
-                answer_key_json = []
-                for q in raw:
-                    qid = q.get("id") or str(_uuid.uuid4())
-                    q_type = (q.get("type") or "mcq").lower()
-                    if q_type not in allowed_types:
-                        continue
-                    opts = q.get("options")
-                    if isinstance(opts, dict):
-                        opts = list(opts.values())
-                    question_json.append({
-                        "id": qid, "type": q_type, "subtype": q.get("subtype"),
-                        "text": q.get("text") or q.get("question", ""),
-                        "options": opts, "pairs": q.get("pairs"),
-                        "points": q.get("marks") or q.get("points") or 1,
-                        "blooms_level": q.get("blooms_level"),
-                    })
-                    answer_key_json.append({
-                        "id": qid,
-                        "correctAnswer": q.get("correct_answer") or q.get("correctAnswer", ""),
-                        "explanation": q.get("explanation", ""),
-                    })
+                question_json, answer_key_json = AIService.finalize_generated_questions(raw, allowed_types)
 
                 yield f"data: {json.dumps({'stage': 'complete', 'progress': 100, 'message': f'{len(question_json)} questions generated successfully!', 'question_json': question_json, 'answer_key_json': answer_key_json})}\n\n"
                 yield "data: [DONE]\n\n"
