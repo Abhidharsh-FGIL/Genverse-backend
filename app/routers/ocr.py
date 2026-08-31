@@ -32,15 +32,18 @@ async def extract_text(
     db: DBSession = None,
 ):
     """Extract text from an uploaded image or document using OCR and save it to the library."""
+    # Kept in exact sync with the file types advertised/accepted by OCRUploader.tsx
+    # on the frontend (PDF, JPEG/PNG/WebP images, DOCX, TXT) — nothing more, nothing less.
     allowed_types = {
-        "image/jpeg", "image/png", "image/gif", "image/webp",
+        "image/jpeg", "image/png", "image/webp",
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "text/plain",
     }
     if file.content_type not in allowed_types:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail="This file type is not supported for OCR. Please upload a PDF, JPEG, PNG, GIF, or WebP file.",
+            detail="This file type is not supported for OCR. Please upload a PDF, JPEG, PNG, WebP, DOCX, or TXT file.",
         )
 
     # Check usage limits and deduct points (cost=3, xp=3 from seed)
@@ -65,6 +68,19 @@ async def extract_text(
         file_path=file_info["path"],
         language=language,
     )
+
+    # extract_text_from_file silently caps long PDFs at AIService._MAX_PDF_PAGES —
+    # surface that here so the user isn't given incomplete text with no indication
+    # pages were dropped.
+    total_pages: int | None = None
+    page_limit_hit = False
+    if file.content_type == "application/pdf":
+        try:
+            from PyPDF2 import PdfReader
+            total_pages = len(PdfReader(file_info["path"]).pages)
+            page_limit_hit = total_pages > ai._MAX_PDF_PAGES
+        except Exception:
+            pass
 
     # Save library item so it appears in GET /library?folder=ocr
     item = UserLibraryItem(
@@ -103,4 +119,6 @@ async def extract_text(
         extracted_text=extracted_text or "",
         word_count=len(extracted_text.split()) if extracted_text else 0,
         language=language,
+        total_pages=total_pages,
+        page_limit_hit=page_limit_hit,
     )

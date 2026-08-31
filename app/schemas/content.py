@@ -253,3 +253,5 @@ class OCRExtractResponse(BaseModel):
     extracted_text: str
     word_count: int
     language: str
+    total_pages: int | None = None
+    page_limit_hit: bool = False

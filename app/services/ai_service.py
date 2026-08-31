@@ -6742,8 +6742,18 @@ Return ONLY valid JSON (no markdown):
                     native = native_pages[i].strip() if i < len(native_pages) else ""
                     ocr_text = ocr_pages_text.get(i, "").strip()
                     if native and ocr_text and i in pages_needing_ocr:
-                        # Page had a little native text + images — combine both
-                        merged_pages.append(f"**Page {i+1}:**\n\n{native}\n\n{ocr_text}")
+                        # Page had a little native text + images — combine both.
+                        # Exception: when the whole page was forced through OCR because
+                        # its native text was sparse (the "likely watermarks" branch
+                        # above), Gemini's OCR often faithfully re-transcribes that same
+                        # short native text as part of describing the full page — check
+                        # for that overlap first so we don't duplicate identical content.
+                        native_normalized = " ".join(native.split())
+                        ocr_normalized = " ".join(ocr_text.split())
+                        if native_normalized and native_normalized in ocr_normalized:
+                            merged_pages.append(f"**Page {i+1}:**\n\n{ocr_text}")
+                        else:
+                            merged_pages.append(f"**Page {i+1}:**\n\n{native}\n\n{ocr_text}")
                     elif ocr_text:
                         merged_pages.append(f"**Page {i+1}:**\n\n{ocr_text}")
                     elif native:
