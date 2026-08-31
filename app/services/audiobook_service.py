@@ -405,6 +405,11 @@ async def generate_audiobook(
     if not narration_segments:
         return {"audio_path": None, "duration_seconds": None, "chapter_timestamps": []}
 
+    from starlette.concurrency import run_in_threadpool
+
+    total_segments = len(narration_segments)
+    print(f"[Audiobook] Starting generation — {total_segments} segments, voice={voice_id}, style={narration_style}, lang={language}")
+
     # Synthesize each segment
     use_edge_tts = True
     audio_parts: list[bytes] = []
@@ -424,6 +429,9 @@ async def generate_audiobook(
         if not segment.text.strip():
             continue
 
+        word_count = len(segment.text.split())
+        print(f"[Audiobook] Synthesizing segment {i+1}/{total_segments}: '{segment.label}' ({word_count} words)")
+
         # Synthesize audio for this segment
         try:
             if use_edge_tts:
@@ -435,24 +443,28 @@ async def generate_audiobook(
                 )
             else:
                 seg_audio = await _synthesize_gtts_fallback(segment.text, gtts_lang)
-        except Exception:
+        except Exception as e:
+            print(f"[Audiobook] Synthesis failed for segment {i+1} ({segment.label}): {e}")
             # If edge-tts fails on first segment, fall back to gTTS for all
             if use_edge_tts:
                 use_edge_tts = False
+                print(f"[Audiobook] Falling back to gTTS for remaining segments")
                 try:
                     seg_audio = await _synthesize_gtts_fallback(segment.text, gtts_lang)
-                except Exception:
+                except Exception as e2:
+                    print(f"[Audiobook] gTTS fallback also failed: {e2}")
                     continue
             else:
                 continue
 
         if not seg_audio:
+            print(f"[Audiobook] Empty audio for segment {i+1}, skipping")
             continue
 
-        # Record timestamp
-        word_count = len(segment.text.split())
-        estimated_duration = max(1, int(word_count / wpm * 60))
+        print(f"[Audiobook] Segment {i+1} synthesized: {len(seg_audio)} bytes")
 
+        # Record timestamp
+        estimated_duration = max(1, int(word_count / wpm * 60))
         chapter_timestamps.append({
             "label": segment.label,
             "type": segment.segment_type,
@@ -476,31 +488,30 @@ async def generate_audiobook(
                 pause_ms = PAUSE_BEFORE_OUTRO
 
             try:
-                silence = _generate_silence_mp3(pause_ms)
+                silence = await run_in_threadpool(_generate_silence_mp3, pause_ms)
                 audio_parts.append(silence)
                 current_offset_seconds += pause_ms / 1000
             except Exception:
                 pass  # Skip silence if pydub isn't available
 
     if not audio_parts:
+        print(f"[Audiobook] No audio segments produced — aborting")
         return {"audio_path": None, "duration_seconds": None, "chapter_timestamps": []}
 
-    # Concatenate all segments
-    from starlette.concurrency import run_in_threadpool
-
+    print(f"[Audiobook] Concatenating {len(audio_parts)} audio parts...")
     try:
         final_audio = await run_in_threadpool(_concat_audio_segments, audio_parts)
-    except Exception:
-        # If pydub concat fails, just use the raw segments concatenated
+    except Exception as e:
+        print(f"[Audiobook] pydub concat failed ({e}), joining raw bytes")
         final_audio = b"".join(audio_parts)
 
-    # Calculate actual duration
+    print(f"[Audiobook] Final audio: {len(final_audio)} bytes — calculating duration...")
     try:
         total_duration = await run_in_threadpool(_get_audio_duration_seconds, final_audio)
     except Exception:
         total_duration = int(current_offset_seconds)
 
-    # Save to storage
+    print(f"[Audiobook] Duration: {total_duration}s — saving to storage...")
     storage_dir = Path(settings.STORAGE_ROOT) / "audio-responses"
     storage_dir.mkdir(parents=True, exist_ok=True)
 
@@ -509,6 +520,7 @@ async def generate_audiobook(
     file_path = storage_dir / filename
     file_path.write_bytes(final_audio)
 
+    print(f"[Audiobook] Done — path={file_path}, duration={total_duration}s, chapters={len(chapter_timestamps)}")
     return {
         "audio_path": str(file_path),
         "duration_seconds": total_duration,

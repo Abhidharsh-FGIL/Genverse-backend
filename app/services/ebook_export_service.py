@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import re
 from xml.sax.saxutils import escape as xml_escape
 
@@ -36,12 +37,15 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     HRFlowable,
     Image as RLImage,
     KeepTogether,
     PageBreak,
     Paragraph,
+    Preformatted,
     SimpleDocTemplate,
     Spacer,
     Table,
@@ -66,6 +70,48 @@ DOC_MARGIN = 1.0                  # inches
 FONT_RL = "Times-Roman"           # ReportLab built-in
 FONT_DOCX = "Times New Roman"     # python-docx
 
+# ── Non-Latin script fonts (PDF only) ───────────────────────────────────────────
+# ReportLab's built-in "Times-*" fonts are the base-14 PDF standard fonts, which
+# only cover WinAnsi/Latin-1 — any Tamil/Devanagari/etc. character silently draws
+# as nothing (a "tofu" box) with no embedded Unicode font registered. DOCX/in-app
+# viewing were never affected by this because those rely on the OS's or browser's
+# own installed fonts, not a font baked into the exported file — a PDF has no such
+# fallback, so the correct font must be embedded explicitly at generation time.
+_FONTS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fonts")
+_SCRIPT_FONT_FILES = {
+    "hi": ("NotoSansDevanagari", "NotoSansDevanagari.ttf"),
+    "ta": ("NotoSansTamil", "NotoSansTamil.ttf"),
+    "te": ("NotoSansTelugu", "NotoSansTelugu.ttf"),
+    "kn": ("NotoSansKannada", "NotoSansKannada.ttf"),
+    "ml": ("NotoSansMalayalam", "NotoSansMalayalam.ttf"),
+}
+_registered_script_fonts: set[str] = set()
+
+
+def _fonts_for_language(language: str | None) -> tuple[str, str, str]:
+    """Return (regular, bold, italic) ReportLab font names for the ebook's language.
+
+    English (or any unrecognised code) keeps the existing Times-Roman/-Bold/-Italic
+    trio unchanged. For the other codes this platform supports (see LANGUAGE_LOCALE
+    in news_service.py), a matching Noto Sans <Script> TTF is registered on first
+    use and reused for regular/bold/italic alike — these are variable-weight font
+    files but ReportLab doesn't interpret variable-font axes, so it only ever draws
+    the single default (Regular) instance regardless of which of the three names is
+    requested. A non-bold Tamil heading is a minor cosmetic gap; a blank one is not.
+    """
+    entry = _SCRIPT_FONT_FILES.get((language or "en").lower())
+    if not entry:
+        return "Times-Roman", "Times-Bold", "Times-Italic"
+
+    font_name, file_name = entry
+    if font_name not in _registered_script_fonts:
+        pdfmetrics.registerFont(TTFont(font_name, os.path.join(_FONTS_DIR, file_name)))
+        pdfmetrics.registerFontFamily(
+            font_name, normal=font_name, bold=font_name, italic=font_name, boldItalic=font_name,
+        )
+        _registered_script_fonts.add(font_name)
+    return font_name, font_name, font_name
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
@@ -85,6 +131,97 @@ def _decode_image(data_url: str) -> bytes | None:
 def _pdf_text(value: object) -> str:
     """Escape dynamic text for ReportLab Paragraph XML parser."""
     return xml_escape("" if value is None else str(value))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rich-content parsing (shared by PDF + DOCX)
+#
+# The AI is instructed (see ai_service.py's chapter-generation prompt) to format
+# chapter/summary text with a small set of HTML tags: <h3> sub-headings, <b>/<i>
+# emphasis, <ul>/<ol>/<li> lists, and <pre><code> blocks. The in-app viewer
+# parses this into real styled elements; without the same parsing here, those
+# tags used to show up as literal text (e.g. "<h3>Some heading</h3>") in the
+# downloaded PDF/DOCX. These helpers split raw content into typed blocks and
+# inline (text, bold, italic) runs so both exporters can render it properly —
+# any *other* stray tag the model emits (e.g. an over-generated <h1>) is simply
+# dropped rather than shown as literal text.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BLOCK_RE = re.compile(
+    r"<h[1-6]>.*?</h[1-6]>|<ul>.*?</ul>|<ol>.*?</ol>|<pre>\s*<code[^>]*>.*?</code>\s*</pre>",
+    re.IGNORECASE | re.DOTALL,
+)
+_LI_RE = re.compile(r"<li>(.*?)</li>", re.IGNORECASE | re.DOTALL)
+_INLINE_TAG_RE = re.compile(r"<(/?)(b|i)>", re.IGNORECASE)
+_ANY_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _parse_content_blocks(text: str) -> list[dict]:
+    """Split raw AI-generated text into typed blocks: paragraph, heading,
+    (un)ordered list, or code — instead of treating <h3>/<ul>/<pre> as plain text."""
+    if not text:
+        return []
+    blocks: list[dict] = []
+    pos = 0
+    for m in _BLOCK_RE.finditer(text):
+        if m.start() > pos:
+            blocks += [{"type": "para", "text": p} for p in _split_paras(text[pos:m.start()])]
+        raw = m.group(0)
+        h_m = re.match(r"<h[1-6]>(.*?)</h[1-6]>", raw, re.IGNORECASE | re.DOTALL)
+        if h_m:
+            blocks.append({"type": "heading", "text": h_m.group(1).strip()})
+        else:
+            code_m = re.match(r"<pre>\s*<code[^>]*>(.*?)</code>\s*</pre>", raw, re.IGNORECASE | re.DOTALL)
+            if code_m:
+                blocks.append({"type": "code", "text": code_m.group(1).strip("\n")})
+            else:
+                list_m = re.match(r"<(ul|ol)>(.*?)</\1>", raw, re.IGNORECASE | re.DOTALL)
+                if list_m:
+                    blocks.append({
+                        "type": "list",
+                        "ordered": list_m.group(1).lower() == "ol",
+                        "items": [li.strip() for li in _LI_RE.findall(list_m.group(2)) if li.strip()],
+                    })
+        pos = m.end()
+    if pos < len(text):
+        blocks += [{"type": "para", "text": p} for p in _split_paras(text[pos:])]
+    return blocks
+
+
+def _split_inline_runs(text: str) -> list[tuple[str, bool, bool]]:
+    """Parse a line of text into (text, bold, italic) runs, honoring <b>/<i> tags
+    and silently dropping any other stray HTML tag rather than showing it literally."""
+    runs: list[tuple[str, bool, bool]] = []
+    bold = italic = False
+    pos = 0
+    tag_re = re.compile(r"<(/?)(b|i)>|<[^>]+>", re.IGNORECASE)
+    for m in tag_re.finditer(text):
+        if m.start() > pos:
+            runs.append((text[pos:m.start()], bold, italic))
+        if m.group(2):
+            closing = bool(m.group(1))
+            if m.group(2).lower() == "b":
+                bold = not closing
+            else:
+                italic = not closing
+        pos = m.end()
+    if pos < len(text):
+        runs.append((text[pos:], bold, italic))
+    return [r for r in runs if r[0]]
+
+
+def _pdf_markup(text: str) -> str:
+    """Convert inline <b>/<i> runs into ReportLab's own markup, XML-escaping the
+    plain-text portions (ReportLab's Paragraph parser natively understands <b>/<i>)."""
+    parts = []
+    for seg, bold, italic in _split_inline_runs(text):
+        seg = xml_escape(seg)
+        if bold:
+            seg = f"<b>{seg}</b>"
+        if italic:
+            seg = f"<i>{seg}</i>"
+        parts.append(seg)
+    return "".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,8 +257,28 @@ def _page_num_cb(canvas, doc) -> None:
     canvas.restoreState()
 
 
-def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
+def _rich_text_flowables(text: str, S: dict) -> list:
+    """Render AI-generated text (headings/bold/italic/lists/code) into ReportLab
+    flowables, in place of dumping the raw HTML-tagged string into one Paragraph."""
+    out: list = []
+    for block in _parse_content_blocks(text):
+        if block["type"] == "heading":
+            out.append(Paragraph(_pdf_markup(block["text"]), S["subhead"]))
+        elif block["type"] == "code":
+            out.append(Preformatted(block["text"], S["code"]))
+        elif block["type"] == "list":
+            for idx, item in enumerate(block["items"]):
+                prefix = f"{idx + 1}. " if block["ordered"] else "\u2022 "
+                out.append(Paragraph(prefix + _pdf_markup(item), S["list_item"]))
+        else:
+            out.append(Paragraph(_pdf_markup(block["text"]), S["body"]))
+    return out
+
+
+def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en") -> bytes:
     """Return raw PDF bytes for the given ebook_json."""
+
+    font_regular, font_bold, font_italic = _fonts_for_language(language)
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -144,11 +301,11 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
         leading: float | None = None,
     ) -> ParagraphStyle:
         if bold:
-            fn = "Times-Bold"
+            fn = font_bold
         elif italic:
-            fn = "Times-Italic"
+            fn = font_italic
         else:
-            fn = "Times-Roman"
+            fn = font_regular
         return ParagraphStyle(
             name,
             fontName=fn,
@@ -168,6 +325,13 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
         "cov_desc":   sty("cd",  italic=True, size=11, align=TA_CENTER, color="#555555"),
         "sec_title":  sty("st",  bold=True,   size=20, align=TA_CENTER, after=18),
         "body":       sty("bd",                size=12, align=TA_JUSTIFY),
+        "subhead":    sty("sh",  bold=True,   size=15, before=10, after=6),
+        "list_item":  sty("li",                size=12, before=1, after=1, left_indent=16),
+        "code":       ParagraphStyle(
+                          "code", fontName="Courier", fontSize=9, leading=12,
+                          textColor=colors.HexColor("#222222"),
+                          backColor=colors.HexColor("#f5f5f5"),
+                          borderPadding=8, spaceBefore=6, spaceAfter=10),
         "eyebrow":    sty("ey",                size=9,  color="#777777", after=8),
         "ch_title":   sty("cht", bold=True,   size=22, after=8),
         "toc_entry":  sty("te",                size=12, leading=20),
@@ -223,15 +387,13 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
     # ── About This Book ───────────────────────────────────────────────────────
     if summary:
         story.append(Paragraph("About This Book", S["sec_title"]))
-        story.append(HRFlowable(width=CONTENT_W, thickness=1.5, color=colors.black, spaceAfter=20))
-        for para in _split_paras(summary):
-            story.append(Paragraph(_pdf_text(para), S["body"]))
+        story.extend(_rich_text_flowables(summary, S))
         story.append(PageBreak())
 
     # ── Table of Contents ─────────────────────────────────────────────────────
     if toc:
         story.append(Paragraph("Table of Contents", S["sec_title"]))
-        story.append(HRFlowable(width=CONTENT_W, thickness=1.5, color=colors.black, spaceAfter=20))
+        story.append(Spacer(1, 0.2 * inch))
 
         pg_count  = ej.get("page_count", 15)
         front     = 1 + (1 if summary else 0) + 1
@@ -273,7 +435,7 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
         ch_story: list = [
             Paragraph(f"CHAPTER {ch_num}", S["eyebrow"]),
             Paragraph(_pdf_text(ch_ttl), S["ch_title"]),
-            HRFlowable(width=52, thickness=2, color=colors.black, spaceAfter=18),
+            Spacer(1, 0.15 * inch),
         ]
 
         # Image 1  (before body text)
@@ -283,8 +445,7 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
                 ch_story += [Spacer(1, 0.1 * inch), img, Spacer(1, 0.2 * inch)]
 
         # Body paragraphs
-        for para in _split_paras(body):
-            ch_story.append(Paragraph(_pdf_text(para), S["body"]))
+        ch_story.extend(_rich_text_flowables(body, S))
 
         # Image 2  (after body text)
         if len(imgs) > 1 and imgs[1]:
@@ -296,7 +457,10 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
         if kps:
             kp_inner: list = [Paragraph("KEY POINTS", S["kp_label"])]
             for kp in kps:
-                kp_inner.append(Paragraph(f"\u25b8\u2002{_pdf_text(kp)}", S["kp_item"]))
+                # U+2022 (bullet), not U+25B8 (triangle) \u2014 confirmed present in every
+                # font used here (Times-Roman and all registered Noto Sans <Script>
+                # fonts); U+25B8 isn't, and silently draws as a missing-glyph box.
+                kp_inner.append(Paragraph(f"\u2022\u2002{_pdf_markup(kp)}", S["kp_item"]))
             kp_tbl = Table([[kp_inner]], colWidths=[CONTENT_W])
             kp_tbl.setStyle(TableStyle([
                 ("LEFTPADDING",   (0, 0), (-1, -1), 14),
@@ -308,14 +472,18 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
             ]))
             ch_story += [Spacer(1, 0.15 * inch), kp_tbl]
 
-        story.append(PageBreak())
+        # The preceding section (cover, or "About This Book"/ToC if present) already
+        # ends on its own PageBreak(), so only chapters after the first need one —
+        # otherwise two consecutive PageBreak()s produce a genuinely blank page.
+        if i > 0:
+            story.append(PageBreak())
         story.extend(ch_story)
 
     # ── Assessment ────────────────────────────────────────────────────────────
     if asmnt:
         story.append(PageBreak())
         story.append(Paragraph("Assessment Questions", S["sec_title"]))
-        story.append(HRFlowable(width=CONTENT_W, thickness=1.5, color=colors.black, spaceAfter=20))
+        story.append(Spacer(1, 0.2 * inch))
 
         def _qgroup(qs: list, label: str, qtype: str) -> None:
             if not qs:
@@ -325,17 +493,16 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
                 ch_ref = q.get("chapter_number", "")
                 blk: list = [
                     Paragraph(
-                        f"{j + 1}. {_pdf_text(q.get('question', ''))} "
+                        f"{j + 1}. {_pdf_markup(q.get('question', ''))} "
                         f"<font color='#aaaaaa' size='9'>(Ch.\u202f{_pdf_text(ch_ref)})</font>",
                         S["aq_q"],
                     )
                 ]
                 if qtype == "mcq":
                     for k, opt in enumerate(q.get("options") or []):
-                        opt_text = re.sub(r'^[A-Da-d][)\.]\s*', '', str(opt))
-                        blk.append(Paragraph(f"{chr(65 + k)})\u2002{_pdf_text(opt_text)}", S["aq_opt"]))
+                        blk.append(Paragraph(f"{chr(65 + k)})\u2002{_pdf_markup(opt)}", S["aq_opt"]))
                 if q.get("answer"):
-                    blk.append(Paragraph(f"Answer:\u2002{_pdf_text(q['answer'])}", S["aq_ans"]))
+                    blk.append(Paragraph(f"Answer:\u2002{_pdf_markup(str(q['answer']))}", S["aq_ans"]))
                 story.append(KeepTogether(blk))
                 story.append(Spacer(1, 0.08 * inch))
 
@@ -351,7 +518,7 @@ def generate_pdf(ebook_json: dict, book_title: str) -> bytes:
             Spacer(1, 1.5 * inch),
             Paragraph("Thank You", S["ty_title"]),
             Spacer(1, 0.2 * inch),
-            Paragraph(_pdf_text(thanks), S["ty_text"]),
+            Paragraph(_pdf_markup(thanks), S["ty_text"]),
         ]
 
     doc.build(story, onFirstPage=_page_num_cb, onLaterPages=_page_num_cb)
@@ -378,42 +545,86 @@ def _page_break(doc: Document) -> None:
     run._r.append(br)
 
 
+def _set_run_size(run, size_pt: int) -> None:
+    """Set a run's font size for BOTH Western and complex scripts.
+
+    run.font.size only writes <w:sz> (the Western-script size). Word renders
+    non-Latin scripts (Tamil, Devanagari, Telugu, Kannada, Malayalam, ...) using
+    the SEPARATE <w:szCs> (complex-script size) instead, and python-docx has no
+    high-level API for it. Left unset, szCs falls back to the Normal style's
+    default — so a 22pt chapter title in Tamil would still *display* at whatever
+    the body-text default is, even though the file correctly stores 22pt for w:sz.
+    Setting both keeps headings visually distinct from body text in every language.
+    """
+    run.font.size = Pt(size_pt)
+    sz_cs = OxmlElement("w:szCs")
+    sz_cs.set(qn("w:val"), str(size_pt * 2))  # half-points, same unit as w:sz
+    run._r.get_or_add_rPr().append(sz_cs)
+
+
 def _sp(
     doc: Document, text: str, *,
     bold: bool = False, italic: bool = False, size: int = 12,
     align: int = WD_ALIGN_PARAGRAPH.LEFT,
     before: int = 0, after: int = 8,
     color: tuple[int, int, int] | None = None,
+    font_name: str = FONT_DOCX,
 ) -> None:
-    """Add a styled Times New Roman paragraph to doc."""
+    """Add a styled paragraph to doc (Times New Roman by default)."""
     p = doc.add_paragraph()
     p.alignment = align
     p.paragraph_format.space_before = Pt(before)
     p.paragraph_format.space_after  = Pt(after)
     p.paragraph_format.line_spacing = Pt(size * 1.5)
     run = p.add_run(text)
-    run.font.name   = FONT_DOCX
-    run.font.size   = Pt(size)
+    run.font.name   = font_name
+    _set_run_size(run, size)
     run.font.bold   = bold
     run.font.italic = italic
     if color:
         run.font.color.rgb = RGBColor(*color)
 
 
-def _add_rule(doc: Document, *, bold: bool = False) -> None:
-    """Add a paragraph with a bottom border acting as a horizontal rule."""
+def _rich_paragraph(
+    doc: Document, text: str, *,
+    size: int = 12, align: int = WD_ALIGN_PARAGRAPH.LEFT,
+    before: int = 0, after: int = 8, base_bold: bool = False, base_italic: bool = False,
+    font_name: str = FONT_DOCX, color: tuple[int, int, int] | None = None,
+) -> None:
+    """Add a paragraph split into multiple runs so inline <b>/<i> tags render as
+    real bold/italic instead of literal text (any other stray tag is dropped)."""
     p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(4)
-    p.paragraph_format.space_after  = Pt(8)
-    pPr    = p._p.get_or_add_pPr()
-    pBdr   = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"),   "single")
-    bottom.set(qn("w:sz"),    "12" if bold else "6")
-    bottom.set(qn("w:space"), "0")
-    bottom.set(qn("w:color"), "000000")
-    pBdr.append(bottom)
-    pPr.append(pBdr)
+    p.alignment = align
+    p.paragraph_format.space_before = Pt(before)
+    p.paragraph_format.space_after  = Pt(after)
+    p.paragraph_format.line_spacing = Pt(size * 1.5)
+    for seg, bold, italic in _split_inline_runs(text):
+        run = p.add_run(seg)
+        run.font.name   = font_name
+        _set_run_size(run, size)
+        run.font.bold   = base_bold or bold
+        run.font.italic = base_italic or italic
+        if color:
+            run.font.color.rgb = RGBColor(*color)
+
+
+def _rich_text_docx(doc: Document, text: str, *, size: int = 12, align: int = WD_ALIGN_PARAGRAPH.LEFT) -> None:
+    """Render AI-generated text (headings/bold/italic/lists/code) as real Word
+    elements, in place of dumping the raw HTML-tagged string into one paragraph."""
+    for block in _parse_content_blocks(text):
+        if block["type"] == "heading":
+            _rich_paragraph(doc, block["text"], size=15, base_bold=True, before=10, after=6)
+        elif block["type"] == "code":
+            lines = block["text"].split("\n")
+            for i, line in enumerate(lines):
+                _sp(doc, line or " ", size=10, font_name="Courier New",
+                    color=(51, 51, 51), before=4 if i == 0 else 0, after=4 if i == len(lines) - 1 else 0)
+        elif block["type"] == "list":
+            for idx, item in enumerate(block["items"]):
+                prefix = f"{idx + 1}. " if block["ordered"] else "•  "
+                _rich_paragraph(doc, prefix + item, size=size, before=1, after=1)
+        else:
+            _rich_paragraph(doc, block["text"], size=size, align=align, after=8)
 
 
 def _docx_image(doc: Document, data_url: str, max_w_in: float, max_h_in: float) -> None:
@@ -480,16 +691,19 @@ def _kp_box(doc: Document, key_points: list[str]) -> None:
     lr  = lp.add_run("KEY POINTS")
     lr.font.name  = FONT_DOCX
     lr.font.bold  = True
-    lr.font.size  = Pt(9)
+    _set_run_size(lr, 9)
     lr.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
 
     # Bullet items
     for kp in key_points:
-        ip = cell.add_paragraph(f"\u25b8\u2002{kp}")
+        ip = cell.add_paragraph()
         ip.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        for run in ip.runs:
-            run.font.name = FONT_DOCX
-            run.font.size = Pt(11)
+        for seg, bold, italic in _split_inline_runs(f"\u25b8\u2002{kp}"):
+            run = ip.add_run(seg)
+            run.font.name   = FONT_DOCX
+            _set_run_size(run, 11)
+            run.font.bold   = bold
+            run.font.italic = italic
 
 
 def _docx_footer_page_num(doc: Document) -> None:
@@ -503,7 +717,7 @@ def _docx_footer_page_num(doc: Document) -> None:
         def _run(txt: str) -> None:
             r = p.add_run(txt)
             r.font.name  = FONT_DOCX
-            r.font.size  = Pt(10)
+            _set_run_size(r, 10)
             r.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
 
         _run("\u2014\u2009")  # em-dash + thin space
@@ -511,7 +725,7 @@ def _docx_footer_page_num(doc: Document) -> None:
         # PAGE field code
         r2 = p.add_run()
         r2.font.name = FONT_DOCX
-        r2.font.size = Pt(10)
+        _set_run_size(r2, 10)
         r2.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
         for tag, ftype in [("begin", None), (None, " PAGE "), ("end", None)]:
             if tag is not None:
@@ -564,7 +778,6 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
     if subtitle:
         _sp(doc, subtitle,
             italic=True, size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=6)
-    _add_rule(doc, bold=True)
     if author:
         _sp(doc, f"by {author}", size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=20)
     if cov_img:
@@ -577,17 +790,14 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
     # ── About This Book ───────────────────────────────────────────────────────
     if summary:
         _sp(doc, "About This Book",
-            bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=4)
-        _add_rule(doc, bold=True)
-        for para in _split_paras(summary):
-            _sp(doc, para, size=12, align=WD_ALIGN_PARAGRAPH.JUSTIFY)
+            bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
+        _rich_text_docx(doc, summary, size=12, align=WD_ALIGN_PARAGRAPH.JUSTIFY)
         _page_break(doc)
 
     # ── Table of Contents ─────────────────────────────────────────────────────
     if toc:
         _sp(doc, "Table of Contents",
-            bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=4)
-        _add_rule(doc, bold=True)
+            bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
 
         pg_count = ej.get("page_count", 15)
         front    = 1 + (1 if summary else 0) + 1
@@ -608,20 +818,20 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
             p0.alignment = WD_ALIGN_PARAGRAPH.LEFT
             r0 = p0.add_run(f"{num}. {ttl}")
             r0.font.name = FONT_DOCX
-            r0.font.size = Pt(12)
+            _set_run_size(r0, 12)
 
             p1 = row[1].paragraphs[0]
             p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
             r1 = p1.add_run("." * 25)
             r1.font.name = FONT_DOCX
-            r1.font.size = Pt(10)
+            _set_run_size(r1, 10)
             r1.font.color.rgb = RGBColor(0xCC, 0xCC, 0xCC)
 
             p2 = row[2].paragraphs[0]
             p2.alignment = WD_ALIGN_PARAGRAPH.RIGHT
             r2 = p2.add_run(pg)
             r2.font.name = FONT_DOCX
-            r2.font.size = Pt(12)
+            _set_run_size(r2, 12)
             r2.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
 
         _page_break(doc)
@@ -638,14 +848,12 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
         imgs   = ch_imgs.get(str(i), [])
 
         _sp(doc, f"CHAPTER {ch_num}", size=9, color=(119, 119, 119), after=4)
-        _sp(doc, ch_ttl, bold=True, size=22, after=4)
-        _add_rule(doc)
+        _sp(doc, ch_ttl, bold=True, size=22, after=16)
 
         if imgs and imgs[0]:
             _docx_image(doc, imgs[0], MAX_IMG_W * 0.8, MAX_IMG_H - 0.4)
 
-        for para in _split_paras(body):
-            _sp(doc, para, size=12, align=WD_ALIGN_PARAGRAPH.JUSTIFY)
+        _rich_text_docx(doc, body, size=12, align=WD_ALIGN_PARAGRAPH.JUSTIFY)
 
         if len(imgs) > 1 and imgs[1]:
             _docx_image(doc, imgs[1], MAX_IMG_W * 0.8, MAX_IMG_H - 0.4)
@@ -657,22 +865,20 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
     if asmnt:
         _page_break(doc)
         _sp(doc, "Assessment Questions",
-            bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=4)
-        _add_rule(doc, bold=True)
+            bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
 
         def _qgroup_docx(qs: list, label: str, qtype: str) -> None:
             if not qs:
                 return
             _sp(doc, label, bold=True, size=14, before=12, after=6)
             for j, q in enumerate(qs):
-                _sp(doc, f"{j + 1}. {q.get('question', '')}", bold=True, size=12, after=4)
+                _rich_paragraph(doc, f"{j + 1}. {q.get('question', '')}", size=12, base_bold=True, after=4)
                 if qtype == "mcq":
                     for k, opt in enumerate(q.get("options") or []):
-                        opt_text = re.sub(r'^[A-Da-d][)\.]\s*', '', str(opt))
-                        _sp(doc, f"   {chr(65 + k)}) {opt_text}", size=11, after=2)
+                        _rich_paragraph(doc, f"   {chr(65 + k)}) {opt}", size=11, after=2)
                 if q.get("answer"):
-                    _sp(doc, f"Answer: {q['answer']}", italic=True, size=10,
-                        color=(85, 85, 85), after=8)
+                    _rich_paragraph(doc, f"Answer: {q['answer']}", size=10, base_italic=True,
+                                     color=(85, 85, 85), after=8)
 
         _qgroup_docx(asmnt.get("mcq_questions"),          "Multiple Choice Questions", "mcq")
         _qgroup_docx(asmnt.get("fill_in_blank_questions"), "Fill in the Blanks",       "fib")
@@ -684,8 +890,8 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
         _page_break(doc)
         _sp(doc, "Thank You",
             bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, before=72, after=16)
-        _sp(doc, thanks, italic=True, size=12,
-            align=WD_ALIGN_PARAGRAPH.CENTER, color=(68, 68, 68))
+        _rich_paragraph(doc, thanks, size=12, base_italic=True,
+                         align=WD_ALIGN_PARAGRAPH.CENTER, color=(68, 68, 68))
 
     _docx_footer_page_num(doc)
 

@@ -537,7 +537,7 @@ async def download_ebook_pdf(ebook_id: uuid.UUID, current_user: CurrentUser, db:
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_pdf", db=db, org_id=ebook.org_id)
     await points_service.deduct(user_id=current_user.id, action="ebook_download_pdf", db=db, org_id=ebook.org_id)
 
-    pdf_bytes = await run_in_threadpool(generate_pdf, ebook.ebook_json, ebook.title)
+    pdf_bytes = await run_in_threadpool(generate_pdf, ebook.ebook_json, ebook.title, ebook.language)
     safe_name = urllib.parse.quote(ebook.title, safe="")
     return Response(
         content=pdf_bytes,

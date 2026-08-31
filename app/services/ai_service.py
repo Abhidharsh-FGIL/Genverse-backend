@@ -2499,56 +2499,82 @@ Return ONLY valid JSON in this exact structure:
         images_per_chapter = {"minimal": 0, "standard": 1, "visual_heavy": 2}.get(image_density, 1)
         result: dict = {"cover_image": None, "chapter_images": {}}
 
+        image_model = settings.AI_IMAGE_MODEL
+        # Some model/API version combinations reject or silently ignore one
+        # particular response_modalities shape — falling back through a few
+        # known-working variants (same approach already proven out in the
+        # infographic generator) avoids a single strict config making every
+        # image fail for a reason unrelated to the prompt itself.
+        _configs_to_try = [
+            types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+            types.GenerateContentConfig(response_modalities=["IMAGE"]),
+            None,
+        ]
+
         def _generate_image(prompt: str) -> str | None:
             """Generate an infographic image using Gemini and return as base64 data URL."""
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash-image",
-                    contents=[prompt],
-                    config=types.GenerateContentConfig(
-                        response_modalities=["TEXT", "IMAGE"],
-                    ),
-                )
+            for attempt, cfg in enumerate(_configs_to_try):
+                try:
+                    call_kwargs: dict = dict(model=image_model, contents=[prompt])
+                    if cfg is not None:
+                        call_kwargs["config"] = cfg
+                    response = client.models.generate_content(**call_kwargs)
 
-                # Safely access candidates
-                if not response.candidates:
-                    print(f"[EbookImage] No candidates in response. Prompt feedback: {getattr(response, 'prompt_feedback', 'N/A')}")
-                    return None
+                    # Safely access candidates
+                    if not response.candidates:
+                        print(f"[EbookImage] No candidates (attempt {attempt+1}). Prompt feedback: {getattr(response, 'prompt_feedback', 'N/A')}")
+                        continue
 
-                candidate = response.candidates[0]
-                if not candidate.content or not candidate.content.parts:
-                    print(f"[EbookImage] No content parts. Finish reason: {getattr(candidate, 'finish_reason', 'N/A')}")
-                    return None
+                    candidate = response.candidates[0]
+                    if not candidate.content or not candidate.content.parts:
+                        print(f"[EbookImage] No content parts (attempt {attempt+1}). Finish reason: {getattr(candidate, 'finish_reason', 'N/A')}")
+                        continue
 
-                for part in candidate.content.parts:
-                    if part.inline_data is not None:
-                        img_bytes = part.inline_data.data
-                        mime = part.inline_data.mime_type or "image/png"
-                        b64 = base64.b64encode(img_bytes).decode("utf-8")
-                        print(f"[EbookImage] Image generated ({len(img_bytes)} bytes)")
-                        return f"data:{mime};base64,{b64}"
+                    for part in candidate.content.parts:
+                        if part.inline_data is not None:
+                            img_bytes = part.inline_data.data
+                            mime = part.inline_data.mime_type or "image/png"
+                            b64 = base64.b64encode(img_bytes).decode("utf-8")
+                            print(f"[EbookImage] Image generated ({len(img_bytes)} bytes)")
+                            return f"data:{mime};base64,{b64}"
 
-                print("[EbookImage] Response had parts but no image data found")
-                return None
-            except Exception as e:
-                print(f"[EbookImage] Generation failed: {type(e).__name__}: {e}")
-                return None
+                    print(f"[EbookImage] Response had parts but no image data found (attempt {attempt+1})")
+                except Exception as e:
+                    print(f"[EbookImage] Generation failed (attempt {attempt+1}): {type(e).__name__}: {e}")
+            return None
+
+        # image_types ("diagrams" / "concept_visuals" / "real_world") previously
+        # reached this function but was never read — the selection had zero
+        # effect on what got generated. Each maps to concrete style guidance
+        # injected into the prompt below, and when multiple are selected they
+        # rotate across the generated images so the mix is actually reflected.
+        IMAGE_TYPE_STYLES = {
+            "diagrams": "Style: a clean labeled DIAGRAM — a flowchart, cycle diagram, labeled cross-section, or process diagram with arrows/connectors showing how the concepts relate.",
+            "concept_visuals": "Style: an abstract CONCEPT VISUALIZATION — icons and symbolic illustrations / visual metaphors that make the abstract idea intuitive at a glance, not a literal scene.",
+            "real_world": "Style: a REAL-WORLD EXAMPLE illustration — a realistic scene showing the concept applied in everyday life or a practical, concrete context.",
+        }
+        selected_types = [t for t in (image_types or []) if t in IMAGE_TYPE_STYLES] or ["diagrams"]
+
+        def _style_guidance(seq: int) -> str:
+            return IMAGE_TYPE_STYLES[selected_types[seq % len(selected_types)]]
 
         def _build_cover_prompt() -> str:
             return (
-                f"Create a professional, visually stunning cover art illustration for an educational eBook.\n\n"
+                f"Create a professional, visually stunning book cover image for an educational eBook.\n\n"
+                f"Book Title: {title}\n"
                 f"Subject: {subj_str}\n"
                 f"Grade Level: {grade_str}\n\n"
                 "Design requirements:\n"
-                "- Pure visual illustration — NO text, NO words, NO letters, NO title in the image\n"
-                "- Rich, vibrant colors and icons directly related to the subject matter\n"
-                "- Include relevant subject-specific illustrations, diagrams, icons, or symbols\n"
+                "- Clean, modern book cover design\n"
+                "- Bold, prominent title text at the center\n"
+                "- Use vibrant, appealing colors related to the subject\n"
+                "- Include relevant icons or illustrations related to the topic\n"
                 "- Professional educational style suitable for students\n"
-                "- High information density — fill the frame with relevant visual elements\n"
-                "- Think book cover art: striking, colourful, thematic — no text overlay"
+                "- No blank or empty spaces — fill with relevant visual elements\n"
+                "- The image should look like a real book cover"
             )
 
-        def _build_chapter_prompt(ch: dict, img_idx: int) -> str:
+        def _build_chapter_prompt(ch: dict, img_idx: int, seq: int) -> str:
             ch_title = ch.get("title", "")
             key_pts = ch.get("key_points", []) or []
             key_pts_str = "\n".join(f"- {kp}" for kp in key_pts[:5]) if key_pts else ""
@@ -2564,6 +2590,7 @@ Return ONLY valid JSON in this exact structure:
                 f"Grade Level: {grade_str}\n"
                 f"Chapter Summary: {summary}\n\n"
                 f"Key information to visualize:\n{key_pts_str}\n\n"
+                f"{_style_guidance(seq)}\n\n"
                 "Design requirements:\n"
                 "- Bold heading at the top with the chapter title\n"
                 "- Use vibrant colors, icons, and visual hierarchy\n"
@@ -2585,9 +2612,11 @@ Return ONLY valid JSON in this exact structure:
 
         if images_per_chapter > 0:
             max_chapters = 10
+            seq = 0
             for i, ch in enumerate(chapters[:max_chapters]):
                 for img_idx in range(images_per_chapter):
-                    tasks.append((f"ch_{i}_{img_idx}", i, _build_chapter_prompt(ch, img_idx)))
+                    tasks.append((f"ch_{i}_{img_idx}", i, _build_chapter_prompt(ch, img_idx, seq)))
+                    seq += 1
 
         # Run ALL image generations in parallel
         print(f"[EbookImage] Generating {len(tasks)} images in parallel...")

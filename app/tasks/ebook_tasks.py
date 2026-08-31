@@ -140,35 +140,39 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
     })
 
     # ── Generate images ──
-    # Always generate at minimum the cover image. generate_ebook_images() uses
-    # images_per_chapter=0 for "minimal", so chapter images are skipped but
-    # the cover is always produced regardless of density.
     image_density = params.get("image_density", "standard")
-    _publish(r, channel, {
-        "stage": "images",
-        "progress": 62,
-        "message": "Creating cover image..." if image_density == "minimal" else "Creating images...",
-    })
-    try:
-        generated_chapters = ebook_data.get("chapters", [])
-        images = await ai.generate_ebook_images(
-            title=params["title"],
-            chapters=generated_chapters,
-            image_density=image_density,
-            image_types=params.get("image_types"),
-            subject=params.get("subject"),
-            grade=params.get("grade"),
-            tone=params.get("tone", "academic"),
-        )
-        ebook_data["images"] = images
-    except Exception as e:
-        print(f"[EbookTask] Image generation error: {e}", flush=True)
+    if image_density != "minimal":
+        _publish(r, channel, {
+            "stage": "images",
+            "progress": 62,
+            "message": "Creating images...",
+        })
+        try:
+            generated_chapters = ebook_data.get("chapters", [])
+            images = await ai.generate_ebook_images(
+                title=params["title"],
+                chapters=generated_chapters,
+                image_density=image_density,
+                image_types=params.get("image_types"),
+                subject=params.get("subject"),
+                grade=params.get("grade"),
+                tone=params.get("tone", "academic"),
+            )
+            ebook_data["images"] = images
+        except Exception as e:
+            print(f"[EbookTask] Image generation error: {e}", flush=True)
 
-    _publish(r, channel, {
-        "stage": "images_done",
-        "progress": 85,
-        "message": "Cover created" if image_density == "minimal" else "Images created",
-    })
+        _publish(r, channel, {
+            "stage": "images_done",
+            "progress": 85,
+            "message": "Images created",
+        })
+    else:
+        _publish(r, channel, {
+            "stage": "images_done",
+            "progress": 85,
+            "message": "Skipping images (minimal density)",
+        })
 
     # ── Save to DB (sync session in Celery worker) ──
     _publish(r, channel, {
