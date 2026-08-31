@@ -93,6 +93,11 @@ async def record_activity(
     # Update workspace-specific streak + daily XP
     ws_gam = await _get_or_create_ws_gamification(current_user.id, org_id, db)
     already_today = False
+    # A brand-new workspace (no prior activity ping) means this call is the
+    # user's very first ever login — i.e. right after signup. Don't hand out
+    # daily-login XP or auto-award streak badges for just showing up; those
+    # start accruing from the user's next actual return.
+    is_first_ever = ws_gam.last_activity_date is None
 
     if ws_gam.last_activity_date:
         last_dt = ws_gam.last_activity_date
@@ -111,10 +116,12 @@ async def record_activity(
 
     if not already_today:
         ws_gam.last_activity_date = now
-        # Award daily login XP (only once per day per workspace)
-        ws_gam.xp = (ws_gam.xp or 0) + DAILY_LOGIN_XP
-        # Also update global XP and streak (backward compatible)
-        current_user.xp = (current_user.xp or 0) + DAILY_LOGIN_XP
+        # Award daily login XP (only once per day per workspace, and never on
+        # the very first ping right after signup)
+        if not is_first_ever:
+            ws_gam.xp = (ws_gam.xp or 0) + DAILY_LOGIN_XP
+            # Also update global XP (backward compatible)
+            current_user.xp = (current_user.xp or 0) + DAILY_LOGIN_XP
         if current_user.last_login_date:
             gl_dt = current_user.last_login_date
             if gl_dt.tzinfo is None:
@@ -131,13 +138,16 @@ async def record_activity(
 
     await db.commit()
 
-    # Check for newly earned badges after streak/XP update
-    try:
-        from app.services.badge_service import check_and_award_badges
-        parsed_oid = _parse_org_id(org_id)
-        new_badges = await check_and_award_badges(current_user.id, db, parsed_oid)
-    except Exception:
-        new_badges = []
+    # Check for newly earned badges after streak/XP update — skipped on the
+    # first-ever ping so signup itself doesn't silently hand out badge XP.
+    new_badges = []
+    if not is_first_ever:
+        try:
+            from app.services.badge_service import check_and_award_badges
+            parsed_oid = _parse_org_id(org_id)
+            new_badges = await check_and_award_badges(current_user.id, db, parsed_oid)
+        except Exception:
+            new_badges = []
 
     return {"streak": ws_gam.streak or 0, "xp": ws_gam.xp or 0, "new_badges": new_badges}
 

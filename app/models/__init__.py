@@ -6,6 +6,7 @@ from app.models.subscription import (
     PointCost,
     PointTransaction,
     SubscriptionAddon,
+    PaymentIntent,
     FeatureLimit,
     UsageCounter,
 )

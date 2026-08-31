@@ -174,40 +174,28 @@ def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = "
     Called asynchronously after a file is uploaded via POST /library/upload.
     The UserLibraryItem already exists with processing_status='processing'.
     """
-    from sqlalchemy import select as _sa_select, delete as _sa_delete
-
-    print(f"[Celery] Starting processing for '{filename}' (item={item_id}, user={user_id})")
+    logger.info("[Vault] Starting processing for '%s' (item=%s, user=%s)", filename, item_id, user_id)
     db: Session = SyncSessionLocal()
     try:
         item = db.get(UserLibraryItem, uuid.UUID(item_id))
         if not item:
-            print(f"[Celery] ERROR: Item {item_id} ('{filename}') not found in DB")
+            logger.error("[Vault] Item %s ('%s') not found in DB", item_id, filename)
             return {"status": "error", "detail": "Item not found"}
 
         if item.processing_status == "ready":
-            print(f"[Celery] '{filename}' already processed, skipping")
+            logger.info("[Vault] '%s' already processed, skipping", filename)
             return {"status": "skipped", "detail": "Already processed"}
 
         ai = AIService()
         faiss_svc = FAISSService(settings.STORAGE_ROOT)
 
-        # Remove any stale chunks from a previous failed/partial attempt
-        old_ids = [str(r[0]) for r in db.execute(
-            _sa_select(DocChunk.id).where(DocChunk.library_item_id == item.id)
-        ).all()]
-        if old_ids:
-            print(f"[Celery] Removing {len(old_ids)} stale chunk(s) before reprocessing")
-            faiss_svc.remove_chunks(user_id=user_id, chunk_ids=set(old_ids))
-            db.execute(_sa_delete(DocChunk).where(DocChunk.library_item_id == item.id))
-            db.flush()
-
         # 1. Extract text from the stored file
-        print(f"[Celery] Extracting text from '{filename}' (path: {item.storage_path})")
+        logger.info("[Vault] Extracting text from '%s' (path: %s)", filename, item.storage_path)
         extracted_text = _run_async(ai.extract_text_from_file(item.storage_path))
         if not extracted_text:
             item.processing_status = "failed"
             db.commit()
-            print(f"[Celery] WARNING: No text extracted from '{filename}' — marked as failed")
+            logger.warning("[Vault] No text extracted from '%s'", filename)
             _publish_vault_event(user_id, {
                 "type": "item_status",
                 "item_id": item_id,
@@ -215,11 +203,15 @@ def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = "
             })
             return {"status": "error", "detail": "No text extracted"}
 
-        print(f"[Celery] Extracted {len(extracted_text)} chars from '{filename}'")
+        # Log extracted text (truncated to 2000 chars for readability)
+        preview = extracted_text[:2000]
+        logger.info("[Vault] Extracted text from '%s' (%d chars):\n%s%s",
+                     filename, len(extracted_text), preview,
+                     "..." if len(extracted_text) > 2000 else "")
 
         # 2. Semantic chunking
         chunks = ai.semantic_chunk_text(extracted_text)
-        print(f"[Celery] '{filename}' → {len(chunks)} chunks")
+        logger.info("[Vault] '%s' → %d chunks", filename, len(chunks))
 
         # 3. Create chunk records + generate embeddings
         chunk_ids: list[str] = []
@@ -232,7 +224,7 @@ def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = "
                 chunk_order=i,
             )
             db.add(doc_chunk)
-            db.flush()
+            db.flush()  # get the assigned id
 
             embedding = _run_async(ai.generate_embedding(chunk_text))
             if embedding:
@@ -253,7 +245,11 @@ def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = "
         item.processing_status = "ready"
         db.commit()
 
-        print(f"[Celery] '{filename}' done — {len(chunk_ids)} embeddings stored")
+        logger.info(
+            "[Vault] '%s' processed successfully: %d chunks, %d embeddings",
+            filename, len(chunks), len(chunk_ids),
+        )
+        # Notify any listening SSE subscribers that this item is now ready.
         _publish_vault_event(user_id, {
             "type": "item_status",
             "item_id": item_id,
@@ -270,7 +266,6 @@ def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = "
 
     except Exception as exc:
         db.rollback()
-        print(f"[Celery] ERROR processing '{filename}' (item={item_id}): {exc}")
         # Mark as failed on final retry
         if self.request.retries >= self.max_retries:
             try:
@@ -285,6 +280,7 @@ def process_vault_embeddings(self, item_id: str, user_id: str, filename: str = "
                     })
             except Exception:
                 db.rollback()
+        logger.exception("[Vault] Failed processing '%s' (item=%s)", filename, item_id)
         raise self.retry(exc=exc, countdown=10 * (self.request.retries + 1))
     finally:
         db.close()

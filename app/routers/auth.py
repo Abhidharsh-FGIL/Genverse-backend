@@ -180,7 +180,9 @@ def _hash_otp(otp: str) -> str:
 @router.post("/send-otp")
 async def send_otp(payload: SendOtpRequest, db: DBSession):
     """Generate a 6-digit OTP and email it to the user for verification."""
+    print("I am send otp")
     email = payload.email.lower().strip()
+    print(f"payload is {payload}")
 
     # Check if email is already registered
     existing = await db.execute(select(User).where(User.email == email))

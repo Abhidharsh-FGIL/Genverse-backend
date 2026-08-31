@@ -22,17 +22,18 @@ import uuid
 import hmac
 import hashlib
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote as url_quote
 
 import httpx
 import stripe
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from pydantic import BaseModel
 from typing import Optional
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, update
 
 from app.config import settings
 from app.dependencies import DBSession, CurrentUser
-from app.models.subscription import Subscription, PlanDefinition, SubscriptionAddon, PointTransaction
+from app.models.subscription import Subscription, PlanDefinition, SubscriptionAddon, PointTransaction, PaymentIntent
 from app.models.promo import PromoCode, PromoUsage
 from app.models.user import User
 from app.services.email_service import send_purchase_invoice_email
@@ -201,7 +202,12 @@ async def _create_phonepe_order(
 
 
 async def _get_phonepe_order_status(merchant_order_id: str) -> dict:
-    """Check the status of a PhonePe order."""
+    """Check the status of a PhonePe ONE-TIME order (Standard Checkout).
+
+    Only valid for merchant_order_ids created via _create_phonepe_order.
+    Do not call this for a recurring-subscription order — use
+    _get_phonepe_subscription_status instead (see _check_phonepe_payment_status).
+    """
     access_token = await _get_phonepe_access_token()
     status_url = f"{settings.PHONEPE_BASE_URL}/checkout/v2/order/{merchant_order_id}/status"
 
@@ -211,12 +217,154 @@ async def _get_phonepe_order_status(merchant_order_id: str) -> dict:
             headers={"Authorization": f"O-Bearer {access_token}"},
         )
         if resp.status_code != 200:
-            print(f"[PhonePe] Status check failed: {resp.status_code} {resp.text}", flush=True)
+            print(f"[PhonePe] Order status check failed: {resp.status_code} {resp.text}", flush=True)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Failed to check payment status",
             )
         return resp.json()
+
+
+async def _get_phonepe_subscription_status(merchant_subscription_id: str) -> dict:
+    """Check the status of a PhonePe recurring UPI AutoPay subscription/mandate.
+
+    This is a COMPLETELY DIFFERENT API from _get_phonepe_order_status, with a
+    different state vocabulary (ACTIVATION_IN_PROGRESS / ACTIVE / EXPIRED /
+    FAILED / CANCELLED / REVOKED / ... — never "COMPLETED"). Required because
+    create_checkout tries a recurring mandate FIRST for every plan upgrade
+    (see _create_phonepe_subscription) — a payment made through that flow can
+    never be confirmed by querying the one-time-order status endpoint.
+    """
+    access_token = await _get_phonepe_access_token()
+    status_url = f"{settings.PHONEPE_BASE_URL}/subscriptions/v2/{merchant_subscription_id}/status?details=true"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            status_url,
+            headers={"Authorization": f"O-Bearer {access_token}"},
+        )
+        if resp.status_code != 200:
+            print(f"[PhonePe] Subscription status check failed: {resp.status_code} {resp.text}", flush=True)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to check payment status",
+            )
+        return resp.json()
+
+
+async def _check_phonepe_payment_status(merchant_order_id: str, flow: str | None = None) -> dict:
+    """Resolve a merchant_order_id's payment status regardless of whether it
+    was created via the standard one-time Checkout API or the recurring UPI
+    AutoPay subscription API, normalising both into one vocabulary.
+
+    Pass `flow` ("order" | "subscription") when known — from the local
+    PaymentIntent record — to check the right endpoint directly. When
+    unknown, tries the order-status endpoint first and falls back to the
+    subscription-status endpoint (covers orders created before PaymentIntent
+    existed, or if the two ever get out of sync).
+
+    Returns {"flow": "order"|"subscription", "normalized_state": "COMPLETED"|"PENDING"|"FAILED", "raw": {...}}.
+    """
+    async def _try_order() -> dict | None:
+        try:
+            raw = await _get_phonepe_order_status(merchant_order_id)
+        except HTTPException:
+            return None
+        state = raw.get("state") or raw.get("data", {}).get("state", "")
+        if not state:
+            return None
+        # Only map to FAILED for a state we KNOW means failure. Any
+        # unrecognized value (e.g. this endpoint returning something odd for
+        # what's actually a subscription-flow ID, or a future PhonePe state
+        # we haven't seen) defaults to PENDING — safe to recheck later, unlike
+        # FAILED which stops fulfilment from ever being retried for a
+        # payment that may have genuinely succeeded.
+        if state == "COMPLETED":
+            normalized = "COMPLETED"
+        elif state in ("FAILED", "CANCELLED", "EXPIRED"):
+            normalized = "FAILED"
+        else:  # PENDING, INITIATED, or anything unrecognized
+            normalized = "PENDING"
+        return {"flow": "order", "normalized_state": normalized, "raw": raw}
+
+    async def _try_subscription() -> dict | None:
+        try:
+            raw = await _get_phonepe_subscription_status(merchant_order_id)
+        except HTTPException:
+            return None
+        state = raw.get("state", "")
+        if not state:
+            return None
+        # Same reasoning as _try_order: only a state we KNOW is terminal-failure
+        # maps to FAILED; anything unrecognized defaults to PENDING rather than
+        # risking a real payment getting permanently marked as failed.
+        if state == "ACTIVE":
+            normalized = "COMPLETED"
+        elif state in ("EXPIRED", "FAILED", "CANCELLED", "REVOKED"):
+            normalized = "FAILED"
+        else:  # ACTIVATION_IN_PROGRESS, PAUSE_IN_PROGRESS, PAUSED, UNPAUSE_IN_PROGRESS,
+               # CANCEL_IN_PROGRESS, REVOKE_IN_PROGRESS, or anything unrecognized
+            normalized = "PENDING"
+        return {"flow": "subscription", "normalized_state": normalized, "raw": raw}
+
+    if flow == "subscription":
+        result = await _try_subscription()
+        if result:
+            return result
+        result = await _try_order()
+    else:
+        result = await _try_order()
+        if result:
+            return result
+        result = await _try_subscription()
+
+    if result:
+        return result
+
+    print(f"[PhonePe] Could not resolve status for {merchant_order_id} via either order or subscription API", flush=True)
+    return {"flow": "unknown", "normalized_state": "PENDING", "raw": {}}
+
+
+async def _try_claim_payment_intent(db, merchant_order_id: str) -> bool:
+    """Atomically claim a PaymentIntent for fulfilment, using its `status`
+    column as a compare-and-swap lock (pending -> fulfilling).
+
+    Needed because /phonepe/status/{id} (frontend redirect), /phonepe/webhook,
+    and the payment_reconciliation sweep can now all genuinely succeed at
+    confirming the same payment — before this fix, in practice only one path
+    ever actually worked (the others were broken), so this race was
+    theoretical. Now that all three work, they can fire close enough together
+    to both pass _fulfil_purchase's time-window dedup check before either has
+    committed, double-crediting the user. This claim makes only one caller
+    proceed; the loser should re-read the intent's (now updated) status
+    instead of calling _fulfil_purchase itself.
+
+    Returns True only if THIS caller won the race. On any exception during
+    the caller's subsequent fulfilment work, the caller MUST call
+    _release_payment_intent_claim to revert the status back to "pending" —
+    otherwise the intent is stuck at "fulfilling" forever and the
+    reconciliation sweep (which only looks at status="pending") will never
+    retry it.
+    """
+    result = await db.execute(
+        update(PaymentIntent)
+        .where(PaymentIntent.merchant_order_id == merchant_order_id, PaymentIntent.status == "pending")
+        .values(status="fulfilling")
+    )
+    await db.commit()
+    return result.rowcount > 0
+
+
+async def _release_payment_intent_claim(db, merchant_order_id: str) -> None:
+    """Revert a claimed-but-failed PaymentIntent back to "pending" so it can
+    be retried (by a later webhook call, redirect check, or the
+    reconciliation sweep) instead of being stuck at "fulfilling" forever."""
+    await db.execute(
+        update(PaymentIntent)
+        .where(PaymentIntent.merchant_order_id == merchant_order_id, PaymentIntent.status == "fulfilling")
+        .values(status="pending")
+    )
+    await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -370,9 +518,18 @@ async def _fulfil_purchase(
     promo_code: str | None = None,
     promo_discount: int = 0,
     background_tasks: BackgroundTasks | None = None,
+    amount_inr: int | None = None,
 ):
     """Apply the purchased plan/addon to the user's subscription.
-    Idempotent — skips if the same order was already fulfilled."""
+    Idempotent — skips if the same order was already fulfilled.
+
+    `amount_inr` should be the actual amount charged for THIS purchase
+    (post-promo, the final amount) — pass it whenever it's known (from the
+    local PaymentIntent record, or straight off a webhook payload) rather
+    than leaving it unset, since PLAN_PRICES/ADDON_POINT_MAP are hardcoded
+    fallbacks that can silently drift out of sync with the real price
+    (e.g. plan_definitions.price_inr for individual_power is 999 while
+    PLAN_PRICES has 799 — one of them is stale)."""
     # Deduplication: if a transaction for this exact item exists in the last 2 min, skip
     # Uses exact action match and .first() to avoid errors with multiple rows
     if merchant_order_id:
@@ -456,11 +613,12 @@ async def _fulfil_purchase(
             # Record the plan upgrade/renewal as a point transaction (credit)
             action_label = f"renewal_{item_id}" if is_renewal else f"plan_upgrade_{item_id}"
             txn_meta = {"gateway": gateway or "N/A"}
+            final_amount = amount_inr if amount_inr is not None else PLAN_PRICES.get(item_id, 0)
+            txn_meta["final_amount"] = final_amount
             if promo_code and promo_discount:
                 txn_meta["promo_code"] = promo_code
                 txn_meta["promo_discount"] = promo_discount
-                txn_meta["original_amount"] = PLAN_PRICES.get(item_id, 0)
-                txn_meta["final_amount"] = PLAN_PRICES.get(item_id, 0) - promo_discount
+                txn_meta["original_amount"] = final_amount + promo_discount
             txn = PointTransaction(
                 subscription_id=sub.id,
                 user_id=user_id,
@@ -494,11 +652,12 @@ async def _fulfil_purchase(
             db.add(addon)
             # Record transaction
             addon_meta = {"gateway": gateway or "N/A"}
+            addon_final_amount = amount_inr if amount_inr is not None else addon_info.get("price", 0)
+            addon_meta["final_amount"] = addon_final_amount
             if promo_code and promo_discount:
                 addon_meta["promo_code"] = promo_code
                 addon_meta["promo_discount"] = promo_discount
-                addon_meta["original_amount"] = addon_info.get("price", 0)
-                addon_meta["final_amount"] = addon_info.get("price", 0) - promo_discount
+                addon_meta["original_amount"] = addon_final_amount + promo_discount
             txn = PointTransaction(
                 subscription_id=sub.id,
                 user_id=user_id,
@@ -527,8 +686,8 @@ async def _fulfil_purchase(
                 )
                 pd = plan_def_result.scalar_one_or_none()
                 label = pd.display_name if pd else item_id.replace("_", " ").title()
-                price = PLAN_PRICES.get(item_id, 0)
-                final_price = price - promo_discount if promo_discount else price
+                final_price = amount_inr if amount_inr is not None else PLAN_PRICES.get(item_id, 0)
+                price = final_price + promo_discount if promo_discount else final_price
                 period_start = sub.current_period_start.strftime("%b %d, %Y") if sub.current_period_start else None
                 period_end = sub.current_period_end.strftime("%b %d, %Y") if sub.current_period_end else None
 
@@ -555,10 +714,10 @@ async def _fulfil_purchase(
                     send_purchase_invoice_email(**invoice_kwargs)
             elif item_type == "point_pack":
                 addon_info = ADDON_POINT_MAP.get(item_id, {})
-                price = addon_info.get("price", 0)
                 pts = addon_info.get("points", 0)
                 label = f"{pts} AI Points Pack"
-                final_price = price - promo_discount if promo_discount else price
+                final_price = amount_inr if amount_inr is not None else addon_info.get("price", 0)
+                price = final_price + promo_discount if promo_discount else final_price
 
                 invoice_kwargs = dict(
                     to_email=user_obj.email,
@@ -709,15 +868,17 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
             raise HTTPException(status_code=500, detail="Payment gateway is currently unavailable. Please contact support.")
 
         # Build redirect URL that includes item metadata for fulfilment
-        redirect_url = (
-            f"{payload.success_url}"
-            f"&merchant_order_id={merchant_order_id}"
-            f"&item_type={payload.item_type}"
-            f"&item_id={payload.item_id}"
-            f"&org_id={payload.org_id or ''}"
-            f"&promo_code={promo_code_str}"
-            f"&promo_discount={promo_discount}"
-        )
+        # Only merchant_order_id needs to travel through the redirect URL —
+        # every other piece of context (item_type, item_id, org_id, promo)
+        # is already stored server-side in the PaymentIntent row created
+        # below, keyed by merchant_order_id, so it doesn't need to round-trip
+        # through the browser's URL at all. This matches the pattern already
+        # proven to work in the legacy system: a single static redirect URL,
+        # with transaction context recovered from a local table by
+        # transaction ID rather than passed through query params. Also keeps
+        # the redirect URL short and simple, in case PhonePe's redirect
+        # mechanism handles long/complex URLs poorly.
+        redirect_url = f"{payload.success_url}&merchant_order_id={url_quote(merchant_order_id)}"
 
         checkout_url = ""
 
@@ -757,6 +918,33 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
             checkout_url = order.get("redirectUrl") or order.get("data", {}).get("redirectUrl", "")
             if not checkout_url:
                 checkout_url = order.get("data", {}).get("instrumentResponse", {}).get("redirectInfo", {}).get("url", "")
+
+        # Persist the checkout context locally BEFORE the user ever reaches
+        # PhonePe's page — this is the record that makes it possible to
+        # confirm and fulfil the payment later even if the success redirect
+        # and the webhook both fail to reach us (see PaymentIntent docstring).
+        # Never let a failure here (e.g. a duplicate merchant_order_id from a
+        # double-submitted request within the same second) block returning
+        # the checkout_url PhonePe already issued — the user being able to
+        # pay matters more than this bookkeeping row.
+        if checkout_url:
+            try:
+                db.add(PaymentIntent(
+                    merchant_order_id=merchant_order_id,
+                    user_id=current_user.id,
+                    org_id=uuid.UUID(payload.org_id) if payload.org_id else None,
+                    gateway="phonepe",
+                    flow="subscription" if phonepe_sub_id else "order",
+                    item_type=payload.item_type,
+                    item_id=payload.item_id,
+                    amount_inr=actual_amount,
+                    promo_code=promo_code_str or None,
+                    promo_discount=promo_discount,
+                ))
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                print(f"[Payment] Failed to persist PaymentIntent for {merchant_order_id}: {e}", flush=True)
 
         return CheckoutResponse(
             session_id=merchant_order_id,
@@ -888,8 +1076,8 @@ async def create_checkout(payload: CheckoutRequest, current_user: CurrentUser, d
 @router.get("/phonepe/status/{merchant_order_id}", response_model=PaymentStatusResponse)
 async def check_phonepe_status(
     merchant_order_id: str,
-    item_type: str,
-    item_id: str,
+    item_type: str = "",
+    item_id: str = "",
     org_id: str = "",
     promo_code: str = "",
     promo_discount: int = 0,
@@ -897,25 +1085,86 @@ async def check_phonepe_status(
     db: DBSession = None,
     background_tasks: BackgroundTasks = None,
 ):
-    """Check PhonePe payment status and fulfil if successful."""
-    order_status = await _get_phonepe_order_status(merchant_order_id)
+    """Check PhonePe payment status (order OR recurring subscription flow) and fulfil if successful.
 
-    state = order_status.get("state") or order_status.get("data", {}).get("state", "")
+    item_type/item_id/org_id/promo_code/promo_discount are now optional —
+    the redirect URL no longer carries them (see create_checkout), since
+    PaymentIntent already stores all of this server-side, keyed by
+    merchant_order_id. They're only used as a fallback for orders created
+    before PaymentIntent existed, where an old-format redirect URL might
+    still land here with these as query params.
+    """
+    intent_result = await db.execute(
+        select(PaymentIntent).where(PaymentIntent.merchant_order_id == merchant_order_id)
+    )
+    intent = intent_result.scalar_one_or_none()
 
-    if state == "COMPLETED":
-        sub = await _fulfil_purchase(
-            item_type,
-            item_id,
-            current_user.id,
-            org_id if org_id else None,
-            db,
-            merchant_order_id=merchant_order_id,
-            gateway="phonepe",
-            phonepe_subscription_id=merchant_order_id if item_type == "plan_upgrade" else None,
-            promo_code=promo_code if promo_code else None,
-            promo_discount=promo_discount,
-            background_tasks=background_tasks,
+    if intent:
+        item_type = intent.item_type
+        item_id = intent.item_id
+        org_id = str(intent.org_id) if intent.org_id else ""
+        promo_code = intent.promo_code or ""
+        promo_discount = intent.promo_discount
+
+    if not item_type or not item_id:
+        raise HTTPException(
+            status_code=400,
+            detail="This payment link is missing required information — if you were charged, please contact support.",
         )
+
+    check = await _check_phonepe_payment_status(merchant_order_id, flow=intent.flow if intent else None)
+    normalized_state = check["normalized_state"]
+
+    if normalized_state == "COMPLETED":
+        # If a local intent exists, claim it atomically before fulfilling —
+        # avoids double-crediting if the webhook confirms this same payment
+        # at nearly the same moment (see _try_claim_payment_intent).
+        if intent:
+            won_claim = await _try_claim_payment_intent(db, merchant_order_id)
+            if not won_claim:
+                await db.refresh(intent)
+                if intent.status == "fulfilled":
+                    pass  # someone else (the webhook) already fulfilled it — report success below
+                else:
+                    # Being claimed/fulfilled by another request right now, or already failed.
+                    return PaymentStatusResponse(status="pending", message="Payment is being processed")
+            else:
+                try:
+                    await _fulfil_purchase(
+                        item_type,
+                        item_id,
+                        current_user.id,
+                        org_id if org_id else None,
+                        db,
+                        merchant_order_id=merchant_order_id,
+                        gateway="phonepe",
+                        phonepe_subscription_id=merchant_order_id if item_type == "plan_upgrade" else None,
+                        promo_code=promo_code if promo_code else None,
+                        promo_discount=promo_discount,
+                        background_tasks=background_tasks,
+                        amount_inr=intent.amount_inr,
+                    )
+                    intent.status = "fulfilled"
+                    await db.commit()
+                except Exception:
+                    await _release_payment_intent_claim(db, merchant_order_id)
+                    raise
+        else:
+            # No local record (pre-existing order) — fall back to the
+            # original time-window dedup inside _fulfil_purchase.
+            await _fulfil_purchase(
+                item_type,
+                item_id,
+                current_user.id,
+                org_id if org_id else None,
+                db,
+                merchant_order_id=merchant_order_id,
+                gateway="phonepe",
+                phonepe_subscription_id=merchant_order_id if item_type == "plan_upgrade" else None,
+                promo_code=promo_code if promo_code else None,
+                promo_discount=promo_discount,
+                background_tasks=background_tasks,
+            )
 
         if item_type == "plan_upgrade":
             plan_result = await db.execute(
@@ -936,10 +1185,14 @@ async def check_phonepe_status(
                 points_added=addon_info.get("points", 0),
             )
 
-    elif state in ("PENDING", "INITIATED"):
+    elif normalized_state == "PENDING":
         return PaymentStatusResponse(status="pending", message="Payment is being processed")
     else:
-        return PaymentStatusResponse(status="failed", message=f"Payment was not successful (state: {state})")
+        if intent and intent.status == "pending":
+            intent.status = "failed"
+            await db.commit()
+        raw_state = check["raw"].get("state") or check["raw"].get("data", {}).get("state", "unknown")
+        return PaymentStatusResponse(status="failed", message=f"Payment was not successful (state: {raw_state})")
 
 
 @router.get("/status/{session_id}", response_model=PaymentStatusResponse)
@@ -1226,67 +1479,164 @@ async def phonepe_recurring_webhook(request: Request, db: DBSession):
 
 @router.post("/phonepe/webhook")
 async def phonepe_standard_webhook(request: Request, db: DBSession, background_tasks: BackgroundTasks):
-    """Server-to-server webhook for PhonePe Standard Checkout.
+    """Server-to-server webhook for PhonePe Standard Checkout ONE-TIME ORDERS
+    ONLY (events: checkout.order.completed / checkout.order.failed).
+
+    IMPORTANT: PhonePe uses a COMPLETELY SEPARATE webhook system for Autopay
+    (recurring UPI mandate) events — this URL is never called for those. The
+    first payment on a recurring-mandate checkout (see _create_phonepe_subscription
+    — tried first for every plan upgrade) is confirmed via the frontend's
+    /phonepe/status/{id} redirect callback and, as a safety net, the
+    payment_reconciliation background sweep — NOT via this webhook.
 
     Configure this URL in the PhonePe merchant dashboard:
         https://app.genverse.ai/api/v1/payments/phonepe/webhook
 
-    PhonePe calls this endpoint when a payment completes. The handler verifies
-    the payment directly with PhonePe and fulfils the subscription/add-on,
-    so the DB is updated even if the user's browser never loads the success page.
-    _fulfil_purchase is idempotent, so a duplicate call from the frontend is safe.
+    PhonePe calls this endpoint when a one-time order completes. The handler
+    verifies the payment directly with PhonePe (does not trust the webhook
+    body's state) and fulfils the purchase, so the DB is updated even if the
+    user's browser never loads the success page. _fulfil_purchase is
+    idempotent, so a duplicate call is safe.
+
+    Context (user/plan/promo) is read from our own local PaymentIntent record
+    (written at checkout time), not from PhonePe's response, since that's
+    more reliable than round-tripping through echoed metaInfo. Falls back to
+    metaInfo only for orders created before PaymentIntent existed.
     """
-    body = await request.json()
+    raw_body = await request.body()
+
+    # Optional HMAC-style Basic Auth check PhonePe recommends: Authorization
+    # header = SHA256(username:password), configured in the merchant
+    # dashboard alongside the webhook URL. Only enforced once configured
+    # here (PHONEPE_WEBHOOK_USERNAME/PASSWORD) — matches the same
+    # opt-in pattern used for STRIPE_ENDPOINT_SECRET above, so this doesn't
+    # start rejecting real webhook calls before the credentials are set.
+    if settings.PHONEPE_WEBHOOK_USERNAME and settings.PHONEPE_WEBHOOK_PASSWORD:
+        expected = hashlib.sha256(
+            f"{settings.PHONEPE_WEBHOOK_USERNAME}:{settings.PHONEPE_WEBHOOK_PASSWORD}".encode()
+        ).hexdigest()
+        received = request.headers.get("authorization", "")
+        if not hmac.compare_digest(expected, received):
+            print("[PhonePe Webhook] Authorization header mismatch, rejecting", flush=True)
+            raise HTTPException(status_code=401, detail="Invalid webhook authorization")
+
+    import json
+    body = json.loads(raw_body)
     print(f"[PhonePe Webhook] Received: {body}", flush=True)
 
-    merchant_order_id = body.get("merchantOrderId", "")
+    # PhonePe nests the actual order data under "payload" (top-level has
+    # "event" + "payload"). Fall back to top-level for safety in case the
+    # exact shape ever differs from the documented one.
+    payload = body.get("payload", {}) or {}
+    merchant_order_id = payload.get("merchantOrderId") or body.get("merchantOrderId", "")
     if not merchant_order_id:
+        print(f"[PhonePe Webhook] No merchantOrderId found in payload: {body}", flush=True)
         return {"status": "ignored", "reason": "no merchantOrderId"}
 
-    # Verify payment state directly with PhonePe — do not trust webhook body alone
-    try:
-        order_status = await _get_phonepe_order_status(merchant_order_id)
-    except Exception as e:
-        print(f"[PhonePe Webhook] Status check failed for {merchant_order_id}: {e}", flush=True)
-        return {"status": "error", "reason": "status check failed"}
+    intent_result = await db.execute(
+        select(PaymentIntent).where(PaymentIntent.merchant_order_id == merchant_order_id)
+    )
+    intent = intent_result.scalar_one_or_none()
 
-    state = order_status.get("state") or order_status.get("data", {}).get("state", "")
-    if state != "COMPLETED":
-        print(f"[PhonePe Webhook] Order {merchant_order_id} state={state}, skipping", flush=True)
+    # Verify payment state directly with PhonePe — do not trust webhook body alone.
+    # Checks the right API (order vs subscription) based on how this checkout
+    # was actually created, instead of always assuming a one-time order.
+    check = await _check_phonepe_payment_status(merchant_order_id, flow=intent.flow if intent else None)
+    normalized_state = check["normalized_state"]
+    if normalized_state != "COMPLETED":
+        print(f"[PhonePe Webhook] Order {merchant_order_id} flow={check['flow']} state={normalized_state}, skipping", flush=True)
+        if normalized_state == "FAILED" and intent and intent.status == "pending":
+            intent.status = "failed"
+            await db.commit()
         return {"status": "pending"}
 
-    # Extract order context from metaInfo udf fields (stored at checkout creation)
-    meta = order_status.get("metaInfo", {})
-    user_id_str = meta.get("udf1", "")
-    item_type   = meta.get("udf2", "")
-    item_id     = meta.get("udf3", "")
-    org_id      = meta.get("udf4", "") or None
-    promo_raw   = meta.get("udf5", "|0").split("|", 1)
-    promo_code  = promo_raw[0] or None
-    promo_discount = int(promo_raw[1]) if len(promo_raw) > 1 and promo_raw[1].isdigit() else 0
+    if intent:
+        user_id = intent.user_id
+        item_type = intent.item_type
+        item_id = intent.item_id
+        org_id = str(intent.org_id) if intent.org_id else None
+        promo_code = intent.promo_code
+        promo_discount = intent.promo_discount
+    else:
+        # Fallback for orders created before PaymentIntent existed — only
+        # ever populated for the one-time order flow (see docstring above).
+        meta = check["raw"].get("metaInfo", {})
+        user_id_str = meta.get("udf1", "")
+        item_type   = meta.get("udf2", "")
+        item_id     = meta.get("udf3", "")
+        org_id      = meta.get("udf4", "") or None
+        promo_raw   = meta.get("udf5", "|0").split("|", 1)
+        promo_code  = promo_raw[0] or None
+        promo_discount = int(promo_raw[1]) if len(promo_raw) > 1 and promo_raw[1].isdigit() else 0
 
-    if not user_id_str or not item_type or not item_id:
-        print(f"[PhonePe Webhook] Missing context for {merchant_order_id}: meta={meta}", flush=True)
-        return {"status": "error", "reason": "missing order context"}
+        if not user_id_str or not item_type or not item_id:
+            print(f"[PhonePe Webhook] No PaymentIntent and no metaInfo context for {merchant_order_id}", flush=True)
+            return {"status": "error", "reason": "missing order context"}
 
-    try:
-        user_id = uuid.UUID(user_id_str)
-    except ValueError:
-        print(f"[PhonePe Webhook] Invalid user_id '{user_id_str}' for {merchant_order_id}", flush=True)
-        return {"status": "error", "reason": "invalid user_id"}
+        try:
+            user_id = uuid.UUID(user_id_str)
+        except ValueError:
+            print(f"[PhonePe Webhook] Invalid user_id '{user_id_str}' for {merchant_order_id}", flush=True)
+            return {"status": "error", "reason": "invalid user_id"}
 
-    print(f"[PhonePe Webhook] Fulfilling {item_type}/{item_id} for user {user_id}", flush=True)
-    await _fulfil_purchase(
-        item_type=item_type,
-        item_id=item_id,
-        user_id=user_id,
-        org_id=org_id,
-        db=db,
-        merchant_order_id=merchant_order_id,
-        gateway="phonepe",
-        promo_code=promo_code,
-        promo_discount=promo_discount,
-        background_tasks=background_tasks,
+    # Prefer the amount PhonePe actually reports for this completed payment
+    # (payload.amount is in paise) over our own stored estimate — this is
+    # the most authoritative source of what was really charged.
+    webhook_amount_paise = check["raw"].get("amount") or payload.get("amount")
+    amount_inr = (
+        webhook_amount_paise // 100 if isinstance(webhook_amount_paise, int)
+        else (intent.amount_inr if intent else None)
     )
 
+    # If a local intent exists, claim it atomically before fulfilling — the
+    # frontend's /phonepe/status/{id} redirect check can confirm and fulfil
+    # this exact same payment at nearly the same moment; without this claim
+    # both could pass _fulfil_purchase's time-window dedup check before
+    # either commits, double-crediting the user.
+    if intent:
+        won_claim = await _try_claim_payment_intent(db, merchant_order_id)
+        if not won_claim:
+            print(f"[PhonePe Webhook] {merchant_order_id} already claimed elsewhere, skipping", flush=True)
+            return {"status": "ok"}
+        try:
+            print(f"[PhonePe Webhook] Fulfilling {item_type}/{item_id} for user {user_id}", flush=True)
+            await _fulfil_purchase(
+                item_type=item_type,
+                item_id=item_id,
+                user_id=user_id,
+                org_id=org_id,
+                db=db,
+                merchant_order_id=merchant_order_id,
+                gateway="phonepe",
+                phonepe_subscription_id=merchant_order_id if check["flow"] == "subscription" else None,
+                promo_code=promo_code,
+                promo_discount=promo_discount,
+                background_tasks=background_tasks,
+                amount_inr=amount_inr,
+            )
+            intent.status = "fulfilled"
+            await db.commit()
+        except Exception:
+            await _release_payment_intent_claim(db, merchant_order_id)
+            raise
+    else:
+        # No local record (pre-existing order) — fall back to the original
+        # time-window dedup inside _fulfil_purchase.
+        print(f"[PhonePe Webhook] Fulfilling {item_type}/{item_id} for user {user_id}", flush=True)
+        await _fulfil_purchase(
+            item_type=item_type,
+            item_id=item_id,
+            user_id=user_id,
+            org_id=org_id,
+            db=db,
+            merchant_order_id=merchant_order_id,
+            gateway="phonepe",
+            phonepe_subscription_id=merchant_order_id if check["flow"] == "subscription" else None,
+            promo_code=promo_code,
+            promo_discount=promo_discount,
+            background_tasks=background_tasks,
+            amount_inr=amount_inr,
+        )
+
     return {"status": "ok"}
+

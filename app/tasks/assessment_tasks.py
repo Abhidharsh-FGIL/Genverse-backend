@@ -96,7 +96,14 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
         "message": f"Generating {question_count} questions with AI...",
     })
 
-    raw = await ai.generate_practice_assessment(
+    # The LLM call below is the longest step by far (often the majority of
+    # total generation time) and previously had NO progress signal between
+    # the 30% "generating" tick and the 80% "processing" tick — the frontend
+    # progress bar just sat still for the whole duration, which read as
+    # "stuck". Running it as a task and polling it lets us publish real
+    # incrementing progress while it's still in flight, instead of a single
+    # long silent gap.
+    gen_task = asyncio.ensure_future(ai.generate_practice_assessment(
         subject=params["subject"],
         topics=params.get("topics"),
         grade=params.get("grade"),
@@ -113,7 +120,21 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
         source_text=params.get("source_text"),
         language=params.get("language"),
         exam_type=params.get("exam_type"),
-    )
+    ))
+
+    heartbeat_progress = 30
+    while True:
+        done, _pending = await asyncio.wait({gen_task}, timeout=2.5)
+        if gen_task in done:
+            break
+        heartbeat_progress = min(heartbeat_progress + 6, 75)
+        _publish(r, channel, {
+            "stage": "generating",
+            "progress": heartbeat_progress,
+            "message": f"Generating {question_count} questions with AI...",
+        })
+
+    raw = gen_task.result()  # re-raises if the task itself raised
 
     _log.info("[Assessment-Celery] LLM returned %d raw questions", len(raw))
 

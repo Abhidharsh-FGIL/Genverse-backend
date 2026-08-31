@@ -82,6 +82,11 @@ class AttemptResponse(BaseModel):
     submitted_at: Optional[datetime] = None
     time_taken_seconds: Optional[int] = None
     status: str
+    # Assessment metadata (joined from PracticeAssessment)
+    title: Optional[str] = None
+    subject: Optional[str] = None
+    difficulty: Optional[str] = None
+    topics: Optional[Any] = None
 
     model_config = {"from_attributes": True}
 

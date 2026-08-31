@@ -12,6 +12,7 @@ from app.routers import register_routers
 from app.services.renewal_scheduler import run_renewal_scheduler
 from app.services.notification_scheduler import run_notification_scheduler
 from app.services.stale_attempt_scheduler import run_stale_attempt_scheduler
+from app.services.payment_reconciliation import run_payment_reconciliation
 
 
 async def _backfill_study_time_if_needed():
@@ -42,12 +43,14 @@ async def lifespan(app: FastAPI):
     renewal_task = asyncio.create_task(run_renewal_scheduler())
     notification_task = asyncio.create_task(run_notification_scheduler())
     stale_attempt_task = asyncio.create_task(run_stale_attempt_scheduler())
+    payment_reconciliation_task = asyncio.create_task(run_payment_reconciliation())
     # One-time backfill of study time data (runs in background, doesn't block startup)
     backfill_task = asyncio.create_task(_backfill_study_time_if_needed())
     yield
     renewal_task.cancel()
     notification_task.cancel()
     stale_attempt_task.cancel()
+    payment_reconciliation_task.cancel()
     backfill_task.cancel()
     await close_db()
 

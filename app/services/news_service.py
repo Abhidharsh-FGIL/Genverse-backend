@@ -282,38 +282,91 @@ class NewsService:
           recent_queries list[str]  – recent AI assistant queries
         """
         if not self._key_configured():
+            logger.warning("[news] RAPIDAPI_KEY not configured — personal news returning []")
             return []
 
-        parts: list[str] = []
-        if user_context.get("subjects"):
-            parts.extend(str(s) for s in user_context["subjects"][:2])
-        if user_context.get("grade"):
-            parts.append(f"class {user_context['grade']}")   # "class 4" not just "4"
-        if user_context.get("board"):
-            parts.append(str(user_context["board"]))          # e.g. "CBSE", "ICSE"
-        if user_context.get("topics"):
-            parts.extend(str(t) for t in user_context["topics"][:2])
-        if user_context.get("weak_topics"):
-            parts.extend(str(t) for t in user_context["weak_topics"][:2])
-        if user_context.get("recent_queries"):
-            parts.extend(str(q)[:40] for q in user_context["recent_queries"][:2])
-
-        if not parts:
-            parts = ["education", "learning"]
-
-        # Append recency hint to boost freshness (covers last 30 days)
-        parts.append(_recency_hint())
-
-        keyword = " ".join(parts)[:150]
-        lr      = LANGUAGE_LOCALE.get(language, "en-US")
-
-        # Append language hint for better non-English coverage
+        lr = LANGUAGE_LOCALE.get(language, "en-US")
         hint = LANGUAGE_KEYWORD_HINT.get(language)
-        if hint:
-            keyword = f"{keyword} {hint}"
+        recency = _recency_hint()
 
-        articles = await self._fetch_search(keyword=keyword, lr=lr)
-        return self._normalize(articles, fallback_category="education", personal=True)[:max_results]
+        # A single compound keyword jamming every context signal together
+        # (subject + grade + board + topics + weak topics + recent queries)
+        # reads nothing like a real headline, so Google News search — a literal
+        # phrase match, not a weighted multi-field OR — frequently returns zero
+        # results for real (non-empty-context) users even though the API/key
+        # is perfectly healthy. Try progressively broader candidates instead of
+        # gambling everything on one shot, so users reliably see *something*.
+        for keyword in self._build_keyword_candidates(user_context):
+            full_keyword = f"{keyword} {recency}"
+            if hint:
+                full_keyword = f"{full_keyword} {hint}"
+
+            ok, raw_items = await self._raw_fetch_with_status(
+                SEARCH_URL, {"keyword": full_keyword[:150], "lr": lr}
+            )
+            if not ok:
+                # Hard failure (bad key, quota exhausted, network/timeout) — retrying
+                # with a different keyword against the same broken call won't help.
+                logger.warning("[news] personal search hard-failed, aborting cascade (keyword=%r)", full_keyword)
+                return []
+
+            normalized = self._normalize(raw_items, fallback_category="education", personal=True)
+            if normalized:
+                return normalized[:max_results]
+            logger.info("[news] personal keyword matched 0 articles, trying broader candidate (keyword=%r)", full_keyword)
+
+        # Every candidate — down to the generic "education learning" fallback —
+        # matched nothing. Fall back to today's general top headlines rather
+        # than ever showing the user a blank feed.
+        ok, raw_items = await self._raw_fetch_with_status(LATEST_URL, {"lr": lr})
+        if not ok:
+            return []
+        return self._normalize(raw_items, fallback_category="education", personal=True)[:max_results]
+
+    def _build_keyword_candidates(self, user_context: dict) -> list[str]:
+        """Ordered search-keyword candidates, most specific first.
+
+        Each is short enough to plausibly match a real headline — unlike the
+        old single compound-everything keyword, which almost never did.
+        """
+        subjects = [str(s) for s in (user_context.get("subjects") or [])]
+        grade = user_context.get("grade")
+        board = user_context.get("board")
+        topics = [str(t) for t in (user_context.get("topics") or [])]
+        weak_topics = [str(t) for t in (user_context.get("weak_topics") or [])]
+        recent_queries = [str(q)[:60] for q in (user_context.get("recent_queries") or [])]
+
+        candidates: list[str] = []
+
+        def _add(parts: list[str]):
+            joined = " ".join(p for p in parts if p).strip()
+            if joined and joined not in candidates:
+                candidates.append(joined)
+
+        # 1. Most specific: subject + grade + board + top weak/active topic
+        _add([
+            subjects[0] if subjects else "",
+            f"class {grade}" if grade else "",
+            str(board) if board else "",
+            (weak_topics or topics)[0] if (weak_topics or topics) else "",
+        ])
+        # 2. Subject + grade/board only
+        _add([
+            subjects[0] if subjects else "",
+            f"class {grade}" if grade else "",
+            str(board) if board else "",
+        ])
+        # 3. Just the subject
+        if subjects:
+            _add([subjects[0]])
+        # 4. A recent AI-assistant query on its own — often more newsworthy
+        #    standalone than buried inside a compound string.
+        if recent_queries:
+            _add([recent_queries[0]])
+        # 5. Generic education fallback — always tried last, guaranteed non-empty
+        _add(["education", "learning"])
+
+        return candidates
 
     # ---- private helpers --------------------------------------------------
 
@@ -323,14 +376,28 @@ class NewsService:
 
     async def _fetch_search(self, keyword: str, lr: str) -> list[dict]:
         """Call /search endpoint — keyword-based results (may not be the freshest)."""
-        return await self._raw_fetch(SEARCH_URL, {"keyword": keyword, "lr": lr})
+        _, items = await self._raw_fetch_with_status(SEARCH_URL, {"keyword": keyword, "lr": lr})
+        return items
 
     async def _fetch_latest(self, lr: str) -> list[dict]:
         """Call /latest endpoint — today's top headlines (always fresh)."""
-        return await self._raw_fetch(LATEST_URL, {"lr": lr})
+        _, items = await self._raw_fetch_with_status(LATEST_URL, {"lr": lr})
+        return items
 
     async def _raw_fetch(self, url: str, params: dict) -> list[dict]:
-        """Generic HTTP GET against the RapidAPI host."""
+        """Generic HTTP GET against the RapidAPI host. Kept for callers that don't
+        need to distinguish a hard failure from a genuine zero-match result."""
+        _, items = await self._raw_fetch_with_status(url, params)
+        return items
+
+    async def _raw_fetch_with_status(self, url: str, params: dict) -> tuple[bool, list[dict]]:
+        """Generic HTTP GET against the RapidAPI host.
+
+        Returns (ok, items). ok=False means a hard failure (bad key, quota
+        exhausted, network/timeout error) — as opposed to a successful call
+        that simply matched zero articles — logged with enough detail to
+        diagnose from server logs without needing another DevTools round trip.
+        """
         headers = {
             "X-RapidAPI-Key":  settings.RAPIDAPI_KEY,
             "X-RapidAPI-Host": settings.RAPIDAPI_NEWS_HOST,
@@ -344,11 +411,17 @@ class NewsService:
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status != 200:
-                        return []
+                        body = await resp.text()
+                        logger.warning(
+                            "[news] RapidAPI request failed: status=%s url=%s params=%s body=%s",
+                            resp.status, url, params, body[:300],
+                        )
+                        return False, []
                     data = await resp.json()
-                    return data.get("items", [])
-        except Exception:
-            return []
+                    return True, data.get("items", [])
+        except Exception as exc:
+            logger.warning("[news] RapidAPI request errored: url=%s params=%s error=%r", url, params, exc)
+            return False, []
 
     def _normalize(
         self,

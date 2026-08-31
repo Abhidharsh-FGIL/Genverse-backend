@@ -207,4 +207,5 @@ async def upload_assignment_file(
     storage = StorageService()
     prefix = path.rsplit("/", 1)[0] if "/" in path else "general"
     file_info = await storage.upload_file(file=file, bucket="assignment-files", prefix=prefix)
-    return {"url": file_info["url"]}
+    proxy_url = f"/api/v1/library/media?path={file_info['path']}"
+    return {"url": proxy_url, "path": file_info["path"]}

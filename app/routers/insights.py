@@ -314,7 +314,14 @@ async def get_personal_news(
             context["recent_queries"].append(h.query[:50])
 
     svc = NewsService()
-    return await svc.get_personal_news(user_context=context, language=language, max_results=max_results)
+    articles = await svc.get_personal_news(user_context=context, language=language, max_results=max_results)
+
+    from app.services.platform_stats_service import (
+        get_platform_stats, get_user_usage_metrics, annotate_personal_articles,
+    )
+    platform_stats = await get_platform_stats(db)
+    user_stats = await get_user_usage_metrics(db, current_user.id)
+    return annotate_personal_articles(articles, user_stats, platform_stats)
 
 
 @router.post("/intelligence", response_model=IntelligenceResponse)

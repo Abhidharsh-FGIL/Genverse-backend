@@ -150,12 +150,13 @@ async def upload_submission_file(
         bucket="assignment-files",
         prefix=str(submission_id),
     )
+    stored_file = {**file_info, "url": f"/api/v1/library/media?path={file_info['path']}"}
     current_files = list(submission.files or [])
-    current_files.append(file_info)
+    current_files.append(stored_file)
     submission.files = current_files
     flag_modified(submission, "files")
     await db.commit()
-    return {"file": file_info, "message": "File uploaded"}
+    return {"file": stored_file, "message": "File uploaded"}
 
 
 @router.get("/", response_model=list[SubmissionResponse])

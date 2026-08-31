@@ -104,6 +104,41 @@ class SubscriptionAddon(Base):
     subscription: Mapped["Subscription"] = relationship(back_populates="addons")
 
 
+class PaymentIntent(Base):
+    """A local record of a checkout attempt, written the moment we redirect
+    the user to the payment gateway — BEFORE we know whether they'll
+    complete payment.
+
+    This exists to close a real gap: previously nothing was persisted at
+    checkout time, so if the gateway's success callback (redirect or
+    webhook) never reached us — closed tab, missed webhook, or (the
+    specific bug this fixes) a PhonePe recurring UPI AutoPay payment whose
+    status can only be checked via a completely different API than a
+    one-time order — the payment could succeed on the gateway's side with
+    zero trace of the attempt in our own database, and no way to recover
+    the fulfilment context (user/plan/promo) after the fact.
+    """
+    __tablename__ = "payment_intents"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    merchant_order_id: Mapped[str] = mapped_column(String(80), unique=True, nullable=False, index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"))
+    gateway: Mapped[str] = mapped_column(String(20), nullable=False)  # "phonepe" | "stripe"
+    # "order" = standard one-time PhonePe checkout; "subscription" = recurring UPI AutoPay mandate.
+    # Each has a DIFFERENT PhonePe status API and must be checked accordingly.
+    flow: Mapped[str] = mapped_column(String(20), nullable=False, default="order")
+    item_type: Mapped[str] = mapped_column(String(30), nullable=False)  # "plan_upgrade" | "point_pack"
+    item_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    amount_inr: Mapped[int] = mapped_column(Integer, nullable=False)
+    promo_code: Mapped[str | None] = mapped_column(String(50))
+    promo_discount: Mapped[int] = mapped_column(Integer, default=0)
+    # "pending" | "fulfilled" | "failed"
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class FeatureLimit(Base):
     __tablename__ = "feature_limits"
 

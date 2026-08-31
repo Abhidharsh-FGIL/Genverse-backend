@@ -471,20 +471,41 @@ async def get_attempt_history(
     limit: int = Query(50, le=200),
     org_id: str | None = Query(None),
 ):
-    """Return only evaluated (submitted) attempts by the current user, newest first."""
+    """Return only evaluated (submitted) attempts by the current user, newest first.
+    Joins PracticeAssessment to include title, subject, difficulty, and topics."""
     q = (
         select(AssessmentAttempt)
+        .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
         .where(
             AssessmentAttempt.user_id == current_user.id,
             AssessmentAttempt.status == "evaluated",
         )
     )
     if org_id is not None:
-        q = q.join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
         q = _apply_org_filter(q, PracticeAssessment.org_id, org_id)
     q = q.order_by(AssessmentAttempt.started_at.desc()).limit(limit)
     result = await db.execute(q)
-    return result.scalars().all()
+    attempts = result.scalars().all()
+
+    # Enrich each attempt with assessment metadata
+    assessment_ids = list({a.assessment_id for a in attempts})
+    assessments_result = await db.execute(
+        select(PracticeAssessment).where(PracticeAssessment.id.in_(assessment_ids))
+    )
+    assessments_map = {a.id: a for a in assessments_result.scalars().all()}
+
+    enriched = []
+    for attempt in attempts:
+        assessment = assessments_map.get(attempt.assessment_id)
+        data = AttemptResponse.model_validate(attempt)
+        if assessment:
+            data.title = assessment.title
+            data.subject = assessment.subject
+            data.difficulty = assessment.difficulty
+            data.topics = assessment.topics
+        enriched.append(data)
+
+    return enriched
 
 
 @router.get("/trends")

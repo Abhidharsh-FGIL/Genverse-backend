@@ -8,7 +8,7 @@ from app.database import Base
 
 
 class PublicFolder(Base):
-    """Three-level folder structure: Board → Grade → Subject. Files live inside subject folders."""
+    """Two-level folder structure: Board → Grade. Files (one per subject) live inside grade folders."""
     __tablename__ = "public_folders"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -16,7 +16,7 @@ class PublicFolder(Base):
         UUID(as_uuid=True), ForeignKey("public_folders.id", ondelete="CASCADE"), index=True,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    folder_type: Mapped[str | None] = mapped_column(String(50))  # "board" | "grade" | "subject"
+    folder_type: Mapped[str | None] = mapped_column(String(50))  # "board" | "grade"
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # Self-referential relationships

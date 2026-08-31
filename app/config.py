@@ -7,6 +7,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
     # Application
@@ -74,6 +75,11 @@ class Settings(BaseSettings):
     STORAGE_ROOT: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 150
 
+    # Google Cloud Vision OCR credentials (used by vision_ocr_service.py for
+    # non-English/handwritten OCR). Not related to file storage — this server
+    # stores files on local disk, not GCS.
+    GCS_CREDENTIALS_PATH: str = ""
+
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 
@@ -94,10 +100,22 @@ class Settings(BaseSettings):
     PHONEPE_ENV: str = "PRODUCTION"
     PHONEPE_TOKEN_URL: str = ""
     PHONEPE_BASE_URL: str = ""
+    # Optional: username/password configured alongside the webhook URL in the
+    # PhonePe merchant dashboard, used to validate the incoming webhook's
+    # Authorization header (SHA256(username:password)). Webhook auth
+    # verification is skipped until both are set — see phonepe_standard_webhook.
+    PHONEPE_WEBHOOK_USERNAME: str = ""
+    PHONEPE_WEBHOOK_PASSWORD: str = ""
 
     # Stripe (international cards)
     STRIPE_API_KEY: str = ""
     STRIPE_ENDPOINT_SECRET: str = ""
+
+    @property
+    def phonepe_base_url(self) -> str:
+        if self.PHONEPE_ENV == "PRODUCTION":
+            return "https://api.phonepe.com/apis/pg"
+        return "https://api-preprod.phonepe.com/apis/pg-sandbox"
 
     # Frontend / Backend URLs
     FRONTEND_URL: str = "http://localhost:4200"

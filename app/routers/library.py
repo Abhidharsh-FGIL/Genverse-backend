@@ -3,7 +3,8 @@ import json
 import uuid
 import logging
 from typing import Optional, AsyncGenerator
-from fastapi import APIRouter, BackgroundTasks, status, UploadFile, File, Form, Query, HTTPException
+from urllib.parse import quote as _quote
+from fastapi import APIRouter, status, UploadFile, File, Form, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, delete as sql_delete, func as sa_func
 
@@ -45,119 +46,6 @@ def _faiss() -> FAISSService:
     return FAISSService(settings.STORAGE_ROOT)
 
 
-def _publish_vault_event_sync(user_id: str, event: dict) -> None:
-    try:
-        import redis as sync_redis
-        r = sync_redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
-        channel = f"vault:events:{user_id}"
-        r.publish(channel, json.dumps(event))
-    except Exception as exc:
-        logger.warning("[Vault] Failed to publish SSE event for user=%s: %s", user_id, exc)
-
-
-async def _process_vault_item_bg(item_id: str, user_id: str, filename: str) -> None:
-    """Process a vault item inline as a FastAPI background task.
-
-    Runs after the HTTP response is sent. Uses the async DB session and
-    async AI service — no Celery or Redis queue required.
-    """
-    from app.database import AsyncSessionLocal
-    print(f"[BG] Starting processing for '{filename}' (item={item_id}, user={user_id})")
-
-    async with AsyncSessionLocal() as db:
-        try:
-            item = await db.get(UserLibraryItem, uuid.UUID(item_id))
-            if not item:
-                print(f"[BG] Item {item_id} not found in DB, aborting")
-                return
-            if item.processing_status == "ready":
-                print(f"[BG] '{filename}' already ready, skipping")
-                return
-
-            ai = get_ai_service()
-            faiss_svc = _faiss()
-
-            # Remove any stale chunks from a previous failed attempt
-            old_chunks_result = await db.execute(
-                select(DocChunk.id).where(DocChunk.library_item_id == item.id)
-            )
-            old_chunk_ids = [str(r[0]) for r in old_chunks_result.all()]
-            if old_chunk_ids:
-                print(f"[BG] Removing {len(old_chunk_ids)} stale chunk(s) for '{filename}'")
-                faiss_svc.remove_chunks(user_id=user_id, chunk_ids=set(old_chunk_ids))
-                await db.execute(sql_delete(DocChunk).where(DocChunk.library_item_id == item.id))
-                await db.flush()
-
-            # 1. Extract text
-            print(f"[BG] Extracting text from '{filename}' (path: {item.storage_path})")
-            extracted_text = await ai.extract_text_from_file(item.storage_path)
-            if not extracted_text:
-                item.processing_status = "failed"
-                await db.commit()
-                print(f"[BG] No text extracted from '{filename}', marked as failed")
-                await asyncio.to_thread(_publish_vault_event_sync, user_id, {
-                    "type": "item_status", "item_id": item_id, "processing_status": "failed",
-                })
-                return
-
-            print(f"[BG] Extracted {len(extracted_text)} chars from '{filename}'")
-
-            # 2. Semantic chunking
-            chunks = ai.semantic_chunk_text(extracted_text)
-            print(f"[BG] '{filename}' → {len(chunks)} chunks")
-
-            # 3. Embed each chunk
-            chunk_ids: list[str] = []
-            embeddings: list[list[float]] = []
-            for i, chunk_text in enumerate(chunks):
-                doc_chunk = DocChunk(
-                    library_item_id=item.id,
-                    chunk_text=chunk_text,
-                    chunk_order=i,
-                )
-                db.add(doc_chunk)
-                await db.flush()
-
-                embedding = await ai.generate_embedding(chunk_text)
-                if embedding:
-                    chunk_ids.append(str(doc_chunk.id))
-                    embeddings.append(embedding)
-
-            # 4. Add to FAISS
-            if chunk_ids:
-                faiss_svc.add_batch(user_id=user_id, chunk_ids=chunk_ids, embeddings=embeddings)
-
-            # 5. Mark ready
-            item.is_processed = True
-            item.extracted_text_ref = "processed"
-            item.processing_status = "ready"
-            await db.commit()
-
-            print(f"[BG] '{filename}' done — {len(chunk_ids)} embeddings stored")
-            await asyncio.to_thread(_publish_vault_event_sync, user_id, {
-                "type": "item_status",
-                "item_id": item_id,
-                "processing_status": "ready",
-                "is_processed": True,
-                "extracted_text_ref": "processed",
-                "chunks_embedded": len(chunk_ids),
-            })
-
-        except Exception as exc:
-            logger.exception("[BG] Failed processing '%s' (item=%s): %s", filename, item_id, exc)
-            print(f"[BG] ERROR processing '{filename}': {exc}")
-            try:
-                item = await db.get(UserLibraryItem, uuid.UUID(item_id))
-                if item:
-                    item.processing_status = "failed"
-                    await db.commit()
-                    await asyncio.to_thread(_publish_vault_event_sync, user_id, {
-                        "type": "item_status", "item_id": item_id, "processing_status": "failed",
-                    })
-            except Exception:
-                pass
-
-
 @router.get("/storage-usage")
 async def get_storage_usage(
     current_user: CurrentUser,
@@ -180,7 +68,6 @@ async def get_storage_usage(
 
 @router.post("/upload", response_model=LibraryItemResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     folder: str = Form(None),
     tags: str = Form(None),
@@ -253,23 +140,9 @@ async def upload_document(
     await db.commit()
     await db.refresh(item)
 
-    # Try Celery first; fall back to an in-process BackgroundTask if the
-    # broker is unavailable or the dispatch throws for any reason.
-    _dispatched_via_celery = False
-    try:
-        process_vault_embeddings.delay(str(item.id), str(current_user.id), item.title)
-        _dispatched_via_celery = True
-        print(f"[Upload] Celery task queued for '{item.title}' (item_id={item.id})")
-    except Exception as exc:
-        print(f"[Upload] Celery dispatch failed ({exc!r}), falling back to BackgroundTask")
-
-    if not _dispatched_via_celery:
-        background_tasks.add_task(
-            _process_vault_item_bg,
-            str(item.id),
-            str(current_user.id),
-            item.title,
-        )
+    # Dispatch text extraction + embedding to Celery worker
+    process_vault_embeddings.delay(str(item.id), str(current_user.id), item.title)
+    logger.info("Dispatched embedding task for vault item %s (%s)", item.id, item.title)
 
     return item
 
@@ -286,9 +159,12 @@ async def list_library_items(
     from datetime import datetime as dt
     from sqlalchemy import func as sa_func
 
-    # Include all items including failed ones so users can see and retry them.
+    # Include in-flight items (pending/processing) so freshly uploaded files
+    # appear immediately in the UI with a "Processing…" state. Only hide
+    # permanently-failed items.
     base = select(UserLibraryItem).where(
         UserLibraryItem.user_id == current_user.id,
+        UserLibraryItem.processing_status != "failed",
     )
     if org_id is not None:
         base = _apply_org_filter(base, UserLibraryItem.org_id, org_id)
@@ -394,13 +270,6 @@ async def vault_events_stream(token: str = Query(..., description="Bearer JWT (E
     )
 
 
-# Inline attachment limits — kept intentionally lower than vault upload limits
-# so the AI assistant stays fast. Large files should go to the Knowledge Vault.
-_INLINE_MAX_BYTES = 8 * 1024 * 1024   # 8 MB hard cap
-_INLINE_MAX_WORDS = 6_000             # truncate extracted text after this many words
-_INLINE_MAX_PDF_PAGES = 15            # only process first N pages inline
-
-
 @router.post("/extract-text-inline")
 async def extract_text_inline(
     file: UploadFile = File(...),
@@ -410,48 +279,29 @@ async def extract_text_inline(
 
     Used by the AI assistant 'From Device' attachment feature so users can ask
     questions about a document without it being stored in the Knowledge Vault.
-    Files above 8 MB or beyond 15 PDF pages are rejected / truncated to keep
-    extraction fast. Large files should use the Knowledge Vault instead.
     """
     import tempfile
     import os
     from pathlib import Path as _Path
 
-    content = await file.read()
-    if len(content) > _INLINE_MAX_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"File is too large for direct AI chat "
-                f"({len(content) / (1024*1024):.1f} MB — limit is 8 MB). "
-                "Upload it to your Knowledge Vault and select it from there instead."
-            ),
-        )
-
     ai = get_ai_service()
     suffix = _Path(file.filename or "file").suffix.lower() or ".tmp"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        text = await ai.extract_text_from_file(tmp_path, inline_page_limit=_INLINE_MAX_PDF_PAGES)
+        text = await ai.extract_text_from_file(tmp_path)
     finally:
         os.unlink(tmp_path)
 
-    truncated = False
-    words = text.split() if text else []
-    if len(words) > _INLINE_MAX_WORDS:
-        text = " ".join(words[:_INLINE_MAX_WORDS])
-        truncated = True
-
+    word_count = len(text.split()) if text else 0
     return {
         "text": text or "",
-        "word_count": len(words[:_INLINE_MAX_WORDS]),
+        "word_count": word_count,
         "filename": file.filename,
-        "truncated": truncated,
-        "page_limit_hit": not text and bool(content),  # True when PDF was too long
     }
 
 
@@ -459,12 +309,27 @@ async def extract_text_inline(
 @router.get("/signed-url/", include_in_schema=False)
 async def get_signed_url(
     path: str = Query(...),
+    download: bool = Query(False, description="Force the browser to save the file instead of opening it"),
+    filename: str | None = Query(None, description="Filename to save as when download=true"),
     current_user: CurrentUser = None,
     db: DBSession = None,
 ):
-    """Convert an absolute storage path to a serving URL (local-storage implementation)."""
+    """Convert a stored path to a serving URL (local-storage implementation).
+
+    When download=true, the URL points at /file-proxy instead of the static
+    /uploads mount, since StaticFiles always serves inline — /file-proxy sets
+    a Content-Disposition: attachment header so a plain navigation to the URL
+    forces a real local download.
+    """
     from pathlib import Path as _Path
     from app.config import settings as _settings
+
+    if download:
+        params = f"path={_quote(path)}&download=true"
+        if filename:
+            params += f"&filename={_quote(filename)}"
+        return {"url": f"/api/v1/library/file-proxy?{params}"}
+
     try:
         storage_root = _Path(_settings.STORAGE_ROOT).resolve()
         abs_path = _Path(path).resolve()
@@ -473,6 +338,39 @@ async def get_signed_url(
     except Exception:
         url = None
     return {"url": url}
+
+
+@router.get("/file-proxy")
+async def proxy_file_bytes(
+    path: str = Query(...),
+    download: bool = Query(False),
+    filename: str | None = Query(None),
+    current_user: CurrentUser = None,
+):
+    """Same-origin proxy that streams back the raw bytes of a stored file.
+
+    Used when the frontend needs to read the bytes itself (e.g. fetch() a
+    .txt file's text, or a .docx to convert to HTML client-side) rather than
+    just pointing an <img>/<a> at a URL.
+    """
+    from pathlib import Path as _Path
+    from fastapi import Response as _Response
+    import mimetypes
+
+    if not path or _Path(path).is_absolute():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    storage = StorageService()
+    content = await storage.read_file_async(path)
+    if content is None:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    headers = {}
+    if download:
+        safe_name = (filename or path.rsplit("/", 1)[-1]).replace('"', "'")
+        headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return _Response(content=content, media_type=media_type, headers=headers)
 
 
 @router.get("/items", response_model=list[LibraryItemResponse])
@@ -524,50 +422,6 @@ async def get_library_item_status(item_id: uuid.UUID, current_user: CurrentUser,
         "is_processed": row.is_processed,
         "title": row.title,
     }
-
-
-@router.post("/{item_id}/reprocess")
-async def reprocess_library_item(
-    item_id: uuid.UUID,
-    background_tasks: BackgroundTasks,
-    current_user: CurrentUser,
-    db: DBSession,
-):
-    """Re-trigger embedding for a vault item stuck in 'processing' or 'failed' state.
-    Safe to call multiple times — skips items that are already 'ready'.
-    """
-    result = await db.execute(
-        select(UserLibraryItem).where(
-            UserLibraryItem.id == item_id,
-            UserLibraryItem.user_id == current_user.id,
-        )
-    )
-    item = result.scalar_one_or_none()
-    if not item:
-        raise NotFoundException("Library item not found")
-
-    item.processing_status = "processing"
-    item.is_processed = False
-    await db.commit()
-    await db.refresh(item)
-
-    _dispatched_via_celery = False
-    try:
-        process_vault_embeddings.delay(str(item.id), str(current_user.id), item.title)
-        _dispatched_via_celery = True
-        print(f"[Reprocess] Celery task queued for '{item.title}' (item_id={item.id})")
-    except Exception as exc:
-        print(f"[Reprocess] Celery dispatch failed ({exc!r}), falling back to BackgroundTask")
-
-    if not _dispatched_via_celery:
-        background_tasks.add_task(
-            _process_vault_item_bg,
-            str(item.id),
-            str(current_user.id),
-            item.title,
-        )
-
-    return {"status": "queued", "item_id": str(item.id)}
 
 
 @router.get("/{item_id}", response_model=LibraryItemResponse)
@@ -690,11 +544,13 @@ async def delete_library_item(item_id: uuid.UUID, current_user: CurrentUser, db:
     if not item:
         raise NotFoundException("Library item not found")
 
-    # Snapshot chunk IDs before cascade-delete removes the rows.
+    # Collect chunk IDs so the Celery worker can remove them from FAISS
+    # after the DB rows are gone. We snapshot them here because the chunks
+    # are cascade-deleted with the item below.
     chunks_result = await db.execute(
         select(DocChunk.id).where(DocChunk.library_item_id == item_id)
     )
-    chunk_ids = {str(row[0]) for row in chunks_result.all()}
+    chunk_ids = [str(row[0]) for row in chunks_result.all()]
 
     storage = StorageService()
     if item.storage_path:
@@ -703,22 +559,10 @@ async def delete_library_item(item_id: uuid.UUID, current_user: CurrentUser, db:
     await db.delete(item)
     await db.commit()
 
+    # Offload vector-store cleanup to Celery so the HTTP request returns fast
+    # and retries are handled by the worker if FAISS I/O fails.
     if chunk_ids:
-        # Try Celery first; fall back to inline removal if broker is unavailable.
-        _del_via_celery = False
-        try:
-            delete_vault_embeddings.delay(str(current_user.id), list(chunk_ids))
-            _del_via_celery = True
-            print(f"[Delete] Celery queued FAISS cleanup ({len(chunk_ids)} chunk(s)) for user={current_user.id}")
-        except Exception as exc:
-            print(f"[Delete] Celery dispatch failed ({exc!r}), removing FAISS chunks inline")
-
-        if not _del_via_celery:
-            try:
-                _faiss().remove_chunks(user_id=str(current_user.id), chunk_ids=chunk_ids)
-                print(f"[Delete] Removed {len(chunk_ids)} FAISS chunk(s) inline for user={current_user.id}")
-            except Exception as exc2:
-                logger.warning("[Delete] Inline FAISS cleanup failed for user=%s: %s", current_user.id, exc2)
+        delete_vault_embeddings.delay(str(current_user.id), chunk_ids)
 
 
 @router.post("/vault/query", response_model=VaultQueryResponse)

@@ -304,34 +304,13 @@ def _lang_instruction(language: str | None) -> str:
     return f" Respond in {lang_name}."
 
 
-def _grade_calibration_note(grade: str | None, board: str | None) -> str:
-    """Return a grade/board calibration reminder to embed in RAG injection prompts."""
-    parts = []
-    if grade:
-        parts.append(f"Grade {grade}")
-    if board:
-        parts.append(board)
-    if not parts:
-        return ""
-    profile = " / ".join(parts)
-    return (
-        f"\nIMPORTANT: While answering from the excerpts, calibrate your explanation "
-        f"for a {profile} student — use vocabulary, depth, and examples appropriate for their level. "
-        f"Do not copy document text verbatim; re-explain it in language the student can understand."
-    )
-
-
-def _inject_rag(messages: list[dict], question: str, rag_text: str, language: str | None = None, grade: str | None = None, board: str | None = None) -> list[dict]:
+def _inject_rag(messages: list[dict], question: str, rag_text: str, language: str | None = None) -> list[dict]:
     """Replace the last user message with a RAG-enriched version."""
     lang_note = _lang_instruction(language)
-    grade_note = _grade_calibration_note(grade, board)
     enriched_question = (
-        "The user has selected specific document(s) from their Knowledge Vault. "
-        "Answer ONLY using the excerpts below — do NOT use any external knowledge, training data, or information outside these excerpts.\n"
-        "If the answer cannot be found in the excerpts, respond with: "
-        "'I couldn't find information about that in your selected document(s). "
-        f"Try rephrasing your question or selecting a different file.'{lang_note}"
-        f"{grade_note}\n\n"
+        "Use the following excerpts from the user's selected documents to answer accurately.\n"
+        "If the answer is not in the excerpts, say so and answer from general knowledge."
+        f"{lang_note}\n\n"
         f"--- DOCUMENT EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
         f"Question: {question}"
     )
@@ -343,38 +322,12 @@ def _inject_rag(messages: list[dict], question: str, rag_text: str, language: st
     return updated
 
 
-def _inject_no_rag_results(messages: list[dict], question: str, language: str | None = None) -> list[dict]:
-    """Inject a constraint when files are selected but no relevant chunks were found."""
-    lang_note = _lang_instruction(language)
-    enriched_question = (
-        "The user has selected specific document(s) from their Knowledge Vault, "
-        "but no relevant content was found in those documents for this query.\n"
-        "Do NOT answer from your own knowledge. Respond with: "
-        "'I couldn't find information about that in your selected document(s). "
-        f"Try rephrasing your question or selecting a different file.'{lang_note}\n\n"
-        f"Question: {question}"
-    )
-    updated = list(messages)
-    if updated and updated[-1]["role"] == "user":
-        updated[-1] = {"role": "user", "content": enriched_question}
-    else:
-        updated.append({"role": "user", "content": enriched_question})
-    return updated
-
-
-def _inject_inline_docs(
-    messages: list[dict],
-    question: str,
-    inline_docs: list[dict],
-    grade: str | None = None,
-    board: str | None = None,
-    language: str | None = None,
-) -> list[dict]:
+def _inject_inline_docs(messages: list[dict], question: str, inline_docs: list[dict], language: str | None = None) -> list[dict]:
     """Inject device-attached file content into the last user message.
 
-    The model is strictly constrained to answer ONLY from the attached file(s).
-    If the requested information is not present in the file it must say so clearly
-    rather than drawing on its general knowledge.
+    inline_docs is a list of {"filename": str, "text": str} dicts sent by the
+    frontend when the user attaches a file from their device (not the vault).
+    The original question is preserved for display; only the AI sees the file content.
     """
     doc_block = "\n\n".join(
         f"[ATTACHED FILE: {doc['filename']}]\n{doc['text']}\n[END OF FILE]"
@@ -384,27 +337,10 @@ def _inject_inline_docs(
     if not doc_block:
         return messages
 
-    filenames = ", ".join(
-        f'"{doc["filename"]}"' for doc in inline_docs if doc.get("filename")
-    )
-
-    calibration = ""
-    if grade and board:
-        calibration = (
-            f"\nIMPORTANT: Calibrate your explanation for a Grade {grade} / {board} student "
-            f"— use age-appropriate language and relatable examples from the document.\n"
-        )
     lang_note = _lang_instruction(language)
-
     enriched = (
-        f"The user has uploaded the following file(s): {filenames}.\n"
-        "STRICT RULE: Answer the question ONLY using information from the attached file(s) above. "
-        "Do NOT use your general knowledge or training data. "
-        "If the answer to the question is not present in the file, respond with exactly: "
-        f'"This information is not available in the uploaded file ({filenames})."'
-        f"{lang_note} "
-        "Do not guess, infer, or supplement with outside knowledge."
-        f"{calibration}\n\n"
+        "The user has attached the following file(s). "
+        f"Use the content to answer their question accurately.{lang_note}\n\n"
         f"{doc_block}\n\n"
         f"Question: {question}"
     )
@@ -425,11 +361,17 @@ async def _build_library_rag_context(
     db,
     ai: AIService,
     k: int = 15,
+    query_embedding: list[float] | None = None,
 ) -> str:
     """Return the most relevant chunk texts from a public library file.
 
     Searches the shared public_library FAISS index, then filters results
     to only chunks belonging to the specified file.
+
+    Pass `query_embedding` when the caller already computed it (e.g. looping
+    over several files for the SAME query) to skip a redundant, relatively
+    slow embedding-API call per file — the embedding only depends on
+    `question`, not on which file is being searched.
     """
     import logging
     log = logging.getLogger(__name__)
@@ -438,7 +380,8 @@ async def _build_library_rag_context(
     file_uuid = uuid.UUID(library_file_id)
 
     # FAISS path — search with a larger k since we'll filter by file_id
-    query_embedding = await ai.generate_query_embedding(question)
+    if query_embedding is None:
+        query_embedding = await ai.generate_query_embedding(question)
     has_index = faiss_svc.user_has_index(LIBRARY_FAISS_KEY)
     log.info("Library RAG: file=%s, has_index=%s, has_embedding=%s", library_file_id, has_index, bool(query_embedding))
 
@@ -479,17 +422,13 @@ async def _build_library_rag_context(
     return "\n\n".join(c.chunk_text for c in chunks)
 
 
-def _inject_library_rag(messages: list[dict], question: str, rag_text: str, book_title: str, language: str | None = None, grade: str | None = None, board: str | None = None) -> list[dict]:
+def _inject_library_rag(messages: list[dict], question: str, rag_text: str, book_title: str, language: str | None = None) -> list[dict]:
     """Replace the last user message with library-book-RAG-enriched version."""
     lang_note = _lang_instruction(language)
-    grade_note = _grade_calibration_note(grade, board)
     enriched_question = (
         f"The user is studying from the book '{book_title}' in the public library.\n"
-        "Answer ONLY using the excerpts from this book below — do NOT use any external knowledge or training data outside these excerpts.\n"
-        "If the answer cannot be found in the excerpts, respond with: "
-        f"'I couldn't find information about that in \"{book_title}\". "
-        f"Try rephrasing your question or check a different section of the book.'{lang_note}"
-        f"{grade_note}\n\n"
+        "Use the following excerpts from this book to answer accurately.\n"
+        f"If the answer is not in the excerpts, say so and answer from general knowledge.{lang_note}\n\n"
         f"--- BOOK EXCERPTS ---\n{rag_text}\n--- END OF EXCERPTS ---\n\n"
         f"Question: {question}"
     )
@@ -787,8 +726,6 @@ async def send_message_stream(
     )
     library_file_id: str | None = (payload.context or {}).get("library_file_id")
     rag_language: str | None = (payload.context or {}).get("language")
-    rag_grade: str | None = (payload.context or {}).get("grade")
-    rag_board: str | None = (payload.context or {}).get("board")
     is_summary = _is_summary_intent(payload.message)
 
     if selected_files:
@@ -826,9 +763,7 @@ async def send_message_stream(
                     ai=ai,
                 )
                 if rag_text:
-                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language, grade=rag_grade, board=rag_board)
-                else:
-                    messages = _inject_no_rag_results(messages, payload.message, language=rag_language)
+                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language)
         except Exception as e:
             print(f"[StreamChat] RAG context build failed: {e}", flush=True)
 
@@ -862,39 +797,18 @@ async def send_message_stream(
                 if lib_rag_text:
                     messages = _inject_library_rag(
                         messages, payload.message, lib_rag_text,
-                        book_title=book_title, language=rag_language, grade=rag_grade, board=rag_board,
+                        book_title=book_title, language=rag_language,
                     )
-                else:
-                    messages = _inject_no_rag_results(messages, payload.message, language=rag_language)
         except Exception as e:
             print(f"[StreamChat] Library RAG context build failed: {e}", flush=True)
 
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
     if inline_docs:
-        messages = _inject_inline_docs(messages, payload.message, inline_docs, grade=rag_grade, board=rag_board, language=rag_language)
+        messages = _inject_inline_docs(messages, payload.message, inline_docs, language=rag_language)
 
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id)
-
-    # If no files are selected this turn, but a previous assistant message in history
-    # carried a document-only constraint, the model may repeat "I couldn't find
-    # information in your selected document(s)" by following the conversation pattern.
-    # Inject a brief override into the current user message to break out of that pattern.
-    if not has_files and messages:
-        prior_assistant_text = " ".join(
-            m.get("content", "") for m in messages[:-1] if m.get("role") == "assistant"
-        )
-        if "selected document" in prior_assistant_text or "couldn't find information" in prior_assistant_text:
-            if messages[-1]["role"] == "user":
-                messages[-1] = {
-                    "role": "user",
-                    "content": (
-                        messages[-1]["content"]
-                        + "\n\n[No files are selected for this message. "
-                        "Ignore any previous document-only constraints and answer freely from your general knowledge.]"
-                    ),
-                }
 
     # --- Instant greeting responses (no LLM call, zero tokens) ---
     # Canned replies are English-only text — only use the fast path when the
@@ -1033,8 +947,6 @@ async def send_message(
     )
     library_file_id_sync: str | None = (payload.context or {}).get("library_file_id")
     rag_language_sync: str | None = (payload.context or {}).get("language")
-    rag_grade_sync: str | None = (payload.context or {}).get("grade")
-    rag_board_sync: str | None = (payload.context or {}).get("board")
     is_summary_sync = _is_summary_intent(payload.message)
 
     if selected_files:
@@ -1068,9 +980,7 @@ async def send_message(
                     ai=ai,
                 )
                 if rag_text:
-                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language_sync, grade=rag_grade_sync, board=rag_board_sync)
-                else:
-                    messages = _inject_no_rag_results(messages, payload.message, language=rag_language_sync)
+                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language_sync)
         except Exception as e:
             print(f"[SendMessage] RAG context build failed: {e}", flush=True)
 
@@ -1101,36 +1011,18 @@ async def send_message(
                 if lib_rag_text_sync:
                     messages = _inject_library_rag(
                         messages, payload.message, lib_rag_text_sync,
-                        book_title=book_title_sync, language=rag_language_sync, grade=rag_grade_sync, board=rag_board_sync,
+                        book_title=book_title_sync, language=rag_language_sync,
                     )
-                else:
-                    messages = _inject_no_rag_results(messages, payload.message, language=rag_language_sync)
         except Exception as e:
             print(f"[SendMessage] Library RAG context build failed: {e}", flush=True)
 
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
     inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
     if inline_docs:
-        messages = _inject_inline_docs(messages, payload.message, inline_docs, grade=rag_grade_sync, board=rag_board_sync, language=rag_language_sync)
+        messages = _inject_inline_docs(messages, payload.message, inline_docs, language=rag_language_sync)
 
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id_sync)
-
-    # Break out of any lingering document-only constraint from a previous turn
-    if not has_files and messages:
-        prior_assistant_text = " ".join(
-            m.get("content", "") for m in messages[:-1] if m.get("role") == "assistant"
-        )
-        if "selected document" in prior_assistant_text or "couldn't find information" in prior_assistant_text:
-            if messages[-1]["role"] == "user":
-                messages[-1] = {
-                    "role": "user",
-                    "content": (
-                        messages[-1]["content"]
-                        + "\n\n[No files are selected for this message. "
-                        "Ignore any previous document-only constraints and answer freely from your general knowledge.]"
-                    ),
-                }
 
     response_text = await ai.chat(messages=messages, context=payload.context, has_files=has_files)
 
@@ -1595,11 +1487,24 @@ async def generate_practice_assessment_stream(
     if payload.library_file_ids:
         ai_for_rag = get_ai_service()
         topic_query = payload.topic or payload.subject or "general content"
+        # The embedding only depends on topic_query, which is the SAME for
+        # every file below — computing it once here (instead of once PER
+        # file, as before) turns N sequential embedding-API calls into 1.
+        # Combined with generate_query_embedding no longer blocking the event
+        # loop, this is what was causing the multi-second "stuck, no progress
+        # shown at all" delay before the SSE stream even started when a user
+        # generated from multiple vault files.
+        shared_query_embedding = await ai_for_rag.generate_query_embedding(topic_query)
         rag_parts: list[str] = []
+        # Kept sequential (not gathered) deliberately — these share one
+        # AsyncSession `db`, which isn't safe to use concurrently from
+        # multiple coroutines. The embedding call above was the actual slow
+        # part; the remaining per-file FAISS search + DB lookup here is fast.
         for lib_fid in payload.library_file_ids:
             part = await _build_library_rag_context(
                 question=topic_query, library_file_id=lib_fid,
                 db=db, ai=ai_for_rag, k=20,
+                query_embedding=shared_query_embedding,
             )
             if part:
                 rag_parts.append(part)
@@ -1696,11 +1601,17 @@ async def generate_practice_assessment_stream(
         async def inprocess_event_generator() -> AsyncGenerator[str, None]:
             try:
                 yield f"data: {json.dumps({'stage': 'points_done', 'progress': 10, 'message': 'Points deducted successfully'})}\n\n"
+                await asyncio.sleep(0.15)  # let each SSE chunk actually flush/paint separately
                 yield f"data: {json.dumps({'stage': 'preparing', 'progress': 20, 'message': 'Preparing assessment configuration...'})}\n\n"
+                await asyncio.sleep(0.15)
                 yield f"data: {json.dumps({'stage': 'generating', 'progress': 30, 'message': f'Generating {payload.question_count} questions with AI...'})}\n\n"
 
                 ai = get_ai_service()
-                raw = await ai.generate_practice_assessment(
+                # The LLM call is the longest step by far and previously had no
+                # progress signal between 30% and 80% — polling it as a task
+                # lets us publish real incrementing progress while it's still
+                # running instead of one long silent gap that read as "stuck".
+                gen_task = asyncio.ensure_future(ai.generate_practice_assessment(
                     subject=payload.subject,
                     topics=topics,
                     grade=payload.grade,
@@ -1717,7 +1628,17 @@ async def generate_practice_assessment_stream(
                     source_text=resolved_source_text,
                     language=payload.language,
                     exam_type=payload.exam_type,
-                )
+                ))
+
+                heartbeat_progress = 30
+                while True:
+                    done, _pending = await asyncio.wait({gen_task}, timeout=2.5)
+                    if gen_task in done:
+                        break
+                    heartbeat_progress = min(heartbeat_progress + 6, 75)
+                    yield f"data: {json.dumps({'stage': 'generating', 'progress': heartbeat_progress, 'message': f'Generating {payload.question_count} questions with AI...'})}\n\n"
+
+                raw = gen_task.result()  # re-raises if the task itself raised
 
                 yield f"data: {json.dumps({'stage': 'processing', 'progress': 80, 'message': 'Processing and validating questions...'})}\n\n"
 
@@ -1731,7 +1652,19 @@ async def generate_practice_assessment_stream(
 
         generator = inprocess_event_generator()
 
-    return StreamingResponse(generator, media_type="text/event-stream")
+    # Cache-Control/X-Accel-Buffering headers (same as the chat SSE endpoint
+    # above) are essential here, not optional — without X-Accel-Buffering:
+    # no, an Nginx-style reverse proxy in front of this API will buffer the
+    # ENTIRE response and only release it once complete (or once its buffer
+    # fills), instead of forwarding each `yield` as it happens. That produces
+    # exactly "nothing shown for a long time, then everything appears at
+    # once" client-side, no matter how correct the backend's progress
+    # events or the frontend's rendering are.
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 class AutoGradeRequest(BaseModel):

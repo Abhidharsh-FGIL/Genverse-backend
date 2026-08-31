@@ -54,7 +54,6 @@ async def _get_active_subscription(
         result = await db.execute(
             select(Subscription).where(
                 Subscription.org_id == org_id,
-                Subscription.workspace_type == "organization",
                 Subscription.status.in_(["active", "trialing"]),
             ).order_by(Subscription.updated_at.desc())
         )
@@ -66,14 +65,7 @@ async def _get_active_subscription(
                 Subscription.status.in_(["active", "trialing"]),
             ).order_by(Subscription.updated_at.desc())
         )
-    sub = result.scalars().first()
-    if sub:
-        plan_def = await db.scalar(
-            select(PlanDefinition).where(PlanDefinition.plan == sub.plan)
-        )
-        if plan_def:
-            sub.max_file_size_mb = plan_def.max_file_size_mb
-    return sub
+    return result.scalars().first()
 
 
 @router.get("", response_model=SubscriptionResponse)
@@ -132,7 +124,10 @@ async def get_feature_limits_by_plan(
     plan: str | None = Query(None),
 ):
     plan_name = plan or "free"
-    if current_user:
+    # An explicit `plan` always wins (used to preview a plan the user isn't on
+    # yet, e.g. to find which tier unlocks a locked feature). Only fall back to
+    # the user's actual current plan when no `plan` was requested.
+    if current_user and not plan:
         sub = await _get_active_subscription(
             db, current_user.id, uuid.UUID(org_id) if org_id else None
         )

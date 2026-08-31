@@ -6529,14 +6529,30 @@ Return ONLY valid JSON (no markdown):
     )
 
     _MAX_PDF_PAGES = 50
-    _PDF_PARALLEL_WORKERS = 8
+    _PDF_PARALLEL_WORKERS = 4
 
     # ------------------------------------------------------------------
     # Image preprocessing (OpenCV) — improves OCR on scanned/handwritten
     # ------------------------------------------------------------------
     @staticmethod
-    def _preprocess_image(image_path: str) -> bytes | None:
-        """Resize, grayscale, denoise, threshold → return JPEG bytes."""
+    def _preprocess_image(image_path: str, binarize: bool = False) -> bytes | None:
+        """Resize, grayscale, denoise, optionally threshold → return JPEG bytes.
+
+        binarize defaults to False. A single global OTSU black/white threshold
+        assumes even lighting across the whole image, which real-world photos
+        (angled, phone camera, a shadow/glare gradient across the page) rarely
+        have — observed in practice: a photographed handwritten receipt with a
+        lighting gradient came back with the printed template text intact but
+        the handwritten content in the dimmer region extracted as nothing at
+        all, consistent with binarization washing out fainter strokes there.
+        It's also generally unnecessary for modern deep-learning OCR (Cloud
+        Vision, Gemini) the way it was for classical engines like Tesseract —
+        those models are trained on natural images and do their own internal
+        contrast/lighting normalization, so hand-rolled binarization is more
+        likely to introduce a new failure mode than fix one. Left in as an
+        opt-in for callers that find a specific need for it, but nothing in
+        this codebase currently sets binarize=True.
+        """
         try:
             import cv2
             image = cv2.imread(image_path)
@@ -6548,8 +6564,9 @@ Return ONLY valid JSON (no markdown):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             # Denoise
             img = cv2.bilateralFilter(img, 9, 75, 75)
-            # Binary threshold (OTSU)
-            img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            # Binary threshold (OTSU) — skipped for Tamil, see docstring
+            if binarize:
+                img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
             # Convert back to RGB for Gemini
             img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
             # Encode to JPEG bytes
@@ -6594,10 +6611,6 @@ Return ONLY valid JSON (no markdown):
     # ------------------------------------------------------------------
     # Single-page OCR via Gemini vision
     # ------------------------------------------------------------------
-    # Ordered list of models to try for vision OCR — first one that succeeds wins.
-    # gemini-2.0-flash is the guaranteed multimodal fallback.
-    _OCR_MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-1.5-flash"]
-
     async def _ocr_single_image(
         self, image_data: bytes, language: str, page_label: str = "",
     ) -> str:
@@ -6605,56 +6618,71 @@ Return ONLY valid JSON (no markdown):
         import google.generativeai as genai
         api_key = settings.GEMINI_API_KEY or settings.GOOGLE_GEMINI_API_KEY
         genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(settings.AI_PRIMARY_MODEL)
 
         lang_hint = f"The text may be in {language} language. " if language != "en" else ""
         prompt = f"{lang_hint}{self._OCR_PROMPT}"
 
-        # Try the configured primary model first; fall back to known vision-capable models.
-        candidates = [settings.AI_PRIMARY_MODEL] + [
-            m for m in self._OCR_MODEL_CANDIDATES if m != settings.AI_PRIMARY_MODEL
-        ]
-        for model_name in candidates:
-            try:
-                model = genai.GenerativeModel(model_name)
-                resp = await asyncio.to_thread(
-                    model.generate_content,
-                    [prompt, {"mime_type": "image/jpeg", "data": image_data}],
-                )
-                text = resp.text or ""
-                if page_label:
-                    print(f"[OCR] {page_label} ({model_name}): extracted {len(text)} chars")
-                return text
-            except Exception as exc:
-                print(f"[OCR] {page_label} model={model_name} failed: {exc}")
-                continue
+        resp = await asyncio.to_thread(
+            model.generate_content,
+            [prompt, {"mime_type": "image/jpeg", "data": image_data}],
+        )
+        text = resp.text or ""
+        if page_label:
+            print(f"[OCR] {page_label}: extracted {len(text)} chars")
+        return text
 
-        print(f"[OCR] {page_label}: all vision models failed, returning empty")
-        return ""
+    # ------------------------------------------------------------------
+    # Route one image/page to the best OCR engine for its language
+    # ------------------------------------------------------------------
+    async def _ocr_page_smart(self, image_data: bytes, language: str, page_label: str = "") -> str:
+        """Google Cloud Vision's document_text_detection first, for EVERY
+        language including English. Vision is a dedicated character-recognition
+        model with genuine handwriting support — a general vision-language
+        model like Gemini, asked to transcribe messy/cursive handwriting
+        directly from an image, can confidently hallucinate plausible-looking
+        but entirely wrong text instead of admitting uncertainty (observed in
+        practice: garbled non-existent glyphs in place of real handwritten
+        content). An explicit language_hints value (not blind auto-detection)
+        further improves accuracy, especially for Tamil and other Indic
+        scripts. Falls back to Gemini — which is still the better choice for
+        fully reconstructing rich math notation/tables as structured markdown —
+        if the Vision API call itself errors, or comes back with nothing.
+        """
+        hint = None if language == "auto" else language
+        try:
+            from app.services.vision_ocr_service import ocr_image
+            text, detected = await asyncio.to_thread(ocr_image, image_data, hint)
+            if text and text.strip():
+                if page_label:
+                    print(f"[OCR] {page_label}: extracted {len(text)} chars (Vision, lang={detected})")
+                return text
+            print(f"[OCR] {page_label}: Vision returned no text, trying Gemini")
+        except Exception as e:
+            print(f"[OCR] {page_label}: Vision API failed, falling back to Gemini: {e}")
+
+        fallback_lang = language if language != "auto" else "en"
+        return await self._ocr_single_image(image_data, fallback_lang, page_label)
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
-    async def extract_text_from_file(
-        self, file_path: str, language: str = "en", inline_page_limit: int | None = None
-    ) -> str:
+    async def extract_text_from_file(self, file_path: str, language: str = "auto") -> str:
         """Extract text from a file (PDF, DOCX, image, etc.).
 
-        Implements the legacy GenVerse OCR pipeline:
         - Image preprocessing (resize, grayscale, denoise, threshold)
-        - Language auto-detection
-        - Vision-based OCR via Gemini (works on scanned/handwritten docs)
+        - `language="en"` → Gemini vision (rich markdown/table/equation reconstruction)
+        - `language="auto"` or any other explicit language → Google Cloud Vision's
+          document_text_detection, a dedicated OCR model with per-language hints
+          and much better handwriting support for non-Latin scripts (falls back
+          to the Gemini path if the Vision API call itself fails)
         - Parallel page processing for multi-page PDFs
-
-        Args:
-            inline_page_limit: When set (inline AI chat use), overrides _MAX_PDF_PAGES
-                so only the first N pages are processed, keeping extraction fast.
         """
         path = Path(file_path)
         if not path.exists():
             return ""
 
         ext = path.suffix.lower()
-        effective_page_limit = inline_page_limit if inline_page_limit is not None else self._MAX_PDF_PAGES
         try:
             # ── PDF: try fast text-layer extraction first, OCR only as fallback ──
             if ext == ".pdf":
@@ -6663,17 +6691,14 @@ Return ONLY valid JSON (no markdown):
                 reader = PdfReader(file_path)
                 page_count = len(reader.pages)
 
-                if page_count > effective_page_limit:
-                    print(f"[OCR] PDF has {page_count} pages, processing first {effective_page_limit} only")
-                    page_count = effective_page_limit
-
-                # Slice to the pages we'll actually process
-                pages_to_process = list(reader.pages[:page_count])
+                if page_count > self._MAX_PDF_PAGES:
+                    print(f"[OCR] PDF has {page_count} pages (limit {self._MAX_PDF_PAGES}), skipping")
+                    return ""
 
                 # Fast path: native text-layer extraction (works for digital PDFs)
                 native_pages: list[str] = []
                 try:
-                    for i, page in enumerate(pages_to_process):
+                    for i, page in enumerate(reader.pages):
                         try:
                             t = page.extract_text() or ""
                         except Exception:
@@ -6685,73 +6710,84 @@ Return ONLY valid JSON (no markdown):
                     print(f"[OCR] Native PDF extraction failed: {e}")
                     native_pages = ["" for _ in range(page_count)]
 
-                # Pages with very little native text are likely scanned / image-heavy.
-                # Threshold is intentionally high (300 chars ≈ 2-3 real sentences) so
-                # that watermark-only text ("Downloaded from studiestoday.com" ≈ 40 chars)
-                # never passes as "real content" and always triggers vision OCR.
-                _PER_PAGE_TEXT_THRESHOLD = 300  # chars
+                # Pages with very little native text are likely image-heavy (diagrams,
+                # scanned figures, equations rendered as images). Run vision OCR on those.
+                _PER_PAGE_TEXT_THRESHOLD = 80  # chars
                 pages_needing_ocr = [
                     i for i, t in enumerate(native_pages) if len(t.strip()) < _PER_PAGE_TEXT_THRESHOLD
                 ]
 
-                # If every page has plenty of native text, return immediately (fastest path).
-                # Also guard against the "watermarks only" case: if the entire document
-                # yields fewer than 300 chars per page on average, force OCR regardless.
-                avg_chars_per_page = total_native_chars / page_count if page_count else 0
-                if not pages_needing_ocr and avg_chars_per_page >= _PER_PAGE_TEXT_THRESHOLD:
+                # If every page has plenty of native text, return immediately (fastest path)
+                if not pages_needing_ocr:
                     merged = "\n\n---\n\n".join(
                         f"**Page {i+1}:**\n\n{t}" for i, t in enumerate(native_pages) if t.strip()
                     )
                     print(f"[OCR] PDF fully covered by native text ({len(merged)} chars), skipping OCR")
                     return merged
-                elif not pages_needing_ocr:
-                    # Every page passed the per-page check individually, but overall
-                    # average is suspiciously low — likely all watermarks.  Force all pages.
-                    print(f"[OCR] Avg {avg_chars_per_page:.0f} chars/page — likely watermarks only, forcing full OCR")
-                    pages_needing_ocr = list(range(page_count))
 
                 print(f"[OCR] {len(pages_needing_ocr)}/{page_count} pages need vision OCR for images/diagrams")
 
-                # Render pages using PyMuPDF (fitz) — no poppler needed, already installed.
-                import fitz as _fitz  # PyMuPDF
+                # Render only the pages that need OCR (image-heavy / scanned pages)
+                from pdf2image import convert_from_path
+                import shutil, sys
+                poppler_path = None
+                if sys.platform.startswith("linux") or sys.platform == "darwin":
+                    for candidate in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]:
+                        if shutil.which("pdfinfo", path=candidate):
+                            poppler_path = candidate
+                            break
+                kwargs = {"poppler_path": poppler_path} if poppler_path else {}
+
+                # Render each needed page individually (1-indexed for pdf2image)
                 import io, tempfile, os
                 ocr_pages_text: dict[int, str] = {}
                 tmp_dir = tempfile.mkdtemp(prefix="ocr_pages_")
                 try:
                     detected_lang = None
                     page_data_list: list[tuple[int, bytes]] = []
-                    fitz_doc = _fitz.open(file_path)
                     for page_idx in pages_needing_ocr:
                         try:
-                            fitz_page = fitz_doc[page_idx]
-                            # 2× zoom → ~144 DPI, good balance of quality vs size
-                            mat = _fitz.Matrix(2, 2)
-                            pix = fitz_page.get_pixmap(matrix=mat)
-                            jpeg_bytes = pix.tobytes("jpeg")
+                            page_images = await asyncio.to_thread(
+                                convert_from_path,
+                                file_path,
+                                first_page=page_idx + 1,
+                                last_page=page_idx + 1,
+                                **kwargs,
+                            )
                         except Exception as e:
-                            print(f"[OCR] Failed to render page {page_idx + 1} with PyMuPDF: {e}")
+                            print(f"[OCR] Failed to render page {page_idx + 1}: {e}")
                             continue
-
+                        if not page_images:
+                            continue
+                        pil_img = page_images[0]
                         page_path = os.path.join(tmp_dir, f"page_{page_idx}.jpg")
-                        with open(page_path, "wb") as f:
-                            f.write(jpeg_bytes)
+                        pil_img.save(page_path, "JPEG")
 
                         # Detect language from first OCR'd page
                         if detected_lang is None:
-                            detected_lang = await self._detect_image_language(jpeg_bytes)
+                            buf = io.BytesIO()
+                            pil_img.save(buf, format="JPEG")
+                            detected_lang = await self._detect_image_language(buf.getvalue())
 
                         preprocessed = await asyncio.to_thread(self._preprocess_image, page_path)
-                        page_data_list.append((page_idx, preprocessed if preprocessed else jpeg_bytes))
-                    fitz_doc.close()
+                        if preprocessed:
+                            page_data_list.append((page_idx, preprocessed))
+                        else:
+                            buf = io.BytesIO()
+                            pil_img.save(buf, format="JPEG")
+                            page_data_list.append((page_idx, buf.getvalue()))
                 finally:
-                    import shutil
                     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-                effective_lang = detected_lang if (detected_lang and language == "en") else language
+                # "auto" isn't a real language code — resolve to the actually-detected
+                # one (or the user's explicit choice, if they picked something other than auto).
+                effective_lang = detected_lang if (detected_lang and language in ("en", "auto")) else language
 
-                # Parallel vision OCR (in batches) — instructed to describe diagrams/figures too
+                # Parallel OCR (in batches) — non-English pages route through Vision
+                # (with a real language hint) via _ocr_page_smart; English stays on
+                # Gemini, which is already good at markdown/table/equation reconstruction.
                 tasks = [
-                    self._ocr_single_image(data, effective_lang, f"Page {idx + 1}")
+                    self._ocr_page_smart(data, effective_lang, f"Page {idx + 1}")
                     for idx, data in page_data_list
                 ]
                 ocr_results: list[str] = []
@@ -6771,18 +6807,8 @@ Return ONLY valid JSON (no markdown):
                     native = native_pages[i].strip() if i < len(native_pages) else ""
                     ocr_text = ocr_pages_text.get(i, "").strip()
                     if native and ocr_text and i in pages_needing_ocr:
-                        # Page had a little native text + images — combine both.
-                        # Exception: when the whole page was forced through OCR because
-                        # its native text was sparse (the "likely watermarks" branch
-                        # above), Gemini's OCR often faithfully re-transcribes that same
-                        # short native text as part of describing the full page — check
-                        # for that overlap first so we don't duplicate identical content.
-                        native_normalized = " ".join(native.split())
-                        ocr_normalized = " ".join(ocr_text.split())
-                        if native_normalized and native_normalized in ocr_normalized:
-                            merged_pages.append(f"**Page {i+1}:**\n\n{ocr_text}")
-                        else:
-                            merged_pages.append(f"**Page {i+1}:**\n\n{native}\n\n{ocr_text}")
+                        # Page had a little native text + images — combine both
+                        merged_pages.append(f"**Page {i+1}:**\n\n{native}\n\n{ocr_text}")
                     elif ocr_text:
                         merged_pages.append(f"**Page {i+1}:**\n\n{ocr_text}")
                     elif native:
@@ -6802,23 +6828,27 @@ Return ONLY valid JSON (no markdown):
             elif ext in (".txt", ".md"):
                 return path.read_text(encoding="utf-8", errors="ignore")
 
-            # ── Images: preprocess → vision OCR ──
+            # ── Images: detect language → preprocess → OCR ──
             elif ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
-                # Preprocess image for better OCR
+                with open(file_path, "rb") as f:
+                    raw_image_data = f.read()
+
+                # Detect the language up front (unless already known), on the RAW
+                # (unprocessed) image — detection doesn't benefit from denoising —
+                # so we can pass a real language_hints value to Vision instead of
+                # leaving it to blind auto-detection, which measurably improves
+                # accuracy for Tamil and other Indic scripts. Every language,
+                # including English, now goes through the same path — see
+                # _ocr_page_smart for why English no longer skips straight to
+                # Gemini, and _preprocess_image for why it no longer binarizes.
+                detected_lang = (
+                    await self._detect_image_language(raw_image_data) if language == "auto" else language
+                )
                 preprocessed = await asyncio.to_thread(self._preprocess_image, file_path)
-                if preprocessed:
-                    image_data = preprocessed
-                else:
-                    with open(file_path, "rb") as f:
-                        image_data = f.read()
+                image_data = preprocessed or raw_image_data
+                print(f"[OCR] Image ready: {len(image_data)} bytes (lang={detected_lang})")
 
-                print(f"[OCR] Image ready: {len(image_data)} bytes")
-
-                # Auto-detect language if not specified
-                if language == "en":
-                    language = await self._detect_image_language(image_data)
-
-                text = await self._ocr_single_image(image_data, language, "Image")
+                text = await self._ocr_page_smart(image_data, detected_lang, "Image")
                 print(f"[OCR] Extracted {len(text)} chars from image")
                 return text
 

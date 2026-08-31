@@ -65,6 +65,19 @@ class StudentAiAnalysis(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class PlatformStats(Base):
+    """Cached platform-wide usage averages (score, study time, streak, topics mastered).
+
+    Recomputed lazily on read when stale — see PlatformStatsService. No user_id/org_id:
+    this table only ever holds a rolling history of singleton snapshot rows.
+    """
+    __tablename__ = "platform_stats"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    stats_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Recommendation(Base):
     __tablename__ = "recommendations"
 

@@ -1,6 +1,6 @@
 import uuid
 from fastapi import APIRouter, status, UploadFile, File, Form, Query
-from sqlalchemy import select, and_
+from sqlalchemy import select
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.content import PastPaper
@@ -9,6 +9,30 @@ from app.core.exceptions import NotFoundException
 from app.services.storage_service import StorageService
 
 router = APIRouter()
+
+
+@router.get("/meta")
+async def get_past_papers_meta(db: DBSession, current_user: CurrentUser):
+    """Return all distinct filter values (boards, grades, subjects, years)."""
+    from sqlalchemy import distinct as sa_distinct
+
+    base_cond = PastPaper.is_public == True
+
+    async def distinct_values(col):
+        q = select(sa_distinct(col)).where(base_cond, col.isnot(None))
+        return (await db.execute(q)).scalars().all()
+
+    boards = sorted([v for v in await distinct_values(PastPaper.board) if v])
+    grades = sorted([v for v in await distinct_values(PastPaper.grade) if v is not None])
+    subjects = sorted([v for v in await distinct_values(PastPaper.subject) if v])
+    years = sorted([v for v in await distinct_values(PastPaper.year) if v is not None], reverse=True)
+
+    return {
+        "boards": boards,
+        "grades": grades,
+        "subjects": subjects,
+        "years": years,
+    }
 
 
 @router.get("/", response_model=PastPaperListResponse)
@@ -20,11 +44,13 @@ async def list_past_papers(
     subject: str | None = Query(None),
     year: int | None = Query(None),
     exam_type: str | None = Query(None),
+    search: str | None = Query(None),
+    sort_by: str | None = Query(None),
     limit: int = Query(12, ge=1, le=50),
     cursor: str | None = Query(None, description="ISO datetime cursor for pagination"),
 ):
     from datetime import datetime as dt
-    from sqlalchemy import func as sa_func
+    from sqlalchemy import func as sa_func, or_
 
     base = select(PastPaper).where(PastPaper.is_public == True)
     if board:
@@ -37,6 +63,13 @@ async def list_past_papers(
         base = base.where(PastPaper.year == year)
     if exam_type:
         base = base.where(PastPaper.exam_type == exam_type)
+    if search:
+        term = f"%{search.lower()}%"
+        base = base.where(or_(
+            sa_func.lower(PastPaper.title).like(term),
+            sa_func.lower(PastPaper.subject).like(term),
+            sa_func.lower(PastPaper.board).like(term),
+        ))
 
     count_q = select(sa_func.count()).select_from(base.subquery())
     total = (await db.execute(count_q)).scalar() or 0
@@ -49,7 +82,16 @@ async def list_past_papers(
         except (ValueError, TypeError):
             pass
 
-    q = q.order_by(PastPaper.created_at.desc()).limit(limit + 1)
+    if sort_by == 'oldest':
+        q = q.order_by(PastPaper.created_at.asc())
+    elif sort_by == 'name_asc':
+        q = q.order_by(PastPaper.title.asc())
+    elif sort_by == 'name_desc':
+        q = q.order_by(PastPaper.title.desc())
+    else:
+        q = q.order_by(PastPaper.created_at.desc())
+
+    q = q.limit(limit + 1)
     result = await db.execute(q)
     rows = result.scalars().all()
 

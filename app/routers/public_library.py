@@ -1,8 +1,8 @@
 """
 Public Library — no authentication required.
 
-Three-level folder structure: Board → Grade → Subject.
-Files (textbooks/notes) are uploaded into subject folders.
+Two-level folder structure: Board → Grade.
+Files (one per subject) are uploaded into grade folders with a subject tag.
 Text extraction, semantic chunking, and FAISS embedding are processed in the
 background via Celery.
 
@@ -37,27 +37,21 @@ def _faiss() -> FAISSService:
 
 @router.post("/folders", status_code=status.HTTP_201_CREATED)
 async def create_folder(
-    name: str = Query(..., description="Folder name (e.g. 'CBSE', 'Grade 10', 'Mathematics')"),
-    parent_id: Optional[str] = Query(None, description="Parent folder ID. Omit for board (root)."),
-    folder_type: Optional[str] = Query(None, description="'board' | 'grade' | 'subject'. Auto-detected from depth if omitted."),
+    name: str = Query(..., description="Folder name (e.g. 'CBSE', 'Grade 10')"),
+    parent_id: Optional[str] = Query(None, description="Parent folder ID. Omit for board (root), provide board ID for grade."),
+    folder_type: Optional[str] = Query(None, description="'board' for root folders, 'grade' for grade folders inside a board"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a folder in the three-level hierarchy: Board (root) → Grade → Subject."""
+    """Create a Board or Grade folder. Only two levels allowed: Board (root) → Grade (child)."""
     parsed_parent = uuid.UUID(parent_id) if parent_id else None
 
-    # Enforce three-level hierarchy: board → grade → subject (no deeper)
+    # Enforce two-level hierarchy
     if parsed_parent:
         parent = await db.get(PublicFolder, parsed_parent)
         if not parent:
             raise HTTPException(status_code=404, detail="Parent folder not found")
         if parent.parent_id is not None:
-            # parent is already a grade (depth-2); check it's not itself a subject (depth-3)
-            grandparent = await db.get(PublicFolder, parent.parent_id)
-            if grandparent and grandparent.parent_id is not None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Only three levels allowed: Board → Grade → Subject. Cannot nest deeper.",
-                )
+            raise HTTPException(status_code=400, detail="Only two levels allowed: Board → Grade. Cannot nest deeper.")
 
     # Check duplicate name under same parent
     existing = await db.execute(
@@ -69,15 +63,9 @@ async def create_folder(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail=f"Folder '{name}' already exists in this location")
 
-    # Auto-detect folder_type from depth if not provided
+    # Auto-detect folder_type if not provided
     if not folder_type:
-        if not parsed_parent:
-            folder_type = "board"
-        else:
-            parent = parent if parsed_parent else None
-            if parent is None:
-                parent = await db.get(PublicFolder, parsed_parent)
-            folder_type = "subject" if parent and parent.parent_id else "grade"
+        folder_type = "grade" if parsed_parent else "board"
 
     folder = PublicFolder(
         name=name,
@@ -223,105 +211,6 @@ async def _collect_chunk_ids_recursive(db: AsyncSession, folder_id: uuid.UUID) -
 
 
 # ── Files (one per subject inside a grade folder) ───────────────────────────
-
-@router.get("/files/by-class")
-async def list_files_by_class(
-    grade: str = Query(..., description="Grade number (e.g. '5', '10')"),
-    board: str = Query(..., description="Board name (e.g. 'CBSE', 'ICSE')"),
-    db: AsyncSession = Depends(get_db),
-):
-    """Return processed public library files matching a class's grade and board.
-
-    Traverses the three-level folder hierarchy: Board → Grade → Subject.
-    Board and grade names are matched case-insensitively and by substring.
-    Returns all files across all subject folders under the matching grade,
-    each annotated with its subject folder name.
-    Falls back to files directly in the grade folder for backwards compatibility.
-    """
-    board_upper = board.strip().upper()
-    grade_str = str(grade).strip()
-
-    # Step 1: find the matching board folder (parent_id IS NULL)
-    boards_result = await db.execute(
-        select(PublicFolder).where(PublicFolder.parent_id == None)  # noqa: E711
-    )
-    board_folder = None
-    for bf in boards_result.scalars().all():
-        if board_upper in bf.name.upper() or bf.name.upper() in board_upper:
-            board_folder = bf
-            break
-
-    if not board_folder:
-        return {"files": [], "board_folder": None, "grade_folder": None}
-
-    # Step 2: find the matching grade folder under this board
-    grades_result = await db.execute(
-        select(PublicFolder).where(PublicFolder.parent_id == board_folder.id)
-    )
-    grade_folder = None
-    for gf in grades_result.scalars().all():
-        name_clean = gf.name.strip().lower().replace("grade", "").strip()
-        if name_clean == grade_str or gf.name.strip() == grade_str:
-            grade_folder = gf
-            break
-
-    if not grade_folder:
-        return {
-            "files": [],
-            "board_folder": {"id": str(board_folder.id), "name": board_folder.name},
-            "grade_folder": None,
-        }
-
-    # Step 3: find all subject folders under this grade
-    subjects_result = await db.execute(
-        select(PublicFolder).where(PublicFolder.parent_id == grade_folder.id).order_by(PublicFolder.name)
-    )
-    subject_folders = subjects_result.scalars().all()
-
-    all_files = []
-
-    if subject_folders:
-        # New 3-level structure: collect files from each subject folder
-        subject_ids = [sf.id for sf in subject_folders]
-        subject_map = {sf.id: sf.name for sf in subject_folders}
-
-        files_result = await db.execute(
-            select(PublicFile)
-            .where(PublicFile.folder_id.in_(subject_ids), PublicFile.is_processed == True)  # noqa: E712
-            .order_by(PublicFile.title)
-        )
-        for f in files_result.scalars().all():
-            all_files.append({
-                "id": str(f.id),
-                "title": f.title,
-                "subject": subject_map.get(f.folder_id, f.subject),
-                "file_type": f.file_type,
-                "file_size_mb": f.file_size_mb,
-                "chunks_embedded": f.chunks_embedded,
-            })
-    else:
-        # Fallback: old 2-level structure — files directly in grade folder
-        files_result = await db.execute(
-            select(PublicFile)
-            .where(PublicFile.folder_id == grade_folder.id, PublicFile.is_processed == True)  # noqa: E712
-            .order_by(PublicFile.title)
-        )
-        for f in files_result.scalars().all():
-            all_files.append({
-                "id": str(f.id),
-                "title": f.title,
-                "subject": f.subject,
-                "file_type": f.file_type,
-                "file_size_mb": f.file_size_mb,
-                "chunks_embedded": f.chunks_embedded,
-            })
-
-    return {
-        "files": all_files,
-        "board_folder": {"id": str(board_folder.id), "name": board_folder.name},
-        "grade_folder": {"id": str(grade_folder.id), "name": grade_folder.name},
-    }
-
 
 @router.post("/files", status_code=status.HTTP_201_CREATED)
 async def upload_file(
@@ -500,29 +389,6 @@ async def get_task_status(task_id: str):
     return response
 
 
-@router.get("/files/{file_id}/text")
-async def get_public_file_text(
-    file_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """Return the full text of a processed public library file by joining its chunks in order."""
-    fid = uuid.UUID(file_id)
-    pub_file = await db.get(PublicFile, fid)
-    if not pub_file:
-        raise HTTPException(status_code=404, detail="File not found")
-    if not pub_file.is_processed:
-        raise HTTPException(status_code=202, detail="File is still being processed")
-
-    chunks_result = await db.execute(
-        select(PublicFileChunk)
-        .where(PublicFileChunk.file_id == fid)
-        .order_by(PublicFileChunk.chunk_order)
-    )
-    chunks = chunks_result.scalars().all()
-    full_text = "\n\n".join(c.chunk_text for c in chunks)
-    return {"text": full_text, "title": pub_file.title, "subject": pub_file.subject}
-
-
 @router.get("/files/{file_id}/status")
 async def get_file_processing_status(
     file_id: str,
@@ -545,7 +411,7 @@ async def get_file_processing_status(
 @router.get("/signed-url", include_in_schema=True)
 @router.get("/signed-url/", include_in_schema=False)
 async def get_signed_url(
-    path: str = Query(..., description="Absolute storage path of the file"),
+    path: str = Query(..., description="Storage path of the file"),
 ):
     """Convert an absolute storage path to a serving URL (no auth required)."""
     from pathlib import Path as _Path

@@ -365,11 +365,12 @@ async def send_message_with_attachment(
         prefix=str(chat_id),
     )
 
+    stored_attachment = {**file_info, "url": f"/api/v1/library/media?path={file_info['path']}"}
     msg = GroupChatMessage(
         chat_id=chat_id,
         user_id=current_user.id,
         content=content,
-        attachments=[file_info],
+        attachments=[stored_attachment],
     )
     db.add(msg)
     await db.commit()

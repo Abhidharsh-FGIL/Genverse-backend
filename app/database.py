@@ -318,6 +318,37 @@ async def run_migrations() -> None:
                 "ALTER TABLE rubrics ALTER COLUMN board TYPE VARCHAR(50) USING board::VARCHAR"
             ))
 
+        # Create payment_intents table if it doesn't exist — persists checkout
+        # context (user/plan/promo) the moment a gateway redirect is created,
+        # so a payment that succeeds but whose success callback never reaches
+        # us (missed webhook, or a PhonePe recurring-mandate payment whose
+        # status API differs from one-time orders) is still recoverable.
+        pi_exists = await conn.execute(text(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'payment_intents'"
+        ))
+        if not pi_exists.scalar():
+            await conn.execute(text("""
+                CREATE TABLE payment_intents (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    merchant_order_id VARCHAR(80) NOT NULL UNIQUE,
+                    user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                    org_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
+                    gateway VARCHAR(20) NOT NULL,
+                    flow VARCHAR(20) NOT NULL DEFAULT 'order',
+                    item_type VARCHAR(30) NOT NULL,
+                    item_id VARCHAR(50) NOT NULL,
+                    amount_inr INTEGER NOT NULL,
+                    promo_code VARCHAR(50),
+                    promo_discount INTEGER NOT NULL DEFAULT 0,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX idx_payment_intents_merchant_order_id ON payment_intents(merchant_order_id)"))
+            await conn.execute(text("CREATE INDEX idx_payment_intents_user ON payment_intents(user_id)"))
+            await conn.execute(text("CREATE INDEX idx_payment_intents_status ON payment_intents(status)"))
+
 
 async def close_db() -> None:
     await engine.dispose()
