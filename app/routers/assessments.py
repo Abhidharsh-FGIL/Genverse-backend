@@ -96,6 +96,7 @@ async def generate_assessment(payload: GenerateAssessmentRequest, current_user: 
         question_count=payload.question_count,
         question_types=payload.question_types,
         mode=payload.mode,
+        language=payload.language,
     )
 
     if not questions or (isinstance(questions, list) and len(questions) == 0):

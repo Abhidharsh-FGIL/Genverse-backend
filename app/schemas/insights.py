@@ -31,6 +31,7 @@ class InsightArticleResponse(BaseModel):
 
 class GenerateInsightsRequest(BaseModel):
     force_refresh: bool = False
+    language: Optional[str] = None
 
 
 class IntelligenceRequest(BaseModel):

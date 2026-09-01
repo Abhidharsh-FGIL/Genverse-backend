@@ -83,7 +83,7 @@ async def generate_insights(
     await points_service.deduct(user_id=current_user.id, action="generate_insights", db=db, org_id=parsed_oid)
 
     ai = get_ai_service()
-    insights_data = await ai.generate_insights(user_id=str(current_user.id), db=db)
+    insights_data = await ai.generate_insights(user_id=str(current_user.id), db=db, language=payload.language)
 
     new_insights = []
     for item in insights_data:
@@ -111,6 +111,7 @@ async def list_insights(
     unread_only: bool = Query(False),
     limit: int = Query(20, le=100),
     org_id: str | None = Query(None),
+    language: str | None = Query(None),
 ):
     from app.models.assessment import AssessmentAttempt
 
@@ -135,7 +136,7 @@ async def list_insights(
         )
         if attempt_count.scalar_one() > 0:
             ai = get_ai_service()
-            insights_data = await ai.generate_insights(user_id=str(current_user.id), db=db)
+            insights_data = await ai.generate_insights(user_id=str(current_user.id), db=db, language=language)
             new_insights = []
             for item in insights_data:
                 insight = UserInsight(
@@ -191,6 +192,7 @@ async def get_insight_feed(
     subject: str | None = Query(None),
     limit: int = Query(10, le=50),
     org_id: str | None = Query(None),
+    language: str | None = Query(None),
 ):
     parsed_oid = _parse_org_id(org_id)
 
@@ -209,6 +211,7 @@ async def get_insight_feed(
             user_id=str(current_user.id),
             subject=subject,
             db=db,
+            language=language,
         )
         for item in feed_data:
             article = InsightArticle(
@@ -382,6 +385,7 @@ async def get_assessment_summary(
     db: DBSession,
     force_refresh: bool = Query(False),
     org_id: str | None = Query(None),
+    language: str | None = Query(None),
 ):
     """
     Returns an AI-generated coach-style summary of the user's Assessment Hub usage:
@@ -409,7 +413,7 @@ async def get_assessment_summary(
             pass
 
     ai = get_ai_service()
-    summary = await ai.generate_assessment_summary(user_id=str(current_user.id), db=db, org_id=org_id)
+    summary = await ai.generate_assessment_summary(user_id=str(current_user.id), db=db, org_id=org_id, language=language)
 
     # Cache for 30 minutes
     try:
@@ -445,6 +449,7 @@ async def get_recommendations(
     db: DBSession,
     rec_type: str | None = Query(None),
     org_id: str | None = Query(None),
+    language: str | None = Query(None),
 ):
     parsed_oid = _parse_org_id(org_id)
 
@@ -474,7 +479,7 @@ async def get_recommendations(
         # Auto-generate on first load — same logic as /recommendations/generate
         ai = get_ai_service()
         recs_data = await ai.generate_assessment_recommendations(
-            user_id=str(current_user.id), db=db, org_id=org_id
+            user_id=str(current_user.id), db=db, org_id=org_id, language=language
         )
         new_recs = []
         for item in recs_data:
@@ -510,6 +515,7 @@ async def generate_recommendations(
     current_user: CurrentUser,
     db: DBSession,
     org_id: str | None = Query(None),
+    language: str | None = Query(None),
 ):
     """Re-generate assessment-based recommendations and replace old ones."""
     from sqlalchemy import delete as sql_delete
@@ -538,7 +544,7 @@ async def generate_recommendations(
 
     ai = get_ai_service()
     recs_data = await ai.generate_assessment_recommendations(
-        user_id=str(current_user.id), db=db, org_id=org_id
+        user_id=str(current_user.id), db=db, org_id=org_id, language=language
     )
 
     new_recs = []

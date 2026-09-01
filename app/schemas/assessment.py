@@ -19,6 +19,7 @@ class AssessmentCreate(BaseModel):
     is_adaptive: bool = False
     negative_marking: bool = False
     negative_mark_value: float = 0.25
+    language: Optional[str] = None
 
 
 class GenerateAssessmentRequest(AssessmentCreate):

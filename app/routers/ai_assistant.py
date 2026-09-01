@@ -1676,6 +1676,7 @@ class AutoGradeRequest(BaseModel):
     assignmentDocumentUrl: Optional[str] = None
     studentFileUrls: Optional[list] = None
     feedbackOnly: bool = False
+    language: Optional[str] = None
 
 
 @router.post("/auto-grade")
@@ -1693,6 +1694,7 @@ async def auto_grade(
         answers=payload.answers,
         student_name=payload.studentName,
         feedback_only=payload.feedbackOnly,
+        language=payload.language,
     )
     return result
 
@@ -1702,6 +1704,7 @@ class AutoEvaluateAttemptRequest(BaseModel):
     answer_key_json: list  # [{ "id": "...", "correctAnswer": "...", "points": 1 }]
     questions_json: list   # [{ "id": "...", "type": "mcq", "text": "...", "points": 1, "options": [...] }]
     subject: Optional[str] = ""
+    language: Optional[str] = None
 
 
 @router.post("/auto-evaluate-attempt")
@@ -1717,6 +1720,7 @@ async def auto_evaluate_attempt(
         answer_key_json=payload.answer_key_json,
         questions_json=payload.questions_json,
         subject=payload.subject or "",
+        language=payload.language,
     )
     return result
 

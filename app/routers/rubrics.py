@@ -98,5 +98,6 @@ async def generate_rubric_ai(payload: GenerateRubricRequest, current_user: Curre
         topic=payload.topic,
         criteria_count=payload.criteria_count,
         difficulty_level=payload.difficulty_level,
+        language=payload.language,
     )
     return {"criteria": criteria}

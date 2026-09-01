@@ -122,6 +122,7 @@ MODE_FEATURE_KEY = {
 
 class SetupRequest(BaseModel):
     topic: str
+    language: Optional[str] = None
 
 
 class ControlDef(BaseModel):
@@ -137,6 +138,7 @@ class SimulateRequest(BaseModel):
     topic: str
     variables: dict[str, Any] = {}
     controls: list[ControlDef] = []   # topic-specific control definitions for AI context
+    language: Optional[str] = None
 
 
 class FlashcardsRequest(BaseModel):
@@ -146,6 +148,7 @@ class FlashcardsRequest(BaseModel):
     board: str | None = None    # CBSE | ICSE | State | etc. Ignored when student_mode is False.
     student_mode: bool = True   # When False, ignore grade/board and generate generically.
     org_id: Optional[str] = None
+    language: Optional[str] = None
 
 
 class ImagineEvalRequest(BaseModel):
@@ -158,18 +161,21 @@ class ImagineEvalRequest(BaseModel):
     board: str | None = None
     student_mode: bool = True
     org_id: Optional[str] = None
+    language: Optional[str] = None
 
 
 class QuestRequest(BaseModel):
     topic: str
     history: list[str] = []
     choice: str | None = None
+    language: Optional[str] = None
 
 
 class MirrorChatRequest(BaseModel):
     topic: str
     persona: str = "The Ancient Scholar"
     messages: list[dict] = []
+    language: Optional[str] = None
 
 
 @router.post("/explore/stream")
@@ -224,6 +230,7 @@ async def playground_explore_stream(
             grade=resolved_grade,
             harder_mode=payload.harder_mode,
             context=merged_context,
+            language=payload.language,
         ):
             # Encode newlines so they survive SSE line-splitting on the client
             encoded = chunk.replace('\n', '\\n')
@@ -280,6 +287,7 @@ async def playground_explore(
         grade=resolved_grade,
         harder_mode=payload.harder_mode,
         context=merged_context,
+        language=payload.language,
     )
     return {"response": response, "mode": payload.mode, "topic": payload.topic}
 
@@ -292,7 +300,7 @@ async def playground_setup(
 ):
     """Topic interpreter: returns topic-specific controls + scene setup for the Sandbox."""
     ai = get_ai_service()
-    return await ai.playground_setup(payload.topic)
+    return await ai.playground_setup(payload.topic, payload.language)
 
 
 # ── The Sandbox — /simulate ───────────────────────────────────────────────────
@@ -304,7 +312,7 @@ async def playground_simulate(
     """Sandbox: send slider variables + control context → AI returns analysis + visual_directives."""
     ai = get_ai_service()
     controls_raw = [c.model_dump() for c in payload.controls] if payload.controls else None
-    return await ai.playground_simulate(payload.topic, payload.variables, controls_raw)
+    return await ai.playground_simulate(payload.topic, payload.variables, controls_raw, payload.language)
 
 
 # ── Flash-Duel — /cards ───────────────────────────────────────────────────────
@@ -315,7 +323,7 @@ async def playground_cards(
 ):
     """Flash-Duel: generate 5 gamified flashcards (question/answer/hint/points)."""
     ai = get_ai_service()
-    cards = await ai.playground_flashcards(payload.topic)
+    cards = await ai.playground_flashcards(payload.topic, payload.language)
     return {"cards": cards, "topic": payload.topic}
 
 
@@ -327,7 +335,7 @@ async def playground_quest(
 ):
     """Quest-Line: advance a branching narrative RPG. Pass history + current choice."""
     ai = get_ai_service()
-    return await ai.playground_quest(payload.topic, payload.history, payload.choice)
+    return await ai.playground_quest(payload.topic, payload.history, payload.choice, payload.language)
 
 
 # ── The Mirror — /chat ────────────────────────────────────────────────────────
@@ -339,7 +347,7 @@ async def playground_mirror_chat(
     """The Mirror: LLM adopts an educational persona and chats in character."""
     ai = get_ai_service()
     response = await ai.playground_mirror_chat(
-        payload.topic, payload.persona, payload.messages
+        payload.topic, payload.persona, payload.messages, payload.language
     )
     return {"response": response, "persona": payload.persona}
 
@@ -359,7 +367,7 @@ async def playground_match_pairs(
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = get_ai_service()
-    pairs = await ai.playground_match_pairs(payload.topic, role, grade, board, student_mode)
+    pairs = await ai.playground_match_pairs(payload.topic, role, grade, board, student_mode, payload.language)
     return {"pairs": pairs, "topic": payload.topic}
 
 
@@ -378,7 +386,7 @@ async def playground_swipe_facts(
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = get_ai_service()
-    facts = await ai.playground_swipe_facts(payload.topic, role, grade, board, student_mode)
+    facts = await ai.playground_swipe_facts(payload.topic, role, grade, board, student_mode, payload.language)
     return {"facts": facts, "topic": payload.topic}
 
 
@@ -398,7 +406,7 @@ async def playground_speed_quiz(
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = get_ai_service()
-    result = await ai.playground_speed_quiz(payload.topic, role, grade, board, student_mode)
+    result = await ai.playground_speed_quiz(payload.topic, role, grade, board, student_mode, payload.language)
     return {"questions": result.get("questions", []),
             "challenger": result.get("challenger", {}),
             "topic": payload.topic}
@@ -420,7 +428,7 @@ async def playground_roleplay(
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = get_ai_service()
-    scenario = await ai.playground_roleplay(payload.topic, role, grade, board, student_mode)
+    scenario = await ai.playground_roleplay(payload.topic, role, grade, board, student_mode, payload.language)
     return {"scenario": scenario, "topic": payload.topic}
 
 
@@ -440,7 +448,7 @@ async def playground_imagine(
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = get_ai_service()
-    scenario = await ai.playground_imagine(payload.topic, role, grade, board, student_mode)
+    scenario = await ai.playground_imagine(payload.topic, role, grade, board, student_mode, payload.language)
     return {"scenario": scenario, "topic": payload.topic}
 
 
@@ -460,7 +468,7 @@ async def playground_imagine_evaluate(
     ai = get_ai_service()
     evaluation = await ai.playground_imagine_evaluate(
         payload.topic, payload.question, payload.answer,
-        payload.max_points, role, grade, board, student_mode,
+        payload.max_points, role, grade, board, student_mode, payload.language,
     )
     return {"evaluation": evaluation}
 
@@ -480,7 +488,7 @@ async def playground_mythbusters(
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = get_ai_service()
-    result = await ai.playground_mythbusters(payload.topic, role, grade, board, student_mode)
+    result = await ai.playground_mythbusters(payload.topic, role, grade, board, student_mode, payload.language)
     return result
 
 
@@ -499,7 +507,7 @@ async def playground_cascade_quiz(
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = get_ai_service()
-    result = await ai.playground_cascade_quiz(payload.topic, role, grade, board, student_mode)
+    result = await ai.playground_cascade_quiz(payload.topic, role, grade, board, student_mode, payload.language)
     return result
 
 
@@ -518,7 +526,7 @@ async def playground_timeline(
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = get_ai_service()
-    result = await ai.playground_timeline(payload.topic, role, grade, board, student_mode)
+    result = await ai.playground_timeline(payload.topic, role, grade, board, student_mode, payload.language)
     return result
 
 
@@ -537,5 +545,5 @@ async def playground_diagram(
     )
     role, grade, board, student_mode = await _resolve_context(payload, current_user, db)
     ai = get_ai_service()
-    result = await ai.playground_diagram(payload.topic, role, grade, board, student_mode)
+    result = await ai.playground_diagram(payload.topic, role, grade, board, student_mode, payload.language)
     return result

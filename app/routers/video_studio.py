@@ -42,6 +42,7 @@ async def generate_video_script(payload: VideoScriptRequest, current_user: Curre
         grade=payload.grade,
         duration_minutes=payload.duration_minutes,
         style=payload.style,
+        language=payload.language,
     )
 
     project = VideoProject(

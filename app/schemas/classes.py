@@ -352,6 +352,7 @@ class GenerateRubricRequest(BaseModel):
     topic: str
     criteria_count: int = 4
     difficulty_level: str = 'medium'
+    language: Optional[str] = None
 
 
 class SuggestQuestionsRequest(BaseModel):
@@ -364,6 +365,7 @@ class SuggestQuestionsRequest(BaseModel):
 class AutoGradeRequest(BaseModel):
     submission_id: str
     rubric_id: str
+    language: Optional[str] = None
 
 
 class GradebookEntry(BaseModel):

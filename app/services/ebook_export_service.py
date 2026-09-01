@@ -30,6 +30,8 @@ import re
 from xml.sax.saxutils import escape as xml_escape
 
 from PIL import Image as PILImage
+import arabic_reshaper
+from bidi import get_display as _bidi_get_display
 
 # ── ReportLab ─────────────────────────────────────────────────────────────────
 from reportlab.lib import colors
@@ -84,8 +86,32 @@ _SCRIPT_FONT_FILES = {
     "te": ("NotoSansTelugu", "NotoSansTelugu.ttf"),
     "kn": ("NotoSansKannada", "NotoSansKannada.ttf"),
     "ml": ("NotoSansMalayalam", "NotoSansMalayalam.ttf"),
+    "ar": ("NotoNaskhArabic", "NotoNaskhArabic-Regular.ttf"),
 }
 _registered_script_fonts: set[str] = set()
+
+_ARABIC_CHAR_RE = re.compile(r"[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]")
+
+
+def _bidi(text: str) -> str:
+    """Reshape Arabic letters into their correct joined (initial/medial/final/
+    isolated) forms and reorder the string into visual left-to-right order.
+
+    Neither ReportLab nor python-docx implement the Unicode bidirectional
+    algorithm — without this, Arabic text draws as disconnected, unjoined
+    letterforms in the wrong (logical, i.e. reversed-looking) order, even
+    with a correct Arabic font embedded. Skipped entirely for text with no
+    Arabic characters so every other language's export is byte-for-byte
+    unaffected. Non-Arabic runs (numbers, Latin words) embedded in Arabic
+    text keep their own correct left-to-right order — reshaping/reordering
+    only ever touches the Arabic runs.
+    """
+    if not text or not _ARABIC_CHAR_RE.search(text):
+        return text
+    try:
+        return _bidi_get_display(arabic_reshaper.reshape(text))
+    except Exception:
+        return text
 
 
 def _fonts_for_language(language: str | None) -> tuple[str, str, str]:
@@ -130,7 +156,7 @@ def _decode_image(data_url: str) -> bytes | None:
 
 def _pdf_text(value: object) -> str:
     """Escape dynamic text for ReportLab Paragraph XML parser."""
-    return xml_escape("" if value is None else str(value))
+    return xml_escape(_bidi("" if value is None else str(value)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,9 +239,20 @@ def _split_inline_runs(text: str) -> list[tuple[str, bool, bool]]:
 def _pdf_markup(text: str) -> str:
     """Convert inline <b>/<i> runs into ReportLab's own markup, XML-escaping the
     plain-text portions (ReportLab's Paragraph parser natively understands <b>/<i>)."""
+    runs = _split_inline_runs(text)
+    # ReportLab draws each run's text left-to-right in the order given, with no
+    # concept of a paragraph-wide bidi run — _bidi() on its own only fixes each
+    # run's INTERNAL character order, leaving whole runs (e.g. a <b>bold word</b>
+    # in the middle of an Arabic sentence) stuck in logical (English-reading)
+    # order relative to each other. For a fully-Arabic paragraph, reversing the
+    # run sequence itself — on top of each run's own _bidi() — reproduces the
+    # correct visual order, the same way get_display() would reorder one
+    # unbroken RTL run of plain text.
+    if _ARABIC_CHAR_RE.search(text):
+        runs = list(reversed(runs))
     parts = []
-    for seg, bold, italic in _split_inline_runs(text):
-        seg = xml_escape(seg)
+    for seg, bold, italic in runs:
+        seg = xml_escape(_bidi(seg))
         if bold:
             seg = f"<b>{seg}</b>"
         if italic:
@@ -279,6 +316,12 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
     """Return raw PDF bytes for the given ebook_json."""
 
     font_regular, font_bold, font_italic = _fonts_for_language(language)
+    # Arabic reads right-to-left — body/heading/list text that would otherwise
+    # be left-aligned or justified reads correctly right-aligned instead.
+    # Centered styles (covers, section titles) are unaffected since centering
+    # is direction-agnostic. Justify isn't flipped to justify-RTL because
+    # ReportLab has no such mode; right-align is the closest correct approximation.
+    is_rtl = (language or "en").lower() == "ar"
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -300,6 +343,11 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
         before: int = 0, after: int = 8, left_indent: int = 0,
         leading: float | None = None,
     ) -> ParagraphStyle:
+        if is_rtl and align in (TA_LEFT, TA_JUSTIFY):
+            align = TA_RIGHT
+        right_indent = left_indent if is_rtl else 0
+        if is_rtl:
+            left_indent = 0
         if bold:
             fn = font_bold
         elif italic:
@@ -316,6 +364,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
             spaceAfter=after,
             textColor=colors.HexColor(color),
             leftIndent=left_indent,
+            rightIndent=right_indent,
         )
 
     S = {
@@ -562,6 +611,32 @@ def _set_run_size(run, size_pt: int) -> None:
     run._r.get_or_add_rPr().append(sz_cs)
 
 
+def _set_paragraph_bidi(p) -> None:
+    """Mark a paragraph right-to-left at the OOXML level (<w:bidi/>).
+
+    Unlike ReportLab, Word DOES implement the Unicode bidi algorithm and
+    Arabic contextual letter shaping natively — it just needs to be told the
+    paragraph is RTL. python-docx has no high-level API for this, hence the
+    raw OxmlElement (same pattern as _set_run_size below). Text passed to
+    _sp/_rich_paragraph for a bidi paragraph must stay in plain logical
+    order (do NOT run it through the PDF path's _bidi() reshape/reorder —
+    that's specifically a workaround for engines, like ReportLab, that lack
+    Word's native bidi support, and would double-reorder it here).
+    """
+    p_pr = p._p.get_or_add_pPr()
+    bidi = OxmlElement("w:bidi")
+    p_pr.append(bidi)
+
+
+def _set_run_rtl(run) -> None:
+    """Mark a run's text as RTL/complex-script (<w:rtl/> in rPr) so Word
+    applies Arabic shaping even if the paragraph-level bidi is somehow
+    not enough context (e.g. a run embedded inside an otherwise-LTR paragraph)."""
+    r_pr = run._r.get_or_add_rPr()
+    rtl = OxmlElement("w:rtl")
+    r_pr.append(rtl)
+
+
 def _sp(
     doc: Document, text: str, *,
     bold: bool = False, italic: bool = False, size: int = 12,
@@ -569,18 +644,23 @@ def _sp(
     before: int = 0, after: int = 8,
     color: tuple[int, int, int] | None = None,
     font_name: str = FONT_DOCX,
+    is_rtl: bool = False,
 ) -> None:
     """Add a styled paragraph to doc (Times New Roman by default)."""
     p = doc.add_paragraph()
-    p.alignment = align
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT if (is_rtl and align == WD_ALIGN_PARAGRAPH.LEFT) else align
     p.paragraph_format.space_before = Pt(before)
     p.paragraph_format.space_after  = Pt(after)
     p.paragraph_format.line_spacing = Pt(size * 1.5)
+    if is_rtl:
+        _set_paragraph_bidi(p)
     run = p.add_run(text)
     run.font.name   = font_name
     _set_run_size(run, size)
     run.font.bold   = bold
     run.font.italic = italic
+    if is_rtl:
+        _set_run_rtl(run)
     if color:
         run.font.color.rgb = RGBColor(*color)
 
@@ -590,31 +670,38 @@ def _rich_paragraph(
     size: int = 12, align: int = WD_ALIGN_PARAGRAPH.LEFT,
     before: int = 0, after: int = 8, base_bold: bool = False, base_italic: bool = False,
     font_name: str = FONT_DOCX, color: tuple[int, int, int] | None = None,
+    is_rtl: bool = False,
 ) -> None:
     """Add a paragraph split into multiple runs so inline <b>/<i> tags render as
     real bold/italic instead of literal text (any other stray tag is dropped)."""
     p = doc.add_paragraph()
-    p.alignment = align
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT if (is_rtl and align == WD_ALIGN_PARAGRAPH.LEFT) else align
     p.paragraph_format.space_before = Pt(before)
     p.paragraph_format.space_after  = Pt(after)
     p.paragraph_format.line_spacing = Pt(size * 1.5)
+    if is_rtl:
+        _set_paragraph_bidi(p)
     for seg, bold, italic in _split_inline_runs(text):
         run = p.add_run(seg)
         run.font.name   = font_name
         _set_run_size(run, size)
         run.font.bold   = base_bold or bold
         run.font.italic = base_italic or italic
+        if is_rtl:
+            _set_run_rtl(run)
         if color:
             run.font.color.rgb = RGBColor(*color)
 
 
-def _rich_text_docx(doc: Document, text: str, *, size: int = 12, align: int = WD_ALIGN_PARAGRAPH.LEFT) -> None:
+def _rich_text_docx(doc: Document, text: str, *, size: int = 12, align: int = WD_ALIGN_PARAGRAPH.LEFT, is_rtl: bool = False) -> None:
     """Render AI-generated text (headings/bold/italic/lists/code) as real Word
     elements, in place of dumping the raw HTML-tagged string into one paragraph."""
     for block in _parse_content_blocks(text):
         if block["type"] == "heading":
-            _rich_paragraph(doc, block["text"], size=15, base_bold=True, before=10, after=6)
+            _rich_paragraph(doc, block["text"], size=15, base_bold=True, before=10, after=6, is_rtl=is_rtl)
         elif block["type"] == "code":
+            # Code stays LTR even inside an RTL document — mixed-direction
+            # programming syntax isn't meaningfully "Arabic text".
             lines = block["text"].split("\n")
             for i, line in enumerate(lines):
                 _sp(doc, line or " ", size=10, font_name="Courier New",
@@ -622,9 +709,9 @@ def _rich_text_docx(doc: Document, text: str, *, size: int = 12, align: int = WD
         elif block["type"] == "list":
             for idx, item in enumerate(block["items"]):
                 prefix = f"{idx + 1}. " if block["ordered"] else "•  "
-                _rich_paragraph(doc, prefix + item, size=size, before=1, after=1)
+                _rich_paragraph(doc, prefix + item, size=size, before=1, after=1, is_rtl=is_rtl)
         else:
-            _rich_paragraph(doc, block["text"], size=size, align=align, after=8)
+            _rich_paragraph(doc, block["text"], size=size, align=align, after=8, is_rtl=is_rtl)
 
 
 def _docx_image(doc: Document, data_url: str, max_w_in: float, max_h_in: float) -> None:
@@ -741,9 +828,31 @@ def _docx_footer_page_num(doc: Document) -> None:
         _run("\u2009\u2014")  # thin space + em-dash
 
 
-def generate_docx(ebook_json: dict, book_title: str) -> bytes:
+def generate_docx(ebook_json: dict, book_title: str, language: str | None = "en") -> bytes:
     """Return raw DOCX bytes for the given ebook_json."""
     doc = Document()
+
+    # Unlike the PDF path, Word natively implements the Unicode bidi algorithm
+    # and Arabic contextual shaping — text stays in plain logical order (no
+    # _bidi() reshape/reorder here); we only need to flag paragraphs/runs as
+    # RTL via OOXML (_set_paragraph_bidi/_set_run_rtl) and DOCX embeds no
+    # fonts, so this is just a font-name hint for readers who have it installed.
+    is_rtl = (language or "en").lower() == "ar"
+    docx_font = "Noto Naskh Arabic" if is_rtl else FONT_DOCX
+
+    def _sp2(*args, **kwargs):
+        kwargs.setdefault("is_rtl", is_rtl)
+        kwargs.setdefault("font_name", docx_font)
+        return _sp(*args, **kwargs)
+
+    def _rich_paragraph2(*args, **kwargs):
+        kwargs.setdefault("is_rtl", is_rtl)
+        kwargs.setdefault("font_name", docx_font)
+        return _rich_paragraph(*args, **kwargs)
+
+    def _rich_text_docx2(*args, **kwargs):
+        kwargs.setdefault("is_rtl", is_rtl)
+        return _rich_text_docx(*args, **kwargs)
 
     # A4 page, 1-inch margins on all sides
     for section in doc.sections:
@@ -773,30 +882,30 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
     asmnt    = ej.get("final_assessment")
 
     # ── Cover ─────────────────────────────────────────────────────────────────
-    _sp(doc, book_title,
+    _sp2(doc, book_title,
         bold=True, size=30, align=WD_ALIGN_PARAGRAPH.CENTER, before=48, after=8)
     if subtitle:
-        _sp(doc, subtitle,
+        _sp2(doc, subtitle,
             italic=True, size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=6)
     if author:
-        _sp(doc, f"by {author}", size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=20)
+        _sp2(doc, f"by {author}", size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=20)
     if cov_img:
         _docx_image(doc, cov_img, MAX_IMG_W * 0.75, 2.8)
     if descr:
-        _sp(doc, descr, italic=True, size=11,
+        _sp2(doc, descr, italic=True, size=11,
             align=WD_ALIGN_PARAGRAPH.CENTER, before=12, color=(85, 85, 85))
     _page_break(doc)
 
     # ── About This Book ───────────────────────────────────────────────────────
     if summary:
-        _sp(doc, "About This Book",
+        _sp2(doc, "About This Book",
             bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
-        _rich_text_docx(doc, summary, size=12, align=WD_ALIGN_PARAGRAPH.JUSTIFY)
+        _rich_text_docx2(doc, summary, size=12, align=WD_ALIGN_PARAGRAPH.JUSTIFY)
         _page_break(doc)
 
     # ── Table of Contents ─────────────────────────────────────────────────────
     if toc:
-        _sp(doc, "Table of Contents",
+        _sp2(doc, "Table of Contents",
             bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
 
         pg_count = ej.get("page_count", 15)
@@ -847,13 +956,13 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
         kps    = ch.get("key_points") or []
         imgs   = ch_imgs.get(str(i), [])
 
-        _sp(doc, f"CHAPTER {ch_num}", size=9, color=(119, 119, 119), after=4)
-        _sp(doc, ch_ttl, bold=True, size=22, after=16)
+        _sp2(doc, f"CHAPTER {ch_num}", size=9, color=(119, 119, 119), after=4)
+        _sp2(doc, ch_ttl, bold=True, size=22, after=16)
 
         if imgs and imgs[0]:
             _docx_image(doc, imgs[0], MAX_IMG_W * 0.8, MAX_IMG_H - 0.4)
 
-        _rich_text_docx(doc, body, size=12, align=WD_ALIGN_PARAGRAPH.JUSTIFY)
+        _rich_text_docx2(doc, body, size=12, align=WD_ALIGN_PARAGRAPH.JUSTIFY)
 
         if len(imgs) > 1 and imgs[1]:
             _docx_image(doc, imgs[1], MAX_IMG_W * 0.8, MAX_IMG_H - 0.4)
@@ -864,20 +973,20 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
     # ── Assessment ────────────────────────────────────────────────────────────
     if asmnt:
         _page_break(doc)
-        _sp(doc, "Assessment Questions",
+        _sp2(doc, "Assessment Questions",
             bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
 
         def _qgroup_docx(qs: list, label: str, qtype: str) -> None:
             if not qs:
                 return
-            _sp(doc, label, bold=True, size=14, before=12, after=6)
+            _sp2(doc, label, bold=True, size=14, before=12, after=6)
             for j, q in enumerate(qs):
-                _rich_paragraph(doc, f"{j + 1}. {q.get('question', '')}", size=12, base_bold=True, after=4)
+                _rich_paragraph2(doc, f"{j + 1}. {q.get('question', '')}", size=12, base_bold=True, after=4)
                 if qtype == "mcq":
                     for k, opt in enumerate(q.get("options") or []):
-                        _rich_paragraph(doc, f"   {chr(65 + k)}) {opt}", size=11, after=2)
+                        _rich_paragraph2(doc, f"   {chr(65 + k)}) {opt}", size=11, after=2)
                 if q.get("answer"):
-                    _rich_paragraph(doc, f"Answer: {q['answer']}", size=10, base_italic=True,
+                    _rich_paragraph2(doc, f"Answer: {q['answer']}", size=10, base_italic=True,
                                      color=(85, 85, 85), after=8)
 
         _qgroup_docx(asmnt.get("mcq_questions"),          "Multiple Choice Questions", "mcq")
@@ -888,9 +997,9 @@ def generate_docx(ebook_json: dict, book_title: str) -> bytes:
     # ── Thank You ─────────────────────────────────────────────────────────────
     if thanks:
         _page_break(doc)
-        _sp(doc, "Thank You",
+        _sp2(doc, "Thank You",
             bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, before=72, after=16)
-        _rich_paragraph(doc, thanks, size=12, base_italic=True,
+        _rich_paragraph2(doc, thanks, size=12, base_italic=True,
                          align=WD_ALIGN_PARAGRAPH.CENTER, color=(68, 68, 68))
 
     _docx_footer_page_num(doc)

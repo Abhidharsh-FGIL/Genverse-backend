@@ -100,6 +100,7 @@ class PlaygroundRequest(BaseModel):
     student_mode: bool = True
     harder_mode: bool = False
     context: Optional[dict] = None
+    language: Optional[str] = None
 
 
 class CareerGuidanceRequest(BaseModel):
@@ -108,6 +109,7 @@ class CareerGuidanceRequest(BaseModel):
     target_careers: Optional[List[str]] = None
     grade: Optional[int] = None
     context: Optional[dict] = None
+    language: Optional[str] = None
 
 
 class CareerGuidanceResponse(BaseModel):

@@ -44,6 +44,7 @@ LANGUAGE_LOCALE: dict[str, str] = {
     "te": "te-IN",
     "kn": "kn-IN",
     "ml": "ml-IN",
+    "ar": "ar-AE",
 }
 
 # Appending the language name to the search keyword improves
@@ -54,6 +55,7 @@ LANGUAGE_KEYWORD_HINT: dict[str, str] = {
     "te": "Telugu",
     "kn": "Kannada",
     "ml": "Malayalam",
+    "ar": "Arabic",
     # "en" intentionally omitted — English is the default index language
 }
 

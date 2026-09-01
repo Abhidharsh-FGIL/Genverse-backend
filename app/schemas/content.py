@@ -197,6 +197,7 @@ class VideoScriptRequest(BaseModel):
     duration_minutes: int = 5
     style: str = "educational"
     org_id: Optional[str] = None
+    language: Optional[str] = None
 
 
 class VideoProjectResponse(BaseModel):

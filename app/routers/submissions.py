@@ -296,6 +296,7 @@ async def auto_grade_submission(
         submission_id=payload.submission_id,
         rubric_id=payload.rubric_id,
         db=db,
+        language=payload.language,
     )
     submission.ai_grade_suggestion = suggestion
     await db.commit()

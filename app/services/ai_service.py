@@ -2267,6 +2267,7 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
         answer_key_json: list,
         questions_json: list,
         subject: str = "",
+        language: str | None = None,
     ) -> dict:
         """Per-question AI evaluation for assignment/quiz attempts.
         Returns feedback_json compatible with GradeSubmissionPage."""
@@ -2317,7 +2318,8 @@ Return ONLY valid JSON, no markdown:
       "explanation": "<explanation of why this is the correct answer>"
     }}
   ]
-}}"""
+}}
+{self._enhancement_language_note(language)}"""
 
         try:
             response = await self.chat([{"role": "user", "content": prompt}])
@@ -3489,6 +3491,7 @@ Return ONLY valid JSON.
         grade: int | None,
         duration_minutes: int,
         style: str,
+        language: str | None = None,
     ) -> dict:
         """Generate a structured video script."""
         prompt = f"""Create a {style} educational video script:
@@ -3513,7 +3516,7 @@ Return JSON:
 }}
 
 Return ONLY valid JSON.
-"""
+{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -3655,7 +3658,7 @@ Return ONLY valid JSON matching this schema exactly:
 
     async def generate_rubric(
         self, board: str, grade: int, subject: str, topic: str, criteria_count: int,
-        difficulty_level: str = 'medium'
+        difficulty_level: str = 'medium', language: str | None = None
     ) -> List[dict]:
         """Generate grading rubric criteria aligned to board, grade, subject and difficulty."""
         board_context = {
@@ -3724,7 +3727,7 @@ Return a JSON array in this exact format:
 ]
 
 Return ONLY valid JSON array. No markdown, no explanation.
-"""
+{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -3736,7 +3739,7 @@ Return ONLY valid JSON array. No markdown, no explanation.
         except Exception:
             return []
 
-    async def auto_grade(self, submission_id: str, rubric_id: str, db) -> dict:
+    async def auto_grade(self, submission_id: str, rubric_id: str, db, language: str | None = None) -> dict:
         """Generate an AI grade suggestion for a submission based on a rubric."""
         from sqlalchemy import select
         from app.models.classes import Submission, Rubric
@@ -3771,7 +3774,7 @@ Return JSON:
 }}
 
 Return ONLY valid JSON.
-"""
+{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -3791,6 +3794,7 @@ Return ONLY valid JSON.
         answers: Optional[dict],
         student_name: Optional[str],
         feedback_only: bool = False,
+        language: str | None = None,
     ) -> dict:
         """Grade a submission directly from payload data (no DB lookups needed)."""
         student_label = student_name or "the student"
@@ -3829,7 +3833,8 @@ Return ONLY valid JSON in this exact format:
   "remediationTopics": [
     {{"criterionTitle": "topic name", "recommendation": "specific advice", "resources": ["resource 1"]}}
   ]
-}}"""
+}}
+{self._enhancement_language_note(language)}"""
         else:
             # Extract exact criterion titles for the prompt
             criterion_titles = []
@@ -3862,7 +3867,8 @@ Return ONLY valid JSON in this exact format:
   ]
 }}
 
-CRITICAL: criterionScores MUST contain exactly {len(criterion_titles)} entries, one for each criterion listed above. Copy each criterion title exactly as written — do not rephrase, abbreviate, or skip any. Points must be a valid integer within that criterion's level range."""
+CRITICAL: criterionScores MUST contain exactly {len(criterion_titles)} entries, one for each criterion listed above. Copy each criterion title exactly as written — do not rephrase, abbreviate, or skip any. Points must be a valid integer within that criterion's level range.
+{self._enhancement_language_note(language)}"""
 
         response = ""
         try:
@@ -4191,6 +4197,7 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
         grade: int | None,
         harder_mode: bool,
         context: dict | None,
+        language: str | None = None,
     ) -> AsyncIterator[str]:
         """Stream playground exploration responses."""
         mode_prompts = {
@@ -4211,6 +4218,7 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
                 system += (
                     f"\nAlign examples and terminology with the {board} curriculum."
                 )
+        system += self._enhancement_language_note(language)
 
         full_messages = [{"role": "system", "content": system}] + messages + [
             {"role": "user", "content": f"Continue our {mode} session about {topic}."}
@@ -4226,9 +4234,10 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
         grade: int | None,
         harder_mode: bool,
         context: dict | None,
+        language: str | None = None,
     ) -> str:
         chunks = []
-        async for chunk in self.stream_playground(topic, mode, messages, grade, harder_mode, context):
+        async for chunk in self.stream_playground(topic, mode, messages, grade, harder_mode, context, language):
             chunks.append(chunk)
         return "".join(chunks)
 
@@ -4421,7 +4430,7 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
 
         return "\n\n".join(sections)
 
-    async def generate_career_profile(self, user_id: str, db, org_id: str | None = None) -> dict:
+    async def generate_career_profile(self, user_id: str, db, org_id: str | None = None, language: str | None = None) -> dict:
         """
         Agentic career profile builder.
         Reads assessment scores, topic mastery, recent AI chat messages, and past career
@@ -4585,7 +4594,8 @@ Rules:
 - skill_gaps: 4-6 items for the top 2-3 careers only
 - inferred_interests: 5-8 keywords extracted from chat topics
 - data_richness: "rich" if >=10 assessment attempts, "moderate" if 3-9, "sparse" if <3
-- Return ONLY valid JSON. No markdown fences."""
+- Return ONLY valid JSON. No markdown fences.
+{self._enhancement_language_note(language)}"""
 
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -4616,6 +4626,7 @@ Rules:
         target_careers: List[str] | None,
         grade: int | None,
         context: dict | None,
+        language: str | None = None,
     ) -> dict:
         """Perform career compatibility analysis."""
         stream_text = (context or {}).get("stream", "Not specified")
@@ -4649,7 +4660,7 @@ Rules:
 - top_careers: 4-6 careers ranked by compatibility (0-100), each with title, compatibility score, description, skills array, education path, and reasons array
 - compatibility_scores: map each career title to its compatibility number
 - Return ONLY valid JSON. No markdown fences.
-"""
+{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}], context)
         try:
             cleaned = response.strip()
@@ -4661,7 +4672,7 @@ Rules:
         except Exception:
             return {"analysis": response, "compatibility_scores": {}}
 
-    async def generate_insights(self, user_id: str, db) -> List[dict]:
+    async def generate_insights(self, user_id: str, db, language: str | None = None) -> List[dict]:
         """Generate personalized learning insights for a user based on assessment data."""
         from sqlalchemy import select
         from app.models.assessment import AssessmentAttempt, TopicMastery, PracticeAssessment
@@ -4720,7 +4731,8 @@ Return a JSON array of exactly 5 objects:
   }}
 ]
 
-Return ONLY valid JSON array. No markdown fences."""
+Return ONLY valid JSON array. No markdown fences.
+{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -4732,7 +4744,7 @@ Return ONLY valid JSON array. No markdown fences."""
         except Exception:
             return [{"type": "content_recommendation", "title": "Start Your Journey", "content": response, "data": {}}]
 
-    async def generate_assessment_recommendations(self, user_id: str, db, org_id: str | None = None) -> List[dict]:
+    async def generate_assessment_recommendations(self, user_id: str, db, org_id: str | None = None, language: str | None = None) -> List[dict]:
         """Generate actionable recommendations based on the user's assessment history."""
         from sqlalchemy import select
         from app.models.assessment import AssessmentAttempt, TopicMastery, PracticeAssessment
@@ -4811,7 +4823,8 @@ Return a JSON array of exactly 6 objects:
   }}
 ]
 
-Return ONLY the JSON array. No markdown fences, no extra text."""
+Return ONLY the JSON array. No markdown fences, no extra text.
+{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -4823,7 +4836,7 @@ Return ONLY the JSON array. No markdown fences, no extra text."""
         except Exception:
             return []
 
-    async def generate_assessment_summary(self, user_id: str, db, org_id: str | None = None) -> dict:
+    async def generate_assessment_summary(self, user_id: str, db, org_id: str | None = None, language: str | None = None) -> dict:
         """
         Agentic AI method — analyses the user's full Assessment Hub history
         and returns a structured coach-style summary with strengths, weak areas, goals and momentum.
@@ -4959,7 +4972,8 @@ Rules:
 - goal priority: retry failed (<60%) = 85-95, improve weak = 70-84, upgrade difficulty = 55-70, explore new = 30-55
 - momentum: "improving" if recent scores are higher than older ones, "declining" if going down, "steady" otherwise
 - CRITICAL for goals: "topic" must be an actual specific topic name extracted from the mastery or attempt data (e.g. "Gravity", "Thermodynamics", "Algebra"). Do NOT use the subject name (like "General" or "Physics") as the topic. If the data has topics like "Gravity (General)", the topic should be "Gravity" and subject should be "General Physics" or similar. If no specific topic exists, set topic to null.
-- Return ONLY valid JSON. No markdown fences."""
+- Return ONLY valid JSON. No markdown fences.
+{self._enhancement_language_note(language)}"""
 
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -4986,7 +5000,7 @@ Rules:
                 "best_score": best_overall,
             }
 
-    async def generate_insight_feed(self, user_id: str, subject: str | None, db) -> List[dict]:
+    async def generate_insight_feed(self, user_id: str, subject: str | None, db, language: str | None = None) -> List[dict]:
         """Generate curated insight articles for user's feed."""
         prompt = f"""Generate 5 educational insight articles{f' about {subject}' if subject else ''}.
 
@@ -5003,7 +5017,7 @@ Return JSON array:
 ]
 
 Return ONLY valid JSON.
-"""
+{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -7057,7 +7071,7 @@ Return ONLY valid JSON. No markdown fences."""
 
     # ── Playground Gamification Modes ─────────────────────────────────────────
 
-    async def playground_simulate(self, topic: str, variables: dict, controls: list | None = None) -> dict:
+    async def playground_simulate(self, topic: str, variables: dict, controls: list | None = None, language: str | None = None) -> dict:
         """Sandbox mode: analyse scientific effects of dynamic slider values."""
         if controls:
             vars_str = "\n".join(
@@ -7105,7 +7119,7 @@ Rules:
 - visual_directives.particle_type: one of bubble | sparkle | leaf | dot | smoke
 - visual_directives.bg_intensity: 0.0-1.0
 - visual_directives.special_effect: null OR one of: fire | ice | glow | storm | bloom | void
-Return ONLY valid JSON."""
+Return ONLY valid JSON.{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -7124,7 +7138,7 @@ Return ONLY valid JSON."""
                 "visual_directives": None,
             }
 
-    async def playground_setup(self, topic: str) -> dict:
+    async def playground_setup(self, topic: str, language: str | None = None) -> dict:
         """Topic interpreter: returns dynamic controls + scene setup for the Sandbox mode."""
         prompt = f"""You are the GenVerse Simulation Engine. For the educational topic: '{topic}'
 
@@ -7152,7 +7166,7 @@ Rules:
 - default: integer 0-100
 - scene_type: exactly one of: garden, ocean, space, lab, forest, microscopic, geological, atmosphere, desert, arctic, urban, river
 - actor_emoji: the single most representative emoji for this topic's main subject
-- Return ONLY valid JSON, no markdown, no explanation."""
+- Return ONLY valid JSON, no markdown, no explanation.{self._enhancement_language_note(language)}"""
 
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7177,7 +7191,7 @@ Rules:
                 "atmosphere": f"Simulating {topic}",
             }
 
-    async def playground_flashcards(self, topic: str) -> list:
+    async def playground_flashcards(self, topic: str, language: str | None = None) -> list:
         """Flash-Duel: generate 5 gamified flashcards for a topic."""
         prompt = f"""You are an energetic quiz master generating flashcards for an educational battle game.
 
@@ -7199,7 +7213,7 @@ Return ONLY a valid JSON array — no markdown fences, no extra text:
 ]
 
 difficulty must be exactly one of: easy | medium | hard
-Return ONLY the JSON array."""
+Return ONLY the JSON array.{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -7215,7 +7229,7 @@ Return ONLY the JSON array."""
                  "hint": "Think about the basics.", "difficulty": "easy", "points": 10}
             ]
 
-    async def playground_quest(self, topic: str, history: list, choice: str | None) -> dict:
+    async def playground_quest(self, topic: str, history: list, choice: str | None, language: str | None = None) -> dict:
         """Quest-Line: advance a branching narrative RPG that teaches the topic."""
         history_str = ""
         if history:
@@ -7248,7 +7262,7 @@ Return ONLY valid JSON — no markdown fences:
   "is_final": {"true" if is_final else "false"},
   "xp_gained": {10 + chapter * 5}
 }}
-Return ONLY valid JSON."""
+Return ONLY valid JSON.{self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
             cleaned = response.strip()
@@ -7267,7 +7281,7 @@ Return ONLY valid JSON."""
                 "xp_gained": 10 + chapter * 5,
             }
 
-    async def playground_mirror_chat(self, topic: str, persona: str, messages: list) -> str:
+    async def playground_mirror_chat(self, topic: str, persona: str, messages: list, language: str | None = None) -> str:
         """The Mirror: LLM adopts an educational persona and chats in character."""
         system_prompt = (
             f'You are "{persona}", an ancient and wise entity who embodies the very essence of {topic}. '
@@ -7275,6 +7289,7 @@ Return ONLY valid JSON."""
             f"Reveal knowledge about {topic} through your persona\u2019s perspective. "
             f"Keep responses 2-4 sentences. Never break character. "
             f"The student is visiting you to learn about {topic}."
+            f"{self._enhancement_language_note(language)}"
         )
         gemini = self._get_gemini()
         if gemini:
@@ -7387,7 +7402,7 @@ Return ONLY valid JSON."""
 
     async def playground_match_pairs(
         self, topic: str, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> list:
         """Match Mania / Concept Connect: generate 6 term-definition pairs."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7398,6 +7413,7 @@ Return ONLY valid JSON."""
             "Terms should be concise (1-3 words). Definitions should be clear (5-12 words).\n\n"
             "Return ONLY a valid JSON array — no markdown, no explanation:\n"
             '[{"term": "Chloroplast", "definition": "Organelle where photosynthesis occurs in plant cells"}]'
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7411,7 +7427,7 @@ Return ONLY valid JSON."""
 
     async def playground_swipe_facts(
         self, topic: str, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> list:
         """Swipe & Sort: generate 10 true/false statements."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7425,6 +7441,7 @@ Return ONLY valid JSON."""
             '"explanation": "Plants absorb CO2 through stomata in their leaves"}]\n\n'
             "Every item: statement (string), is_true (boolean), explanation (1 sentence).\n"
             "Return ONLY the JSON array."
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7435,7 +7452,7 @@ Return ONLY valid JSON."""
 
     async def playground_speed_quiz(
         self, topic: str, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> dict:
         """Speed Blitz: generate 10 MCQ questions + a challenger persona."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7464,6 +7481,7 @@ Return ONLY valid JSON."""
             '   - "explanation": 1-sentence explanation of the correct answer\n'
             f'   Mix: {"3 easy, 4 medium, 3 hard" if is_adult else "4 easy, 4 medium, 2 hard"}.\n\n'
             "Return ONLY the JSON object — no markdown, no extra text."
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7489,7 +7507,7 @@ Return ONLY valid JSON."""
 
     async def playground_roleplay(
         self, topic: str, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> dict:
         """Generate an immersive roleplay scenario with character, scenes, and choices."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7527,6 +7545,7 @@ Return ONLY valid JSON."""
             "Shuffle the order of best/good/poor in each scene.\n"
             "Each scene must teach something important about the topic.\n"
             "Return ONLY the JSON object — no markdown, no extra text."
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7542,7 +7561,7 @@ Return ONLY valid JSON."""
 
     async def playground_imagine(
         self, topic: str, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> dict:
         """Generate a creative 'What if?' scenario with open-ended prompts."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7567,6 +7586,7 @@ Return ONLY valid JSON."""
             "Questions should build on each other — start simpler, get more creative.\n"
             "Make the scenario fascinating and engaging.\n"
             "Return ONLY the JSON object — no markdown, no extra text."
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7582,7 +7602,7 @@ Return ONLY valid JSON."""
     async def playground_imagine_evaluate(
         self, topic: str, question: str, answer: str,
         max_points: int = 20, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> dict:
         """Evaluate a creative open-ended answer."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7600,6 +7620,7 @@ Return ONLY valid JSON."""
             '- "feedback": 2-3 sentences of constructive feedback\n'
             '- "highlight": the best part of their answer (quote a phrase or summarize)\n\n'
             "Return ONLY the JSON object — no markdown."
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7611,7 +7632,7 @@ Return ONLY valid JSON."""
 
     async def playground_mythbusters(
         self, topic: str, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> dict:
         """Generate a common myth/misconception + 8 evidence cards for sorting."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7633,6 +7654,7 @@ Return ONLY valid JSON."""
             '"red_herring" = sounds relevant but is actually irrelevant or misleading.\n\n'
             "Make evidence cards plausible and thought-provoking.\n"
             "Return ONLY the JSON object — no markdown, no extra text."
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7652,7 +7674,7 @@ Return ONLY valid JSON."""
 
     async def playground_cascade_quiz(
         self, topic: str, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> dict:
         """Generate a branching quiz tree (depth 3, 7 questions total)."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7676,6 +7698,7 @@ Return ONLY valid JSON."""
             '- "children": array of exactly 2 child nodes (omit for leaf nodes at level 2)\n\n'
             "Start broad at the root, get more specific at each level.\n"
             "Return ONLY the JSON object — no markdown, no extra text."
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7688,7 +7711,7 @@ Return ONLY valid JSON."""
 
     async def playground_timeline(
         self, topic: str, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> dict:
         """Generate a timeline of events + ordering/prediction challenges."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7717,6 +7740,7 @@ Return ONLY valid JSON."""
             "Include at least 1 order challenge and 1 predict challenge.\n"
             "Events MUST be in correct chronological order.\n"
             "Return ONLY the JSON object — no markdown, no extra text."
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -7729,7 +7753,7 @@ Return ONLY valid JSON."""
 
     async def playground_diagram(
         self, topic: str, role: str = "student", grade: int | None = None,
-        board: str | None = None, student_mode: bool = True,
+        board: str | None = None, student_mode: bool = True, language: str | None = None,
     ) -> dict:
         """Generate a concept diagram with nodes, connections, and zones."""
         audience = self._audience_context(role, grade, board, student_mode)
@@ -7755,6 +7779,7 @@ Return ONLY valid JSON."""
             "Include 1-2 mystery nodes that students must identify.\n"
             "Nodes should form a logical flow or process diagram.\n"
             "Return ONLY the JSON object — no markdown, no extra text."
+            f"{self._enhancement_language_note(language)}"
         )
         response = await self.chat([{"role": "user", "content": prompt}])
         try:

@@ -36,6 +36,7 @@ async def get_career_profile(
     db: DBSession,
     force_refresh: bool = Query(False),
     org_id: str | None = Query(None),
+    language: str | None = Query(None),
 ):
     """
     Returns an AI-generated career profile built from the user's assessment data,
@@ -67,7 +68,7 @@ async def get_career_profile(
             pass
 
     ai = get_ai_service()
-    profile = await ai.generate_career_profile(user_id=str(current_user.id), db=db, org_id=org_id)
+    profile = await ai.generate_career_profile(user_id=str(current_user.id), db=db, org_id=org_id, language=language)
 
     # Cache for 60 minutes
     try:
@@ -117,6 +118,7 @@ async def analyze_career(
         target_careers=payload.target_careers,
         grade=payload.grade,
         context=payload.context,
+        language=payload.language,
     )
 
     session = CareerGuidanceSession(
