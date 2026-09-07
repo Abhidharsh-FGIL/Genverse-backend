@@ -1874,7 +1874,8 @@ MATH NOTATION — CRITICAL:
 2. Verify every MCQ "subtype" field matches the required distribution above.
 3. If source text was provided, verify every question is answerable ONLY from that text — remove any question that requires outside knowledge.
 {f"""
-⚠️ CRITICAL LANGUAGE REQUIREMENT: Every single "text", "options" array element, "correct_answer", and "explanation" value MUST be written in {lang_name} using its native script. NOT in English. If any value is in English, rewrite it in {lang_name} before returning. Only JSON keys remain in English.""" if is_non_english else ""}
+⚠️ CRITICAL LANGUAGE REQUIREMENT: Every single "text", "options" array element, "correct_answer", and "explanation" value MUST be written in {lang_name} using its native script. NOT in English. If any value is in English, rewrite it in {lang_name} before returning.
+This does NOT apply to "id", "type", "subtype", or "blooms_level" — those are fixed structural codes the system matches against literally (e.g. "mcq", "true_false", "standard", "understand") and MUST stay exactly as specified above in English, unchanged, even though every other field is in {lang_name}. Translating them will cause every question to be silently rejected.""" if is_non_english else ""}
 Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""
 
         return prompt
@@ -2202,7 +2203,21 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             qid = q.get("id") or str(_uuid.uuid4())
             q_type = (q.get("type") or "mcq").lower()
             if q_type not in allowed_types:
-                continue
+                # Defensive fallback: despite explicit prompt instructions to
+                # keep "type" as a literal English enum value, a non-English
+                # generation occasionally translates it anyway (e.g. "mcq" ->
+                # an Arabic word) — matching against allowed_types then fails
+                # for every question, silently zeroing out the whole
+                # assessment. Recover rather than drop when the shape/context
+                # makes the intended type unambiguous.
+                if len(allowed_types) == 1:
+                    # Only one type was ever requested — whatever the model
+                    # wrote in "type", this question can only mean that one.
+                    q_type = next(iter(allowed_types))
+                elif q.get("pairs") and "match" in allowed_types:
+                    q_type = "match"
+                else:
+                    continue
             opts = q.get("options")
             if isinstance(opts, dict):
                 opts = list(opts.values())
