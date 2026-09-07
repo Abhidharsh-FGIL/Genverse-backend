@@ -350,6 +350,7 @@ async def generate_ebook_stream(
                             subject=payload.topic or payload.subject,
                             grade=payload.grade,
                             tone=payload.tone or "academic",
+                            language=payload.language,
                         )
                         ebook_data["images"] = images
                     except Exception as e:
@@ -564,7 +565,7 @@ async def download_ebook_doc(ebook_id: uuid.UUID, current_user: CurrentUser, db:
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ebook_docx", db=db, org_id=ebook.org_id)
     await points_service.deduct(user_id=current_user.id, action="ebook_download_docx", db=db, org_id=ebook.org_id)
 
-    docx_bytes = await run_in_threadpool(generate_docx, ebook.ebook_json, ebook.title)
+    docx_bytes = await run_in_threadpool(generate_docx, ebook.ebook_json, ebook.title, ebook.language)
     safe_name = urllib.parse.quote(ebook.title, safe="")
     return Response(
         content=docx_bytes,

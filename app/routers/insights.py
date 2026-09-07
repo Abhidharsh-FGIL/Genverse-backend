@@ -43,6 +43,18 @@ def _apply_org_filter(q, column, org_id_param: str | None):
     return q.where(column == parsed)
 
 
+def _tag_insight_data(data: dict | None, language: str | None) -> dict:
+    """Stamp the generation language onto an insight's data_json (no schema
+    change needed — UserInsight has no language column) so stored insights
+    can be checked for a language match before being reused as a cache."""
+    return {**(data or {}), "_language": (language or "en").lower()}
+
+
+def _insight_matches_language(insight: "UserInsight", language: str | None) -> bool:
+    stored = (insight.data_json or {}).get("_language", "en")
+    return stored == (language or "en").lower()
+
+
 @router.post("/generate", response_model=list[UserInsightResponse])
 async def generate_insights(
     payload: GenerateInsightsRequest,
@@ -54,14 +66,15 @@ async def generate_insights(
     parsed_oid = _parse_org_id(org_id)
 
     if not payload.force_refresh:
-        # Check for recent insights
+        # Check for recent insights — only reuse if they were generated in the
+        # same language, otherwise fall through and regenerate.
         q = select(UserInsight).where(UserInsight.user_id == current_user.id)
         if org_id is not None:
             q = _apply_org_filter(q, UserInsight.org_id, org_id)
         q = q.order_by(UserInsight.created_at.desc()).limit(5)
         result = await db.execute(q)
         existing = result.scalars().all()
-        if existing:
+        if existing and all(_insight_matches_language(i, payload.language) for i in existing):
             return existing
     else:
         # Delete existing unread insights so regeneration replaces rather than accumulates
@@ -93,7 +106,7 @@ async def generate_insights(
             insight_type=item.get("type", "general"),
             title=item.get("title"),
             content=item.get("content"),
-            data_json=item.get("data"),
+            data_json=_tag_insight_data(item.get("data"), payload.language),
         )
         db.add(insight)
         new_insights.append(insight)
@@ -126,6 +139,22 @@ async def list_insights(
     result = await db.execute(q)
     insights = result.scalars().all()
 
+    # Insights generated in a different language than requested are stale —
+    # treat them the same as "none exist" so they get regenerated below,
+    # instead of silently showing the wrong language forever.
+    stale_language = bool(insights) and not all(_insight_matches_language(i, language) for i in insights)
+    if stale_language and not unread_only:
+        from sqlalchemy import delete as sql_delete
+        del_q = sql_delete(UserInsight).where(UserInsight.user_id == current_user.id)
+        if org_id is not None:
+            if parsed_oid:
+                del_q = del_q.where(UserInsight.org_id == parsed_oid)
+            else:
+                del_q = del_q.where(UserInsight.org_id.is_(None))
+        await db.execute(del_q)
+        await db.commit()
+        insights = []
+
     # Auto-generate insights on first load if none exist and the user has real assessment data
     if not insights and not unread_only:
         attempt_count = await db.execute(
@@ -145,7 +174,7 @@ async def list_insights(
                     insight_type=item.get("type", "general"),
                     title=item.get("title", ""),
                     content=item.get("content", ""),
-                    data_json=item.get("data"),
+                    data_json=_tag_insight_data(item.get("data"), language),
                 )
                 db.add(insight)
                 new_insights.append(insight)
@@ -395,7 +424,8 @@ async def get_assessment_summary(
     from datetime import timedelta
 
     workspace_tag = org_id or "personal"
-    cache_key = f"assessment-summary:{current_user.id}:{workspace_tag}"
+    lang_tag = (language or "en").lower()
+    cache_key = f"assessment-summary:{current_user.id}:{workspace_tag}:{lang_tag}"
 
     if not force_refresh:
         try:

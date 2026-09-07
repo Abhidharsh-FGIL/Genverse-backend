@@ -45,7 +45,8 @@ async def get_career_profile(
     Cached for 60 minutes per user.
     """
     workspace_tag = org_id or "personal"
-    cache_key = f"career-profile:{current_user.id}:{workspace_tag}"
+    lang_tag = (language or "en").lower()
+    cache_key = f"career-profile:{current_user.id}:{workspace_tag}:{lang_tag}"
 
     # Only deduct 1 point on explicit refresh, not on normal page view
     if force_refresh:
@@ -135,19 +136,18 @@ async def analyze_career(
     await db.commit()
     await db.refresh(session)
 
-    # Invalidate cached profile so next load reflects new session data
+    # Invalidate cached profile (all languages) so next load reflects new session data
     workspace_tag = org_id or "personal"
     try:
         old = await db.execute(
             select(IntelligenceCache).where(
                 IntelligenceCache.user_id == current_user.id,
-                IntelligenceCache.cache_key == f"career-profile:{current_user.id}:{workspace_tag}",
+                IntelligenceCache.cache_key.like(f"career-profile:{current_user.id}:{workspace_tag}:%"),
             )
         )
-        old_row = old.scalar_one_or_none()
-        if old_row:
+        for old_row in old.scalars().all():
             await db.delete(old_row)
-            await db.commit()
+        await db.commit()
     except Exception:
         await db.rollback()
 

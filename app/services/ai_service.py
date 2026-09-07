@@ -2341,7 +2341,24 @@ Return ONLY valid JSON, no markdown:
                 "percentage": percentage,
             }
         except Exception:
-            # Fallback: simple objective scoring without AI feedback
+            # Fallback: simple objective scoring without AI feedback.
+            # This bypasses the LLM entirely, so — like the no-data fallbacks
+            # in generate_career_profile/generate_assessment_summary — these
+            # strings must be pre-translated rather than relying on a prompt
+            # instruction (which is never reached on this path).
+            fb_strings = {
+                "ar": {
+                    "see_key": "راجع مفتاح الإجابة",
+                    "correct": "هذه إجابة صحيحة.",
+                    "correct_is": "الإجابة الصحيحة هي: {correct_ans}.",
+                    "manual_review": "مطلوب مراجعة يدوية.",
+                },
+            }.get((language or "en").lower(), {
+                "see_key": "See answer key",
+                "correct": "This is correct.",
+                "correct_is": "The correct answer is: {correct_ans}.",
+                "manual_review": "Manual review required.",
+            })
             fallback = []
             total_score = 0.0
             obj_types = {"mcq", "fill", "fill-blank", "true-false", "truefalse"}
@@ -2354,12 +2371,12 @@ Return ONLY valid JSON, no markdown:
                 if qtype in obj_types:
                     is_correct = student_ans.lower() == correct_ans.lower()
                     score = points if is_correct else 0
-                    ca = correct_ans if correct_ans else "See answer key"
-                    expl = "This is correct." if is_correct else f"The correct answer is: {correct_ans}."
+                    ca = correct_ans if correct_ans else fb_strings["see_key"]
+                    expl = fb_strings["correct"] if is_correct else fb_strings["correct_is"].format(correct_ans=correct_ans)
                 else:
                     score = 0
-                    ca = correct_ans if correct_ans else "See answer key"
-                    expl = "Manual review required."
+                    ca = correct_ans if correct_ans else fb_strings["see_key"]
+                    expl = fb_strings["manual_review"]
                 total_score += score
                 fallback.append({"questionId": qid, "score": score, "correctAnswer": ca, "explanation": expl})
 
@@ -2462,17 +2479,44 @@ Return ONLY valid JSON in this exact structure:
             except Exception as e:
                 print(f"[Outline] attempt {attempt+1} error: {type(e).__name__}: {e}", flush=True)
 
-        # All attempts failed — build a safe fallback outline
+        # All attempts failed — build a safe fallback outline.
+        # This bypasses the LLM entirely, so — like the no-data fallbacks in
+        # generate_career_profile/generate_assessment_summary — these labels
+        # must be pre-translated rather than relying on a prompt instruction
+        # (which is never reached on this path).
         print(f"[Outline] all attempts failed, returning fallback for '{title}'", flush=True)
+        fb_labels = {
+            "ar": {
+                "intro_title": "مقدمة عن {title}",
+                "intro_desc": "نظرة عامة على {title} وما يغطيه هذا الكتاب.",
+                "conclusion_title": "الخاتمة وأهم النقاط",
+                "conclusion_desc": "ملخص لكل ما تم تناوله في هذا الكتاب.",
+                "chapter_title": "الفصل {n}: {title}",
+                "chapter_desc": "المفاهيم والمواضيع الأساسية للفصل {n}.",
+            },
+        }.get((language or "en").lower(), {
+            "intro_title": "Introduction to {title}",
+            "intro_desc": "An overview of {title} and what this book covers.",
+            "conclusion_title": "Conclusion and Key Takeaways",
+            "conclusion_desc": "A summary of everything covered in this book.",
+            "chapter_title": "Chapter {n}: {title}",
+            "chapter_desc": "Core concepts and topics for chapter {n}.",
+        })
         num_chapters = (min_ch + max_ch) // 2
         fallback = []
         for i in range(num_chapters):
             if i == 0:
-                fallback.append({"title": f"Introduction to {title}", "description": f"An overview of {title} and what this book covers."})
+                fallback.append({
+                    "title": fb_labels["intro_title"].format(title=title),
+                    "description": fb_labels["intro_desc"].format(title=title),
+                })
             elif i == num_chapters - 1:
-                fallback.append({"title": "Conclusion and Key Takeaways", "description": "A summary of everything covered in this book."})
+                fallback.append({"title": fb_labels["conclusion_title"], "description": fb_labels["conclusion_desc"]})
             else:
-                fallback.append({"title": f"Chapter {i + 1}: {title}", "description": f"Core concepts and topics for chapter {i + 1}."})
+                fallback.append({
+                    "title": fb_labels["chapter_title"].format(n=i + 1, title=title),
+                    "description": fb_labels["chapter_desc"].format(n=i + 1),
+                })
         return fallback
 
     async def generate_ebook_images(
@@ -2484,6 +2528,7 @@ Return ONLY valid JSON in this exact structure:
         subject: str | None = None,
         grade: int | None = None,
         tone: str = "academic",
+        language: str | None = None,
     ) -> dict:
         """Generate infographic images using Gemini image generation for ebook cover and chapters."""
         import asyncio
@@ -2497,6 +2542,18 @@ Return ONLY valid JSON in this exact structure:
 
         grade_str = f"Grade {grade}" if grade else "General"
         subj_str = subject or "General"
+
+        # The cover/chapter prompts below ask the image model to bake the book
+        # title / chapter title in as real in-image text — without an explicit
+        # script instruction, image models are far more prone to mistranslating
+        # or mis-rendering non-Latin script (especially RTL) than plain text
+        # generation is. Same pattern as generate_chat_infographic's lang_note.
+        lang_name = self._LANGUAGE_NAMES.get((language or "en").lower(), language or "English")
+        lang_note = (
+            f"\nAll title/heading text must be in {lang_name} — render every character exactly "
+            f"as given, using correct {lang_name} script/orthography. Do not translate or "
+            f"substitute English text.\n" if lang_name.lower() != "english" else ""
+        )
 
         images_per_chapter = {"minimal": 0, "standard": 1, "visual_heavy": 2}.get(image_density, 1)
         result: dict = {"cover_image": None, "chapter_images": {}}
@@ -2565,7 +2622,8 @@ Return ONLY valid JSON in this exact structure:
                 f"Create a professional, visually stunning book cover image for an educational eBook.\n\n"
                 f"Book Title: {title}\n"
                 f"Subject: {subj_str}\n"
-                f"Grade Level: {grade_str}\n\n"
+                f"Grade Level: {grade_str}\n"
+                f"{lang_note}\n"
                 "Design requirements:\n"
                 "- Clean, modern book cover design\n"
                 "- Bold, prominent title text at the center\n"
@@ -2592,7 +2650,8 @@ Return ONLY valid JSON in this exact structure:
                 f"Grade Level: {grade_str}\n"
                 f"Chapter Summary: {summary}\n\n"
                 f"Key information to visualize:\n{key_pts_str}\n\n"
-                f"{_style_guidance(seq)}\n\n"
+                f"{_style_guidance(seq)}\n"
+                f"{lang_note}\n"
                 "Design requirements:\n"
                 "- Bold heading at the top with the chapter title\n"
                 "- Use vibrant colors, icons, and visual hierarchy\n"
@@ -2948,7 +3007,35 @@ Return this exact JSON structure (fill every string field with {language_name} c
         parsed = self._parse_json_response(response)
         if parsed:
             return parsed
-        # Fallback
+        # Fallback — this bypasses the LLM entirely, so — like the no-data
+        # fallbacks in generate_career_profile/generate_assessment_summary —
+        # thank_you_message and ui_labels (the section headers the PDF/DOCX
+        # exporter renders verbatim) must be pre-translated rather than
+        # relying on a prompt instruction that's never reached on this path.
+        fb = {
+            "ar": {
+                "thank_you_message": f"شكرًا لقراءة {title}. نأمل أن تكون هذه التجربة قيّمة ومفيدة لك.",
+                "ui_labels": {
+                    "about_this_book": "عن هذا الكتاب",
+                    "table_of_contents": "جدول المحتويات",
+                    "chapter": "الفصل",
+                    "key_points": "النقاط الرئيسية",
+                    "assessment_questions": "أسئلة التقييم",
+                    "multiple_choice_questions": "أسئلة الاختيار من متعدد",
+                    "fill_in_the_blanks": "أكمل الفراغات",
+                    "short_answer_questions": "أسئلة الإجابة القصيرة",
+                    "long_answer_questions": "أسئلة الإجابة الطويلة",
+                    "thank_you": "شكرًا لك",
+                    "answer": "الإجابة",
+                    "questions": "الأسئلة",
+                    "figure": "الشكل",
+                    "by": "بقلم",
+                },
+            },
+        }.get((language or "en").lower(), {
+            "thank_you_message": f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you.",
+            "ui_labels": {},
+        })
         return {
             "title_page": {"title": title, "author": author, "subtitle": "", "description": ""},
             "book_summary": "",
@@ -2956,8 +3043,8 @@ Return this exact JSON structure (fill every string field with {language_name} c
                 {"chapter_number": i + 1, "title": ch.get("title", f"Chapter {i + 1}")}
                 for i, ch in enumerate(chapter_list)
             ],
-            "thank_you_message": f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you.",
-            "ui_labels": {},
+            "thank_you_message": fb["thank_you_message"],
+            "ui_labels": fb["ui_labels"],
         }
 
     # ── Step 2: Generate a single chapter (called in parallel) ───────────
@@ -3309,6 +3396,15 @@ Return ONLY valid JSON (no markdown fences):
             print(f"[Ebook] Metadata generation failed: {metadata}", flush=True)
             metadata = {}
 
+        # Per-chapter error placeholder — this bypasses the LLM entirely (the
+        # chapter's own generation task raised), so — like the no-data
+        # fallbacks in generate_career_profile/generate_assessment_summary —
+        # it must be pre-translated rather than relying on a prompt
+        # instruction that's never reached on this path.
+        chapter_error_tmpl = {
+            "ar": "تعذر إنشاء محتوى هذا الفصل. الخطأ: {error}",
+        }.get((language or "en").lower(), "Content generation failed for this chapter. Error: {error}")
+
         generated_chapters = []
         for i, result in enumerate(results[1:], start=1):
             if isinstance(result, Exception):
@@ -3316,7 +3412,7 @@ Return ONLY valid JSON (no markdown fences):
                 generated_chapters.append({
                     "chapter_number": i,
                     "title": chapter_list[i - 1]["title"],
-                    "content": f"<i>Content generation failed for this chapter. Error: {result}</i>",
+                    "content": f"<i>{chapter_error_tmpl.format(error=result)}</i>",
                     "key_points": [],
                     "summary": "",
                 })
@@ -3355,8 +3451,10 @@ Return ONLY valid JSON (no markdown fences):
             "table_of_contents": toc_with_pages,
             "chapters": generated_chapters,
             "final_assessment": final_assessment,
-            "thank_you_message": metadata.get("thank_you_message",
-                f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you."),
+            "thank_you_message": metadata.get("thank_you_message", {
+                "ar": f"شكرًا لقراءة {title}. نأمل أن تكون هذه التجربة قيّمة ومفيدة لك.",
+            }.get((language or "en").lower(),
+                f"Thank you for reading {title}. We hope this book has been a valuable and enriching experience for you.")),
             "ui_labels": metadata.get("ui_labels", {}),
         }
 
@@ -3373,6 +3471,7 @@ Return ONLY valid JSON (no markdown fences):
                     subject=subject,
                     grade=grade,
                     tone=tone,
+                    language=language,
                 )
                 ebook_data["images"] = images
             except Exception as e:
@@ -3528,11 +3627,15 @@ Return ONLY valid JSON.
         except Exception:
             return {"title": topic, "scenes": [{"scene_number": 1, "narration": response}]}
 
-    async def generate_video_visuals(self, script_json: dict | None) -> dict:
+    async def generate_video_visuals(self, script_json: dict | None, language: str | None = None) -> dict:
         """Generate visual references for video scenes."""
         if not script_json:
             return {}
-        prompt = f"Based on this video script, suggest visual elements for each scene:\n{json.dumps(script_json, indent=2)[:3000]}"
+        prompt = (
+            f"Based on this video script, suggest visual elements for each scene:\n"
+            f"{json.dumps(script_json, indent=2)[:3000]}"
+            f"{self._enhancement_language_note(language)}"
+        )
         response = await self.chat([{"role": "user", "content": prompt}])
         return {"visuals": response}
 
@@ -3654,7 +3757,15 @@ Return ONLY valid JSON matching this schema exactly:
         parsed = self._parse_json_response(response)
         if parsed:
             return parsed
-        return {"title": f"Lesson Plan: {topic}", "objectives": [topic], "timeEstimate": 45, "steps": []}
+        # This fallback bypasses the LLM entirely (Gemini call failed or its
+        # response didn't parse as JSON), so — like the no-data fallbacks in
+        # generate_career_profile/generate_assessment_summary — the title
+        # prefix must be pre-translated rather than relying on a prompt
+        # instruction (which is never reached on this path).
+        title_prefix = {
+            "ar": "خطة درس: ",
+        }.get((language or "en").lower(), "Lesson Plan: ")
+        return {"title": f"{title_prefix}{topic}", "objectives": [topic], "timeEstimate": 45, "steps": []}
 
     async def generate_rubric(
         self, board: str, grade: int, subject: str, topic: str, criteria_count: int,
@@ -3894,16 +4005,26 @@ CRITICAL: criterionScores MUST contain exactly {len(criterion_titles)} entries, 
                     return json.loads(json_match.group())
                 except Exception:
                     pass
+            # This fallback bypasses the LLM's translated output entirely (the
+            # response failed to parse), so — like the no-data fallbacks in
+            # generate_career_profile/generate_assessment_summary — it must be
+            # pre-translated rather than relying on a prompt instruction.
+            fallback_comment = {
+                "ar": "اكتمل التقييم بالذكاء الاصطناعي. يرجى المراجعة يدويًا.",
+            }.get((language or "en").lower(), "AI grading completed. Please review manually.")
             return {
-                "overallComment": "AI grading completed. Please review manually.",
+                "overallComment": fallback_comment,
                 "strengths": [],
                 "areasForImprovement": [],
                 "remediationTopics": [],
             }
         except Exception as e:
             print(f"[AIService] auto_grade_direct failed: {e}", flush=True)
+            fallback_comment = {
+                "ar": "اكتمل التقييم بالذكاء الاصطناعي. يرجى المراجعة يدويًا.",
+            }.get((language or "en").lower(), "AI grading completed. Please review manually.")
             return {
-                "overallComment": "AI grading completed. Please review manually.",
+                "overallComment": fallback_comment,
                 "strengths": [],
                 "areasForImprovement": [],
                 "remediationTopics": [],
@@ -4526,17 +4647,33 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
         ) or "No past career sessions."
 
         if not has_data:
-            return {
+            # This fallback bypasses the LLM entirely (no data to analyse yet),
+            # so — like _ERROR_MESSAGES/error_message() — it must be
+            # pre-translated rather than relying on a prompt instruction.
+            no_data_text = {
+                "ar": {
+                    "summary": "لم تستخدم المنصة بما يكفي حتى الآن للحصول على ملف مهني مخصص. ابدأ بإجراء تقييمات في المواد التي تستمتع بها والتحدث مع المساعد الذكي حول الموضوعات التي تهمك.",
+                    "next_steps": [
+                        "قم بإجراء تقييمات في المواد التي تستمتع بها لبناء ملفك الأكاديمي",
+                        "تحدث مع المساعد الذكي حول الموضوعات التي تثير فضولك",
+                        "استخدم تبويب إنشاء المسارات لاستكشاف المهن يدويًا",
+                    ],
+                },
+            }.get((language or "en").lower(), {
                 "summary": "You haven't used the platform enough yet for a personalised career profile. Start by taking assessments in subjects you enjoy and chatting with the AI Assistant about topics that interest you.",
-                "inferred_interests": [],
-                "subject_strengths": [],
-                "top_careers": [],
-                "skill_gaps": [],
                 "next_steps": [
                     "Take assessments in subjects you enjoy to build your academic profile",
                     "Chat with the AI Assistant about topics you're curious about",
                     "Use the Generate Paths tab to explore careers manually",
                 ],
+            })
+            return {
+                "summary": no_data_text["summary"],
+                "inferred_interests": [],
+                "subject_strengths": [],
+                "top_careers": [],
+                "skill_gaps": [],
+                "next_steps": no_data_text["next_steps"],
                 "data_richness": "none",
             }
 
@@ -4595,6 +4732,7 @@ Rules:
 - inferred_interests: 5-8 keywords extracted from chat topics
 - data_richness: "rich" if >=10 assessment attempts, "moderate" if 3-9, "sparse" if <3
 - Return ONLY valid JSON. No markdown fences.
+- The SUBJECT PERFORMANCE / TOPIC MASTERY data above uses English formatting words ("mastery", "attempts", "trend", "avg") purely as internal labels — do NOT copy those words verbatim into any output field. Every string value, including "detail", must be written as natural, fluent text in the requested language, with no English words mixed in (except proper nouns, chemical formulas, and standard mathematical symbols).
 {self._enhancement_language_note(language)}"""
 
         response = await self.chat([{"role": "user", "content": prompt}])
@@ -4606,16 +4744,27 @@ Rules:
                     cleaned = cleaned[4:]
             return json.loads(cleaned)
         except Exception:
-            return {
+            parse_fail_text = {
+                "ar": {
+                    "summary": f"لقد أجريت تقييمات في {len(subject_stats)} مادة (مواد). واصل التقدم لفتح ملف مهني كامل بالذكاء الاصطناعي!",
+                    "next_steps": ["أجرِ المزيد من التقييمات لتحسين ملفك المهني"],
+                    "detail": lambda n: f"{n} محاولة",
+                },
+            }.get((language or "en").lower(), {
                 "summary": f"You've taken assessments across {len(subject_stats)} subject(s). Keep going to unlock a full AI career profile!",
+                "next_steps": ["Take more assessments to improve your career profile"],
+                "detail": lambda n: f"{n} attempts",
+            })
+            return {
+                "summary": parse_fail_text["summary"],
                 "inferred_interests": [],
                 "subject_strengths": [
-                    {"subject": row.subject or "General", "score": round(row.avg_pct or 0), "trend": "steady", "detail": f"{int(row.attempt_count)} attempts"}
+                    {"subject": row.subject or "General", "score": round(row.avg_pct or 0), "trend": "steady", "detail": parse_fail_text["detail"](int(row.attempt_count))}
                     for row in subject_stats
                 ],
                 "top_careers": [],
                 "skill_gaps": [],
-                "next_steps": ["Take more assessments to improve your career profile"],
+                "next_steps": parse_fail_text["next_steps"],
                 "data_richness": "sparse",
             }
 
@@ -4732,6 +4881,7 @@ Return a JSON array of exactly 5 objects:
 ]
 
 Return ONLY valid JSON array. No markdown fences.
+- The topic mastery / assessment data above uses English formatting words ("mastery", "trend", "attempts", "difficulty") purely as internal labels — do NOT copy those words verbatim into any output field. Every string value must be written as natural, fluent text in the requested language, with no English words mixed in (except proper nouns, chemical formulas, and standard mathematical symbols).
 {self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -4742,7 +4892,10 @@ Return ONLY valid JSON array. No markdown fences.
                     cleaned = cleaned[4:]
             return json.loads(cleaned)
         except Exception:
-            return [{"type": "content_recommendation", "title": "Start Your Journey", "content": response, "data": {}}]
+            fallback_title = {
+                "ar": "ابدأ رحلتك",
+            }.get((language or "en").lower(), "Start Your Journey")
+            return [{"type": "content_recommendation", "title": fallback_title, "content": response, "data": {}}]
 
     async def generate_assessment_recommendations(self, user_id: str, db, org_id: str | None = None, language: str | None = None) -> List[dict]:
         """Generate actionable recommendations based on the user's assessment history."""
@@ -4824,6 +4977,7 @@ Return a JSON array of exactly 6 objects:
 ]
 
 Return ONLY the JSON array. No markdown fences, no extra text.
+- The "reason" field's example wording is illustrative only, not literal text to copy. The RECENT PRACTICE ATTEMPTS / TOPIC MASTERY data above uses English formatting words ("mastery", "attempts", "trend", "Score", "Date") purely as internal labels — do NOT copy those words verbatim into any output field. Every string value must be written as natural, fluent text in the requested language, with no English words mixed in (except proper nouns, chemical formulas, and standard mathematical symbols).
 {self._enhancement_language_note(language)}"""
         response = await self.chat([{"role": "user", "content": prompt}])
         try:
@@ -4911,15 +5065,33 @@ Return ONLY the JSON array. No markdown fences, no extra text.
         ) or "No subject data."
 
         if total_attempts == 0:
-            return {
+            no_attempts_text = {
+                "ar": {
+                    "summary": "لم تخض أي تقييمات بعد. توجه إلى مركز التقييمات، وأنشئ أو أجرِ اختبارًا قصيرًا، ثم عد إلى هنا للحصول على مراجعة تدريب ذكاء اصطناعي مخصصة لك.",
+                    "goals": [
+                        "خض أول تقييم لك",
+                        "أنشئ اختبارًا قصيرًا حسب الموضوع",
+                        "ارفع مواد دراسية إلى الخزنة",
+                    ],
+                },
+            }.get((language or "en").lower(), {
                 "summary": "You haven't taken any assessments yet. Head to the Assessment Hub, create or take a quiz, and come back here for your personalised AI coaching review.",
+                "goals": [
+                    "Take your first assessment",
+                    "Create a topic-based quiz",
+                    "Upload study material to vault",
+                ],
+            })
+            goal_titles = no_attempts_text["goals"]
+            return {
+                "summary": no_attempts_text["summary"],
                 "momentum": "new",
                 "strengths": [],
                 "weak_areas": [],
                 "goals": [
-                    {"title": "Take your first assessment", "type": "explore", "priority": 90, "subject": None, "topic": None, "action_href": "/u/assessments"},
-                    {"title": "Create a topic-based quiz", "type": "explore", "priority": 75, "subject": None, "topic": None, "action_href": "/u/assessments"},
-                    {"title": "Upload study material to vault", "type": "explore", "priority": 50, "subject": None, "topic": None, "action_href": "/u/library"},
+                    {"title": goal_titles[0], "type": "explore", "priority": 90, "subject": None, "topic": None, "action_href": "/u/assessments"},
+                    {"title": goal_titles[1], "type": "explore", "priority": 75, "subject": None, "topic": None, "action_href": "/u/assessments"},
+                    {"title": goal_titles[2], "type": "explore", "priority": 50, "subject": None, "topic": None, "action_href": "/u/library"},
                 ],
                 "total_attempts": 0,
                 "overall_avg": 0,
@@ -4972,6 +5144,8 @@ Rules:
 - goal priority: retry failed (<60%) = 85-95, improve weak = 70-84, upgrade difficulty = 55-70, explore new = 30-55
 - momentum: "improving" if recent scores are higher than older ones, "declining" if going down, "steady" otherwise
 - CRITICAL for goals: "topic" must be an actual specific topic name extracted from the mastery or attempt data (e.g. "Gravity", "Thermodynamics", "Algebra"). Do NOT use the subject name (like "General" or "Physics") as the topic. If the data has topics like "Gravity (General)", the topic should be "Gravity" and subject should be "General Physics" or similar. If no specific topic exists, set topic to null.
+- The "detail" field's example wording ("avg", "improving trend", "needs more practice") is illustrative only, not literal text to copy — write every string value naturally in the requested language.
+- The PER-SUBJECT STATS / RECENT PRACTICE ATTEMPTS / TOPIC MASTERY data above uses English formatting words ("avg", "best", "attempts", "trend", "mastery") purely as internal labels — do NOT copy those words verbatim into any output field. Every string value must be written as natural, fluent text in the requested language, with no English words mixed in (except proper nouns, chemical formulas, and standard mathematical symbols).
 - Return ONLY valid JSON. No markdown fences.
 {self._enhancement_language_note(language)}"""
 
@@ -4989,12 +5163,21 @@ Rules:
             data["best_score"] = best_overall
             return data
         except Exception:
-            return {
+            parse_fail_text = {
+                "ar": {
+                    "summary": f"لقد أجريت {total_attempts} تقييمًا بمعدل نتائج {overall_avg}%. واصل التقدم لفتح المزيد من الرؤى المعمقة!",
+                    "goal": "واصل إجراء التقييمات",
+                },
+            }.get((language or "en").lower(), {
                 "summary": f"You've taken {total_attempts} assessment{'s' if total_attempts != 1 else ''} with an average score of {overall_avg}%. Keep going to unlock deeper insights!",
+                "goal": "Keep taking assessments",
+            })
+            return {
+                "summary": parse_fail_text["summary"],
                 "momentum": "steady",
                 "strengths": [],
                 "weak_areas": [],
-                "goals": [{"title": "Keep taking assessments", "type": "practice", "priority": 70, "subject": None, "topic": None, "action_href": "/u/assessments"}],
+                "goals": [{"title": parse_fail_text["goal"], "type": "practice", "priority": 70, "subject": None, "topic": None, "action_href": "/u/assessments"}],
                 "total_attempts": total_attempts,
                 "overall_avg": overall_avg,
                 "best_score": best_overall,

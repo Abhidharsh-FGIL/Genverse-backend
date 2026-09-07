@@ -412,6 +412,15 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
     thanks    = ej.get("thank_you_message", "")
     asmnt     = ej.get("final_assessment")
 
+    # AI-generated, language-matched section labels (see _generate_ebook_metadata's
+    # ui_labels_template in ai_service.py). These are boilerplate/template strings
+    # baked into the exporter itself, not AI-generated body content, so — unlike
+    # the chapter/summary text above which already arrives translated — they must
+    # be looked up here explicitly. Fall back to the English literal only if
+    # metadata generation failed to produce ui_labels (e.g. English request, or
+    # an LLM-failure fallback that couldn't populate it).
+    ui = ej.get("ui_labels") or {}
+
     story: list = []
 
     # ── Cover ─────────────────────────────────────────────────────────────────
@@ -424,7 +433,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
         spaceBefore=10, spaceAfter=12,
     ))
     if author:
-        story.append(Paragraph(f"by {_pdf_text(author)}", S["cov_author"]))
+        story.append(Paragraph(f"{ui.get('by', 'by')} {_pdf_text(author)}", S["cov_author"]))
     if cov_img:
         img = _rl_image(cov_img, CONTENT_W * 0.75, 2.8 * inch)
         if img:
@@ -435,13 +444,13 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
 
     # ── About This Book ───────────────────────────────────────────────────────
     if summary:
-        story.append(Paragraph("About This Book", S["sec_title"]))
+        story.append(Paragraph(ui.get("about_this_book", "About This Book"), S["sec_title"]))
         story.extend(_rich_text_flowables(summary, S))
         story.append(PageBreak())
 
     # ── Table of Contents ─────────────────────────────────────────────────────
     if toc:
-        story.append(Paragraph("Table of Contents", S["sec_title"]))
+        story.append(Paragraph(ui.get("table_of_contents", "Table of Contents"), S["sec_title"]))
         story.append(Spacer(1, 0.2 * inch))
 
         pg_count  = ej.get("page_count", 15)
@@ -482,7 +491,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
         imgs   = ch_imgs.get(str(i), [])
 
         ch_story: list = [
-            Paragraph(f"CHAPTER {ch_num}", S["eyebrow"]),
+            Paragraph(f"{ui.get('chapter', 'CHAPTER').upper()} {ch_num}", S["eyebrow"]),
             Paragraph(_pdf_text(ch_ttl), S["ch_title"]),
             Spacer(1, 0.15 * inch),
         ]
@@ -504,7 +513,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
 
         # Key-points box
         if kps:
-            kp_inner: list = [Paragraph("KEY POINTS", S["kp_label"])]
+            kp_inner: list = [Paragraph(ui.get("key_points", "KEY POINTS").upper(), S["kp_label"])]
             for kp in kps:
                 # U+2022 (bullet), not U+25B8 (triangle) \u2014 confirmed present in every
                 # font used here (Times-Roman and all registered Noto Sans <Script>
@@ -531,8 +540,10 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
     # ── Assessment ────────────────────────────────────────────────────────────
     if asmnt:
         story.append(PageBreak())
-        story.append(Paragraph("Assessment Questions", S["sec_title"]))
+        story.append(Paragraph(ui.get("assessment_questions", "Assessment Questions"), S["sec_title"]))
         story.append(Spacer(1, 0.2 * inch))
+        ch_abbr = ui.get("chapter", "Ch.")
+        answer_label = ui.get("answer", "Answer")
 
         def _qgroup(qs: list, label: str, qtype: str) -> None:
             if not qs:
@@ -543,7 +554,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
                 blk: list = [
                     Paragraph(
                         f"{j + 1}. {_pdf_markup(q.get('question', ''))} "
-                        f"<font color='#aaaaaa' size='9'>(Ch.\u202f{_pdf_text(ch_ref)})</font>",
+                        f"<font color='#aaaaaa' size='9'>({_pdf_text(ch_abbr)}\u202f{_pdf_text(ch_ref)})</font>",
                         S["aq_q"],
                     )
                 ]
@@ -551,21 +562,21 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
                     for k, opt in enumerate(q.get("options") or []):
                         blk.append(Paragraph(f"{chr(65 + k)})\u2002{_pdf_markup(opt)}", S["aq_opt"]))
                 if q.get("answer"):
-                    blk.append(Paragraph(f"Answer:\u2002{_pdf_markup(str(q['answer']))}", S["aq_ans"]))
+                    blk.append(Paragraph(f"{_pdf_text(answer_label)}:\u2002{_pdf_markup(str(q['answer']))}", S["aq_ans"]))
                 story.append(KeepTogether(blk))
                 story.append(Spacer(1, 0.08 * inch))
 
-        _qgroup(asmnt.get("mcq_questions"),          "Multiple Choice Questions", "mcq")
-        _qgroup(asmnt.get("fill_in_blank_questions"), "Fill in the Blanks",       "fib")
-        _qgroup(asmnt.get("short_answer_questions"),  "Short Answer Questions",   "sa")
-        _qgroup(asmnt.get("long_answer_questions"),   "Long Answer Questions",    "la")
+        _qgroup(asmnt.get("mcq_questions"),          ui.get("multiple_choice_questions", "Multiple Choice Questions"), "mcq")
+        _qgroup(asmnt.get("fill_in_blank_questions"), ui.get("fill_in_the_blanks", "Fill in the Blanks"),       "fib")
+        _qgroup(asmnt.get("short_answer_questions"),  ui.get("short_answer_questions", "Short Answer Questions"),   "sa")
+        _qgroup(asmnt.get("long_answer_questions"),   ui.get("long_answer_questions", "Long Answer Questions"),    "la")
 
     # ── Thank You ─────────────────────────────────────────────────────────────
     if thanks:
         story.append(PageBreak())
         story += [
             Spacer(1, 1.5 * inch),
-            Paragraph("Thank You", S["ty_title"]),
+            Paragraph(ui.get("thank_you", "Thank You"), S["ty_title"]),
             Spacer(1, 0.2 * inch),
             Paragraph(_pdf_markup(thanks), S["ty_text"]),
         ]
@@ -745,7 +756,7 @@ def _no_border_cell(cell) -> None:
     tcPr.append(tcBorders)
 
 
-def _kp_box(doc: Document, key_points: list[str]) -> None:
+def _kp_box(doc: Document, key_points: list[str], label: str = "KEY POINTS") -> None:
     """Render a key-points box: gray background + 4pt left border."""
     tbl  = doc.add_table(rows=1, cols=1)
     cell = tbl.rows[0].cells[0]
@@ -772,10 +783,10 @@ def _kp_box(doc: Document, key_points: list[str]) -> None:
     tcBorders.append(left)
     tcPr.append(tcBorders)
 
-    # "KEY POINTS" label
+    # Key-points label (translated by the caller via ui_labels)
     lp  = cell.paragraphs[0]
     lp.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    lr  = lp.add_run("KEY POINTS")
+    lr  = lp.add_run(label)
     lr.font.name  = FONT_DOCX
     lr.font.bold  = True
     _set_run_size(lr, 9)
@@ -880,6 +891,10 @@ def generate_docx(ebook_json: dict, book_title: str, language: str | None = "en"
     summary  = ej.get("book_summary", "")
     thanks   = ej.get("thank_you_message", "")
     asmnt    = ej.get("final_assessment")
+    # See the matching comment in generate_pdf: these are exporter-side
+    # template/boilerplate labels, not AI body content, so they must be
+    # looked up from the AI-generated ui_labels explicitly.
+    ui       = ej.get("ui_labels") or {}
 
     # ── Cover ─────────────────────────────────────────────────────────────────
     _sp2(doc, book_title,
@@ -888,7 +903,7 @@ def generate_docx(ebook_json: dict, book_title: str, language: str | None = "en"
         _sp2(doc, subtitle,
             italic=True, size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=6)
     if author:
-        _sp2(doc, f"by {author}", size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=20)
+        _sp2(doc, f"{ui.get('by', 'by')} {author}", size=14, align=WD_ALIGN_PARAGRAPH.CENTER, after=20)
     if cov_img:
         _docx_image(doc, cov_img, MAX_IMG_W * 0.75, 2.8)
     if descr:
@@ -898,14 +913,14 @@ def generate_docx(ebook_json: dict, book_title: str, language: str | None = "en"
 
     # ── About This Book ───────────────────────────────────────────────────────
     if summary:
-        _sp2(doc, "About This Book",
+        _sp2(doc, ui.get("about_this_book", "About This Book"),
             bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
         _rich_text_docx2(doc, summary, size=12, align=WD_ALIGN_PARAGRAPH.JUSTIFY)
         _page_break(doc)
 
     # ── Table of Contents ─────────────────────────────────────────────────────
     if toc:
-        _sp2(doc, "Table of Contents",
+        _sp2(doc, ui.get("table_of_contents", "Table of Contents"),
             bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
 
         pg_count = ej.get("page_count", 15)
@@ -956,7 +971,7 @@ def generate_docx(ebook_json: dict, book_title: str, language: str | None = "en"
         kps    = ch.get("key_points") or []
         imgs   = ch_imgs.get(str(i), [])
 
-        _sp2(doc, f"CHAPTER {ch_num}", size=9, color=(119, 119, 119), after=4)
+        _sp2(doc, f"{ui.get('chapter', 'CHAPTER').upper()} {ch_num}", size=9, color=(119, 119, 119), after=4)
         _sp2(doc, ch_ttl, bold=True, size=22, after=16)
 
         if imgs and imgs[0]:
@@ -968,13 +983,14 @@ def generate_docx(ebook_json: dict, book_title: str, language: str | None = "en"
             _docx_image(doc, imgs[1], MAX_IMG_W * 0.8, MAX_IMG_H - 0.4)
 
         if kps:
-            _kp_box(doc, kps)
+            _kp_box(doc, kps, label=ui.get("key_points", "KEY POINTS").upper())
 
     # ── Assessment ────────────────────────────────────────────────────────────
     if asmnt:
         _page_break(doc)
-        _sp2(doc, "Assessment Questions",
+        _sp2(doc, ui.get("assessment_questions", "Assessment Questions"),
             bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, after=12)
+        answer_label = ui.get("answer", "Answer")
 
         def _qgroup_docx(qs: list, label: str, qtype: str) -> None:
             if not qs:
@@ -986,18 +1002,18 @@ def generate_docx(ebook_json: dict, book_title: str, language: str | None = "en"
                     for k, opt in enumerate(q.get("options") or []):
                         _rich_paragraph2(doc, f"   {chr(65 + k)}) {opt}", size=11, after=2)
                 if q.get("answer"):
-                    _rich_paragraph2(doc, f"Answer: {q['answer']}", size=10, base_italic=True,
+                    _rich_paragraph2(doc, f"{answer_label}: {q['answer']}", size=10, base_italic=True,
                                      color=(85, 85, 85), after=8)
 
-        _qgroup_docx(asmnt.get("mcq_questions"),          "Multiple Choice Questions", "mcq")
-        _qgroup_docx(asmnt.get("fill_in_blank_questions"), "Fill in the Blanks",       "fib")
-        _qgroup_docx(asmnt.get("short_answer_questions"),  "Short Answer Questions",   "sa")
-        _qgroup_docx(asmnt.get("long_answer_questions"),   "Long Answer Questions",    "la")
+        _qgroup_docx(asmnt.get("mcq_questions"),          ui.get("multiple_choice_questions", "Multiple Choice Questions"), "mcq")
+        _qgroup_docx(asmnt.get("fill_in_blank_questions"), ui.get("fill_in_the_blanks", "Fill in the Blanks"),       "fib")
+        _qgroup_docx(asmnt.get("short_answer_questions"),  ui.get("short_answer_questions", "Short Answer Questions"),   "sa")
+        _qgroup_docx(asmnt.get("long_answer_questions"),   ui.get("long_answer_questions", "Long Answer Questions"),    "la")
 
     # ── Thank You ─────────────────────────────────────────────────────────────
     if thanks:
         _page_break(doc)
-        _sp2(doc, "Thank You",
+        _sp2(doc, ui.get("thank_you", "Thank You"),
             bold=True, size=20, align=WD_ALIGN_PARAGRAPH.CENTER, before=72, after=16)
         _rich_paragraph2(doc, thanks, size=12, base_italic=True,
                          align=WD_ALIGN_PARAGRAPH.CENTER, color=(68, 68, 68))

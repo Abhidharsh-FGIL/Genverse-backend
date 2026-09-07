@@ -157,6 +157,7 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
                 subject=params.get("subject"),
                 grade=params.get("grade"),
                 tone=params.get("tone", "academic"),
+                language=params.get("language"),
             )
             ebook_data["images"] = images
         except Exception as e:

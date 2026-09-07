@@ -63,7 +63,10 @@ async def generate_video_script(payload: VideoScriptRequest, current_user: Curre
 
 
 @router.post("/{project_id}/visuals", response_model=VideoProjectResponse)
-async def generate_video_visuals(project_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+async def generate_video_visuals(
+    project_id: uuid.UUID, current_user: CurrentUser, db: DBSession,
+    language: str | None = Query(None),
+):
     """Generate visual references for an existing video project."""
     result = await db.execute(
         select(VideoProject).where(VideoProject.id == project_id, VideoProject.user_id == current_user.id)
@@ -77,7 +80,7 @@ async def generate_video_visuals(project_id: uuid.UUID, current_user: CurrentUse
     await points_service.deduct(user_id=current_user.id, action="generate_video_visuals", db=db, org_id=project.org_id)
 
     ai = get_ai_service()
-    visuals_json = await ai.generate_video_visuals(script_json=project.script_json)
+    visuals_json = await ai.generate_video_visuals(script_json=project.script_json, language=language)
     project.visuals_json = visuals_json
     project.status = "visuals_ready"
     await db.commit()

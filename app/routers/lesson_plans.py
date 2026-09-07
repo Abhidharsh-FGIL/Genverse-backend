@@ -20,6 +20,7 @@ async def generate_lesson_plan(payload: LessonPlanRequest, current_user: Current
         raise NotFoundException("Class not found")
 
     ai = get_ai_service()
+    lang = payload.language or current_user.language or "en"
     plan_data = await ai.generate_lesson_plan(
         class_id=payload.class_id,
         topic=payload.topic,
@@ -30,13 +31,19 @@ async def generate_lesson_plan(payload: LessonPlanRequest, current_user: Current
         class_name=class_.name,
         class_section=class_.section,
         class_description=class_.description,
-        language=payload.language or current_user.language or "en",
+        language=lang,
     )
+
+    # Fallback title only used if the AI response omitted "title" — must be
+    # pre-translated since it never goes through the LLM's language handling.
+    default_title_prefix = {
+        "ar": "خطة درس: ",
+    }.get((lang or "en").lower(), "Lesson Plan: ")
 
     lesson_plan = LessonPlan(
         class_id=class_.id,
         created_by=current_user.id,
-        title=plan_data.get("title", f"Lesson Plan: {payload.topic}"),
+        title=plan_data.get("title", f"{default_title_prefix}{payload.topic}"),
         topic=payload.topic,
         objectives=plan_data.get("objectives"),
         time_estimate=plan_data.get("timeEstimate"),
