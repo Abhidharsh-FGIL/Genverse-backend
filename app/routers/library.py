@@ -10,7 +10,7 @@ from sqlalchemy import select, delete as sql_delete, func as sa_func
 
 logger = logging.getLogger(__name__)
 
-from app.dependencies import DBSession, CurrentUser
+from app.dependencies import DBSession, CurrentUser, OptionalCurrentUser
 from app.core.security import verify_access_token
 from app.models.content import UserLibraryItem, DocChunk
 from app.models.subscription import Subscription, PlanDefinition
@@ -345,23 +345,45 @@ async def proxy_file_bytes(
     path: str = Query(...),
     download: bool = Query(False),
     filename: str | None = Query(None),
-    current_user: CurrentUser = None,
+    current_user: OptionalCurrentUser = None,
 ):
     """Same-origin proxy that streams back the raw bytes of a stored file.
 
     Used when the frontend needs to read the bytes itself (e.g. fetch() a
     .txt file's text, or a .docx to convert to HTML client-side) rather than
-    just pointing an <img>/<a> at a URL.
+    just pointing an <img>/<a> at a URL. Also used for browser-triggered
+    downloads (a plain <a href> navigation, which can't carry the app's
+    Authorization header) — auth is intentionally optional here: this proxies
+    the exact same files already served unauthenticated by the /uploads
+    static mount (see app/main.py), and current_user was never actually used
+    for access control, so requiring it only broke plain-navigation downloads
+    without adding any real protection.
     """
     from pathlib import Path as _Path
     from fastapi import Response as _Response
+    from app.config import settings as _settings
     import mimetypes
 
-    if not path or _Path(path).is_absolute():
+    # UserLibraryItem.storage_path (and every other model's storage_path) is
+    # always stored as an ABSOLUTE filesystem path, so this must accept those
+    # — rejecting all absolute paths (the old check) made every real caller
+    # 404. What actually matters for security is that the resolved path stays
+    # inside STORAGE_ROOT: a relative path is joined onto it first (blocking
+    # "../../etc/passwd"-style traversal), an absolute path is resolved as-is
+    # and then must still land inside STORAGE_ROOT, so a path outside the
+    # storage tree is rejected either way.
+    if not path:
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        storage_root = _Path(_settings.STORAGE_ROOT).resolve()
+        candidate = _Path(path)
+        resolved = candidate.resolve() if candidate.is_absolute() else (storage_root / candidate).resolve()
+        resolved.relative_to(storage_root)
+    except (ValueError, OSError):
         raise HTTPException(status_code=404, detail="File not found")
 
     storage = StorageService()
-    content = await storage.read_file_async(path)
+    content = await storage.read_file_async(str(resolved))
     if content is None:
         raise HTTPException(status_code=404, detail="File not found")
 
