@@ -1530,6 +1530,30 @@ Answer:"""
         counts[last_key] = max(1, total - allocated)
         return counts
 
+    # LaTeX command roots that start with a letter JSON also uses for a real
+    # control-char escape (\t \b \f \n \r) — so "\right" and a genuine escaped
+    # newline followed by a capital letter (e.g. "...end.\nNext paragraph...")
+    # are BOTH syntactically valid JSON on their own, and json.loads() can't
+    # tell them apart; nothing about the character stream disambiguates them.
+    # A plain "is the next char a letter" check (the previous approach) treats
+    # any prose line starting a fresh sentence right after a real newline as
+    # LaTeX too, corrupting it. Matching against the actual command vocabulary
+    # instead only fires for genuine LaTeX, leaving real \n/\t/\b/\f/\r content
+    # untouched. Not exhaustive — every LaTeX command in real use here — but
+    # covers the commands this platform's math/physics/chemistry content
+    # actually generates; extend this list if a new false-negative shows up.
+    _LATEX_COMMAND_ROOTS = {
+        't': ('text', 'textbf', 'textit', 'textrm', 'textsf', 'texttt', 'textsc',
+              'textsl', 'times', 'tau', 'theta', 'Theta', 'to', 'top', 'tilde',
+              'tan', 'tanh', 'triangle'),
+        'b': ('begin', 'bar', 'binom', 'boldsymbol', 'beta', 'bf', 'big',
+              'bigl', 'bigr', 'bigcup', 'bigcap', 'boxed', 'bmod', 'breve',
+              'bullet', 'bot'),
+        'f': ('frac', 'forall', 'fbox', 'flat'),
+        'n': ('nabla', 'nu', 'neq', 'ne', 'notin', 'nolimits', 'not'),
+        'r': ('right', 'rho', 'rangle', 'rfloor', 'rceil', 'rm'),
+    }
+
     @staticmethod
     def _fix_json_escapes(s: str) -> str:
         """Repair invalid JSON backslash escapes produced by LLM-generated LaTeX.
@@ -1556,10 +1580,12 @@ Answer:"""
                 elif nxt in ('"', '/'):
                     out.append(s[i:i+2])
                     i += 2
-                elif nxt in ('t', 'b', 'f', 'n', 'r'):
+                elif nxt in AIService._LATEX_COMMAND_ROOTS:
                     # Could be a valid JSON escape OR the start of a LaTeX command
-                    # (\text, \beta, \frac, \nu, \rho). If followed by a letter → LaTeX.
-                    if i + 2 < n and s[i + 2].isalpha():
+                    # (\text, \beta, \frac, \nu, \rho) — only the latter matches a
+                    # known command root right after the escape letter.
+                    rest = s[i + 2:i + 12]
+                    if any(rest.startswith(root[1:]) for root in AIService._LATEX_COMMAND_ROOTS[nxt]):
                         out.append('\\\\')
                         i += 1
                     else:
@@ -1885,7 +1911,20 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
         """Parse a JSON array from a model response, tolerating markdown fences,
         surrounding prose, and LaTeX-escape JSON conflicts. Returns [] rather than
         raising if nothing parseable is found — callers treat [] as "generation
-        failed" (matching generate_practice_assessment's pre-existing contract)."""
+        failed" (matching generate_practice_assessment's pre-existing contract).
+
+        Under schema-constrained (response_schema) generation, the model's raw text
+        is GUARANTEED to be grammatically valid JSON — so a stray single backslash
+        before a LaTeX command whose first letter is one of JSON's own escape
+        letters (\\r, \\n, \\t, \\b, \\f — e.g. "\\right", "\\nu", "\\tau", "\\beta",
+        "\\frac") is *already* valid JSON syntax (a real control-char escape) and
+        json.loads() below NEVER raises for it — it silently decodes to a control
+        character + the rest of the command name (e.g. "\\right)" -> a literal CR
+        followed by "ight)"), corrupting the LaTeX with no exception to catch.
+        Previously _fix_json_escapes only ran as an on-error fallback, which is
+        provably too late for this exact class of corruption. Running it first is
+        safe: it round-trips already-correctly-double-escaped text (e.g. "\\\\left")
+        unchanged, so it can't break input that was fine as-is."""
         cleaned = (response or "").strip()
 
         if cleaned.startswith("```"):
@@ -1904,10 +1943,10 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 cleaned = match.group(0)
 
         try:
-            result = json.loads(cleaned, strict=False)
+            result = json.loads(AIService._fix_json_escapes(cleaned), strict=False)
         except json.JSONDecodeError:
             try:
-                result = json.loads(AIService._fix_json_escapes(cleaned), strict=False)
+                result = json.loads(cleaned, strict=False)
             except Exception:
                 return []
         except Exception:
@@ -2343,7 +2382,10 @@ Return ONLY valid JSON, no markdown:
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            data = json.loads(cleaned)
+            try:
+                data = json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                data = json.loads(cleaned)
             feedback_list = data.get("feedback", [])
 
             total_score = sum(f.get("score", 0) for f in feedback_list)
@@ -2854,23 +2896,6 @@ Return ONLY valid JSON in this exact structure:
         "  - NEVER use markdown: no **bold**, no *italic*, no # headings, no - bullet lists, no ```code fences```."
     )
 
-    # LaTeX commands that start with a JSON-valid escape character.
-    # \t (tab) starts: \text, \textbf, \textit, \textrm, \texttt, \textsf, \top, \tilde, \to
-    # \f (form-feed) starts: \frac, \forall, \fbox
-    # \b (backspace) starts: \begin, \bar, \binom, \boldsymbol, \beta
-    # These must be double-escaped in JSON strings (\\text{} → \text{} after decode).
-    # We fix single-backslash occurrences here so json.loads always succeeds.
-    _LATEX_JSON_FIX = [
-        # \text, \textbf, \textit, \textrm, \texttt, \textsf, \textsc, \textsl
-        (re.compile(r'(?<!\\)\\t(?=ext(?:bf|it|rm|sf|tt|sc|sl)?\{|ext\b)'), r'\\\\t'),
-        # \top, \tilde, \to
-        (re.compile(r'(?<!\\)\\t(?=op\b|ilde\b|o\b)'), r'\\\\t'),
-        # \frac, \forall, \fbox
-        (re.compile(r'(?<!\\)\\f(?=rac\{|orall\b|box\{)'), r'\\\\f'),
-        # \begin, \bar, \binom, \boldsymbol, \beta, \bf
-        (re.compile(r'(?<!\\)\\b(?=egin\{|ar\{|inom\{|oldsymbol\{|eta\b|f\b)'), r'\\\\b'),
-    ]
-
     @staticmethod
     def _parse_json_response(response: str) -> dict | None:
         """Try to parse a JSON response, stripping markdown fences if present."""
@@ -2890,13 +2915,25 @@ Return ONLY valid JSON in this exact structure:
             if brace_end != -1:
                 cleaned = cleaned[: brace_end + 1]
 
-        # Fix LaTeX backslashes that conflict with JSON escape sequences before parsing.
-        # e.g. \text{sin} → \\text{sin} so json.loads decodes it as \text{sin} not [TAB]ext{sin}
-        for _pat, _rep in AIService._LATEX_JSON_FIX:
-            cleaned = _pat.sub(_rep, cleaned)
+        # Fix LaTeX backslashes that conflict with JSON escape sequences before parsing
+        # (e.g. \text{sin} → \\text{sin} so json.loads decodes it as \text{sin}, not a
+        # tab character followed by "ext{sin}"). Previously used a hand-maintained regex
+        # list covering only \t/\f/\b-prefixed commands (\text, \frac, \begin, ...) —
+        # it silently missed every \r- and \n-prefixed command (\right, \rho, \nu,
+        # \nabla, \neq, ...), which json.loads() accepts as literal control-char escapes
+        # with no exception raised, so those slipped through corrupted with no error to
+        # catch. _fix_json_escapes handles any LaTeX command generically (by checking
+        # whether more letters follow the escape) instead of a fixed command whitelist.
+        try:
+            return json.loads(AIService._fix_json_escapes(cleaned))
+        except Exception:
+            pass
 
         try:
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return None
 
@@ -3594,7 +3631,14 @@ Return ONLY valid JSON.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            # See _extract_json_array's docstring for why this must run unconditionally
+            # rather than only as an on-error fallback — node labels can contain LaTeX
+            # (e.g. "\ce{CO2}") whose \r/\n-prefixed commands parse "successfully" into
+            # corrupted text with no exception to catch otherwise.
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return {"root": {"id": "root", "label": topic, "children": []}}
 
@@ -3638,7 +3682,10 @@ Return ONLY valid JSON.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return {"title": topic, "scenes": [{"scene_number": 1, "narration": response}]}
 
@@ -3861,7 +3908,10 @@ Return ONLY valid JSON array. No markdown, no explanation.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return []
 
@@ -3908,7 +3958,10 @@ Return ONLY valid JSON.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return {"totalScore": 0, "maxScore": 100, "criterionScores": [], "overallComment": response}
 
@@ -4009,7 +4062,10 @@ CRITICAL: criterionScores MUST contain exactly {len(criterion_titles)} entries, 
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
                 cleaned = cleaned.strip()
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except json.JSONDecodeError as e:
             print(f"[AIService] auto_grade_direct JSON parse failed: {e}\nRaw response: {response[:500]}", flush=True)
             # Try to extract JSON from the response
@@ -4017,9 +4073,12 @@ CRITICAL: criterionScores MUST contain exactly {len(criterion_titles)} entries, 
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
                 try:
-                    return json.loads(json_match.group())
+                    return json.loads(AIService._fix_json_escapes(json_match.group()))
                 except Exception:
-                    pass
+                    try:
+                        return json.loads(json_match.group())
+                    except Exception:
+                        pass
             # This fallback bypasses the LLM's translated output entirely (the
             # response failed to parse), so — like the no-data fallbacks in
             # generate_career_profile/generate_assessment_summary — it must be
@@ -4073,7 +4132,10 @@ Return ONLY valid JSON.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return []
 
@@ -4294,7 +4356,10 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            parsed = json.loads(cleaned)
+            try:
+                parsed = json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                parsed = json.loads(cleaned)
             questions = parsed.get("questions", parsed) if isinstance(parsed, dict) else parsed
             if not isinstance(questions, list):
                 return []
@@ -4757,7 +4822,10 @@ Rules:
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             parse_fail_text = {
                 "ar": {
@@ -4832,7 +4900,10 @@ Rules:
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return {"analysis": response, "compatibility_scores": {}}
 
@@ -4905,7 +4976,10 @@ Return ONLY valid JSON array. No markdown fences.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             fallback_title = {
                 "ar": "ابدأ رحلتك",
@@ -5001,7 +5075,10 @@ Return ONLY the JSON array. No markdown fences, no extra text.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return []
 
@@ -5171,7 +5248,10 @@ Rules:
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            data = json.loads(cleaned)
+            try:
+                data = json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                data = json.loads(cleaned)
             # Attach raw stats so frontend doesn't need to recompute
             data["total_attempts"] = total_attempts
             data["overall_avg"] = overall_avg
@@ -5223,7 +5303,10 @@ Return ONLY valid JSON.
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return []
 
@@ -5599,10 +5682,11 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 if match:
                     cleaned = match.group(0)
 
+            # See _extract_json_array's docstring for why the escape fix must run
+            # unconditionally rather than only as an on-error fallback.
             try:
-                questions = json.loads(cleaned, strict=False)
+                questions = json.loads(AIService._fix_json_escapes(cleaned), strict=False)
             except json.JSONDecodeError:
-                cleaned = AIService._fix_json_escapes(cleaned)
                 questions = json.loads(cleaned, strict=False)
             if not isinstance(questions, list):
                 raise ValueError(f"Expected JSON array, got {type(questions).__name__}")
@@ -5660,7 +5744,10 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            questions = json.loads(cleaned)
+            try:
+                questions = json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                questions = json.loads(cleaned)
             if isinstance(questions, list):
                 return [str(q) for q in questions[:count]]
         except Exception:
@@ -5695,7 +5782,10 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            steps = json.loads(cleaned)
+            try:
+                steps = json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                steps = json.loads(cleaned)
             if isinstance(steps, list):
                 return [str(s) for s in steps[:count]]
         except Exception:
@@ -5747,7 +5837,10 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            exercises = json.loads(cleaned)
+            try:
+                exercises = json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                exercises = json.loads(cleaned)
             if isinstance(exercises, list):
                 result = []
                 for ex in exercises[:count]:
@@ -5886,10 +5979,13 @@ Return ONLY this JSON structure:
             if start >= 0 and end > start:
                 json_str = cleaned[start:end]
                 try:
-                    result = json.loads(json_str)
+                    result = json.loads(AIService._fix_json_escapes(json_str))
                 except json.JSONDecodeError:
-                    json_str = json_str.replace("'", '"')
-                    result = json.loads(json_str)
+                    try:
+                        result = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        json_str = json_str.replace("'", '"')
+                        result = json.loads(json_str)
                 if isinstance(result, dict) and "label" in result:
                     if "children" not in result:
                         result["children"] = []
@@ -6176,7 +6272,10 @@ Icons: BookOpen, Globe, Clock, Lightbulb, Users, Star, Target, Zap, Award, Shiel
             # Strip any trailing ``` that got captured
             if cleaned.endswith("```"):
                 cleaned = cleaned[:-3].strip()
-            data = json.loads(cleaned)
+            try:
+                data = json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                data = json.loads(cleaned)
             # Ensure sections have the right structure
             for sec in data.get("sections", []):
                 if "points" in sec and "facts" not in sec:
@@ -7138,7 +7237,10 @@ Return ONLY valid JSON. No markdown fences."""
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return [
                 {
@@ -7234,7 +7336,10 @@ Return ONLY valid JSON. No markdown fences."""
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return {
                 "summary": response[:500] if response else "Unable to generate summary.",
@@ -7325,7 +7430,10 @@ Return ONLY valid JSON.{self._enhancement_language_note(language)}"""
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return {
                 "headline": "Simulation running…",
@@ -7375,7 +7483,11 @@ Rules:
                     cleaned = cleaned[4:]
             start = cleaned.find("{")
             end = cleaned.rfind("}") + 1
-            return json.loads(cleaned[start:end])
+            extracted = cleaned[start:end]
+            try:
+                return json.loads(AIService._fix_json_escapes(extracted))
+            except json.JSONDecodeError:
+                return json.loads(extracted)
         except Exception:
             return {
                 "controls": [
@@ -7419,7 +7531,10 @@ Return ONLY the JSON array.{self._enhancement_language_note(language)}"""
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            data = json.loads(cleaned)
+            try:
+                data = json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                data = json.loads(cleaned)
             return data if isinstance(data, list) else data.get("cards", [])
         except Exception:
             return [
@@ -7468,7 +7583,10 @@ Return ONLY valid JSON.{self._enhancement_language_note(language)}"""
                 cleaned = cleaned.split("```")[1]
                 if cleaned.startswith("json"):
                     cleaned = cleaned[4:]
-            return json.loads(cleaned)
+            try:
+                return json.loads(AIService._fix_json_escapes(cleaned))
+            except json.JSONDecodeError:
+                return json.loads(cleaned)
         except Exception:
             return {
                 "scene": response[:400],
@@ -7583,7 +7701,13 @@ Return ONLY valid JSON.{self._enhancement_language_note(language)}"""
         end = cleaned.rfind("]") + 1
         if start == -1 or end == 0:
             return []
-        return json.loads(cleaned[start:end])
+        extracted = cleaned[start:end]
+        # See _extract_json_array's docstring for why the escape fix must run
+        # unconditionally rather than only as an on-error fallback.
+        try:
+            return json.loads(AIService._fix_json_escapes(extracted))
+        except Exception:
+            return json.loads(extracted)
 
     def _parse_json_object(self, text: str) -> dict:
         """Robustly extract a JSON object from LLM output."""
@@ -7596,7 +7720,11 @@ Return ONLY valid JSON.{self._enhancement_language_note(language)}"""
         end = cleaned.rfind("}") + 1
         if start == -1 or end == 0:
             return {}
-        return json.loads(cleaned[start:end])
+        extracted = cleaned[start:end]
+        try:
+            return json.loads(AIService._fix_json_escapes(extracted))
+        except Exception:
+            return json.loads(extracted)
 
     async def playground_match_pairs(
         self, topic: str, role: str = "student", grade: int | None = None,
