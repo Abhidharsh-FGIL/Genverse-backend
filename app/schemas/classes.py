@@ -115,6 +115,7 @@ class AssignmentCreate(BaseModel):
     points: int = 100
     rubric_id: Optional[str] = None
     lesson_plan_id: Optional[str] = None
+    library_item_id: Optional[str] = None
     assignment_type: str = "assignment"  # "assignment" or "manual_exam"
     status: str = "draft"
     questions: Optional[List[Any]] = None
@@ -130,6 +131,7 @@ class AssignmentUpdate(BaseModel):
     points: Optional[int] = None
     rubric_id: Optional[str] = None
     lesson_plan_id: Optional[str] = None
+    library_item_id: Optional[str] = None
     status: Optional[str] = None
     questions: Optional[List[Any]] = None
     attachments: Optional[List[Any]] = None
@@ -146,6 +148,7 @@ class AssignmentResponse(BaseModel):
     points: int
     rubric_id: Optional[uuid.UUID] = None
     lesson_plan_id: Optional[uuid.UUID] = None
+    library_item_id: Optional[uuid.UUID] = None
     assignment_type: str = "assignment"
     status: str
     questions: Optional[Any] = None
