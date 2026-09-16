@@ -297,6 +297,27 @@ async def get_file(
     }
 
 
+@router.get("/files/{file_id}/text")
+async def get_public_file_text(
+    file_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the full extracted text for a public library file by joining its chunks."""
+    fid = uuid.UUID(file_id)
+    pub_file = await db.get(PublicFile, fid)
+    if not pub_file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    chunks_result = await db.execute(
+        select(PublicFileChunk)
+        .where(PublicFileChunk.file_id == fid)
+        .order_by(PublicFileChunk.chunk_order)
+    )
+    chunks = chunks_result.scalars().all()
+    full_text = " ".join(c.chunk_text for c in chunks)
+    return {"text": full_text}
+
+
 @router.delete("/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_file(
     file_id: str,
