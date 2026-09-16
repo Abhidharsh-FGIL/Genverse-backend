@@ -55,6 +55,11 @@ def _insight_matches_language(insight: "UserInsight", language: str | None) -> b
     return stored == (language or "en").lower()
 
 
+def _rec_matches_language(rec: "Recommendation", language: str | None) -> bool:
+    stored = (rec.metadata_json or {}).get("_language", "en")
+    return stored == (language or "en").lower()
+
+
 @router.post("/generate", response_model=list[UserInsightResponse])
 async def generate_insights(
     payload: GenerateInsightsRequest,
@@ -505,6 +510,28 @@ async def get_recommendations(
     result = await db.execute(q)
     recs = result.scalars().all()
 
+    # Recommendations generated in a different language than requested are
+    # stale — treat them the same as "none exist" so they get regenerated
+    # below, instead of silently showing the wrong language forever.
+    stale_language = bool(recs) and not all(_rec_matches_language(r, language) for r in recs)
+    if stale_language:
+        from sqlalchemy import delete as sql_delete
+        del_q = sql_delete(Recommendation).where(
+            Recommendation.user_id == current_user.id,
+            Recommendation.is_acted_on == False,
+        )
+        if org_id is not None:
+            from sqlalchemy import cast, String
+            if parsed_oid:
+                del_q = del_q.where(
+                    cast(Recommendation.metadata_json["org_id"], String) == f'"{parsed_oid}"'
+                )
+            else:
+                del_q = del_q.where(~Recommendation.metadata_json.has_key("org_id"))
+        await db.execute(del_q)
+        await db.commit()
+        recs = []
+
     if not recs:
         # Auto-generate on first load — same logic as /recommendations/generate
         ai = get_ai_service()
@@ -518,6 +545,7 @@ async def get_recommendations(
                 "topic": item.get("topic"),
                 "priority_score": item.get("priority_score", 50),
                 "href": "/u/assessments",
+                "_language": (language or "en").lower(),
             }
             if parsed_oid:
                 metadata["org_id"] = str(parsed_oid)
@@ -584,6 +612,7 @@ async def generate_recommendations(
             "topic": item.get("topic"),
             "priority_score": item.get("priority_score", 50),
             "href": "/u/assessments",
+            "_language": (language or "en").lower(),
         }
         if parsed_oid:
             metadata["org_id"] = str(parsed_oid)
