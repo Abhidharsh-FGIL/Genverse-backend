@@ -4510,10 +4510,27 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
                 result["submissions_subject_text"] = "\n".join(sub_subject_lines)
                 # For combining stats
                 all_pcts = [p for scores in sub_subject_scores.values() for p in scores]
+                result["submissions_pcts"] = all_pcts
                 result["submissions_avg"] = round(sum(all_pcts) / len(all_pcts)) if all_pcts else 0
                 result["submissions_best"] = max(all_pcts) if all_pcts else 0
         except Exception:
             pass
+
+        # ── 1b. Pending (ungraded) class submissions ─────────────────────────
+        try:
+            pending_result = await db.execute(
+                select(sqlfunc.count(Submission.id))
+                .join(Assignment, Submission.assignment_id == Assignment.id)
+                .join(Class, Assignment.class_id == Class.id)
+                .where(
+                    Submission.student_id == user_id,
+                    Submission.status.in_(["submitted", "late", "pending"]),
+                    Class.org_id == parsed_org,
+                )
+            )
+            result["pending_submissions_count"] = pending_result.scalar() or 0
+        except Exception:
+            result["pending_submissions_count"] = 0
 
         # ── 2. Evaluation attempts ───────────────────────────────────────────
         try:
@@ -4540,7 +4557,9 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
                 result["evaluations_text"] = "\n".join(eval_lines)
                 result["evaluations_count"] = len(eval_rows)
                 eval_pcts = [round(a.percentage or 0) for a, _ in eval_rows]
+                result["evaluations_pcts"] = eval_pcts
                 result["evaluations_avg"] = round(sum(eval_pcts) / len(eval_pcts)) if eval_pcts else 0
+                result["evaluations_best"] = max(eval_pcts) if eval_pcts else 0
         except Exception:
             pass
 
@@ -4604,6 +4623,10 @@ Example: {{"questions": [{{"type": "mcq", "text": "What is ...?", "options": ["A
             sections.append(
                 f"CLASS ASSIGNMENT PERFORMANCE ({org_data.get('submissions_count', 0)} graded assignments):\n"
                 f"{org_data['submissions_text']}"
+            )
+        if org_data.get("pending_submissions_count"):
+            sections.append(
+                f"PENDING CLASS WORK: {org_data['pending_submissions_count']} assignment(s) submitted but awaiting teacher grading."
             )
         if org_data.get("submissions_subject_text"):
             sections.append(
@@ -5127,12 +5150,22 @@ Return ONLY the JSON array. No markdown fences, no extra text.
         org_data = await self._fetch_org_enrichment_data(user_id, org_id, db)
         org_context = self._build_org_context_text(org_data)
 
-        total_attempts = len(rows) + org_data.get("submissions_count", 0) + org_data.get("evaluations_count", 0)
-        all_pcts = [r[0].percentage or 0 for r in rows]
-        if org_data.get("submissions_avg"):
-            all_pcts.append(org_data["submissions_avg"])
-        if org_data.get("evaluations_avg"):
-            all_pcts.append(org_data["evaluations_avg"])
+        graded_submissions_count = org_data.get("submissions_count", 0)
+        pending_submissions_count = org_data.get("pending_submissions_count", 0)
+        evaluations_count = org_data.get("evaluations_count", 0)
+        total_attempts = (
+            len(rows)
+            + graded_submissions_count
+            + pending_submissions_count
+            + evaluations_count
+        )
+        # Weight every individual attempt equally — never mix aggregate scalars
+        # with individual percentages (that made 15 graded assignments count as
+        # one data point and hid high-scoring individual submissions from the
+        # "best score" max()).
+        all_pcts: list[float] = [r[0].percentage or 0 for r in rows]
+        all_pcts.extend(org_data.get("submissions_pcts", []) or [])
+        all_pcts.extend(org_data.get("evaluations_pcts", []) or [])
         overall_avg = round(sum(all_pcts) / len(all_pcts), 1) if all_pcts else 0
         best_overall = round(max(all_pcts, default=0), 1)
 
@@ -5190,12 +5223,18 @@ Return ONLY the JSON array. No markdown fences, no extra text.
                 "best_score": 0,
             }
 
+        pending_line = (
+            f"PENDING (submitted, not yet graded): {pending_submissions_count}\n"
+            if pending_submissions_count
+            else ""
+        )
+
         prompt = f"""You are an expert AI learning coach. Analyse this student's complete assessment and learning data and produce a personalised coaching summary.
 
 TOTAL ASSESSMENTS & ASSIGNMENTS: {total_attempts}
 OVERALL AVERAGE SCORE: {overall_avg}%
 PERSONAL BEST SCORE: {best_overall}%
-
+{pending_line}
 PER-SUBJECT STATS (practice assessments):
 {subject_text}
 
@@ -5235,6 +5274,7 @@ Rules:
 - goals: exactly 3-5 specific goals ordered by priority (highest first)
 - goal priority: retry failed (<60%) = 85-95, improve weak = 70-84, upgrade difficulty = 55-70, explore new = 30-55
 - momentum: "improving" if recent scores are higher than older ones, "declining" if going down, "steady" otherwise
+- NEVER invent percentages, subject names, or topic names that are not present in the data above. If you cite a number in "summary", "detail", or elsewhere, it MUST appear verbatim in the OVERALL AVERAGE SCORE, PERSONAL BEST SCORE, PER-SUBJECT STATS, RECENT PRACTICE ATTEMPTS, TOPIC MASTERY, CLASS ASSIGNMENT PERFORMANCE, CLASS SUBJECT AVERAGES, or ORGANIZATION EXAM RESULTS sections.
 - CRITICAL for goals: "topic" must be an actual specific topic name extracted from the mastery or attempt data (e.g. "Gravity", "Thermodynamics", "Algebra"). Do NOT use the subject name (like "General" or "Physics") as the topic. If the data has topics like "Gravity (General)", the topic should be "Gravity" and subject should be "General Physics" or similar. If no specific topic exists, set topic to null.
 - The "detail" field's example wording ("avg", "improving trend", "needs more practice") is illustrative only, not literal text to copy — write every string value naturally in the requested language.
 - The PER-SUBJECT STATS / RECENT PRACTICE ATTEMPTS / TOPIC MASTERY data above uses English formatting words ("avg", "best", "attempts", "trend", "mastery") purely as internal labels — do NOT copy those words verbatim into any output field. Every string value must be written as natural, fluent text in the requested language, with no English words mixed in (except proper nouns, chemical formulas, and standard mathematical symbols).
@@ -5256,6 +5296,8 @@ Rules:
             data["total_attempts"] = total_attempts
             data["overall_avg"] = overall_avg
             data["best_score"] = best_overall
+            data["graded_count"] = len(rows) + graded_submissions_count + evaluations_count
+            data["pending_submissions"] = pending_submissions_count
             return data
         except Exception:
             parse_fail_text = {
@@ -5276,6 +5318,8 @@ Rules:
                 "total_attempts": total_attempts,
                 "overall_avg": overall_avg,
                 "best_score": best_overall,
+                "graded_count": len(rows) + graded_submissions_count + evaluations_count,
+                "pending_submissions": pending_submissions_count,
             }
 
     async def generate_insight_feed(self, user_id: str, subject: str | None, db, language: str | None = None) -> List[dict]:

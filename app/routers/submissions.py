@@ -21,6 +21,22 @@ from app.services.ai_service import AIService, get_ai_service
 router = APIRouter()
 
 
+async def _evict_student_intelligence_cache(db, student_id) -> None:
+    """Drop any cached coach summaries / recommendations for this student so
+    the next Recommendations-page load reflects the new grade immediately."""
+    try:
+        from app.models.ai import IntelligenceCache
+        from sqlalchemy import delete as sql_delete
+        await db.execute(
+            sql_delete(IntelligenceCache).where(
+                IntelligenceCache.user_id == student_id,
+                IntelligenceCache.cache_key.like("assessment-summary:%"),
+            )
+        )
+    except Exception:
+        pass
+
+
 class SubmissionPatchRequest(BaseModel):
     grade: Optional[Any] = None
     status: Optional[str] = None
@@ -242,6 +258,7 @@ async def patch_submission(
             icon="check-circle-2",
             data_json={"submission_id": str(submission.id), "link": f"/student/assignments"},
         )
+        await _evict_student_intelligence_cache(db, submission.student_id)
 
     await db.commit()
     await db.refresh(submission)
@@ -275,6 +292,7 @@ async def grade_submission(
         icon="check-circle-2",
         data_json={"submission_id": str(submission.id), "link": f"/student/assignments"},
     )
+    await _evict_student_intelligence_cache(db, submission.student_id)
 
     await db.commit()
     await db.refresh(submission)

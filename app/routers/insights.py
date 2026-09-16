@@ -463,7 +463,10 @@ async def get_assessment_summary(
         if old_row:
             await db.delete(old_row)
 
-        expires = datetime.now(timezone.utc) + timedelta(minutes=30)
+        # 5 min TTL — long enough to absorb repeated refetches from a single
+        # page load, short enough that a newly-graded assignment shows up on
+        # the next natural visit even without a manual refresh.
+        expires = datetime.now(timezone.utc) + timedelta(minutes=5)
         cache = IntelligenceCache(
             user_id=current_user.id,
             cache_key=cache_key,

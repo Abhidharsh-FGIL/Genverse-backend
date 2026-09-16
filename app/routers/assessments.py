@@ -26,6 +26,22 @@ from app.services.points_service import PointsService
 router = APIRouter()
 
 
+async def _evict_user_intelligence_cache(db, user_id) -> None:
+    """Drop cached coach summaries so the next Recommendations-page load
+    reflects the just-evaluated attempt."""
+    try:
+        from app.models.ai import IntelligenceCache
+        from sqlalchemy import delete as sql_delete
+        await db.execute(
+            sql_delete(IntelligenceCache).where(
+                IntelligenceCache.user_id == user_id,
+                IntelligenceCache.cache_key.like("assessment-summary:%"),
+            )
+        )
+    except Exception:
+        pass
+
+
 def _parse_org_id(org_id: str | None) -> uuid.UUID | None:
     """Convert org_id string to UUID. Returns None for personal workspace."""
     if not org_id or org_id == "personal":
@@ -516,7 +532,12 @@ async def get_assessment_trends(
     subject: str | None = Query(None),
     org_id: str | None = Query(None),
 ):
-    """Return per-subject score trend aggregates for the current user."""
+    """Return per-subject score trend aggregates for the current user.
+
+    In an org workspace this merges practice assessment attempts with graded
+    class submissions so the trend strip reflects everything the student has
+    done, not just Assessment Hub practice attempts.
+    """
     q = (
         select(
             PracticeAssessment.subject,
@@ -537,14 +558,62 @@ async def get_assessment_trends(
         q = q.where(PracticeAssessment.subject == subject)
     result = await db.execute(q)
     rows = result.all()
+
+    # subject -> { attempt_count, sum_pct, best } — merged from practice + class
+    merged: dict[str, dict] = {}
+    for r in rows:
+        subj = r.subject or "General"
+        count = int(r.attempt_count or 0)
+        avg = float(r.average_score or 0)
+        merged[subj] = {
+            "attempt_count": count,
+            "sum_pct": avg * count,
+            "best": float(r.best_score or 0),
+        }
+
+    parsed_org = _parse_org_id(org_id)
+    if parsed_org is not None:
+        from app.models.classes import Submission, Assignment, Class
+
+        sub_result = await db.execute(
+            select(Submission, Assignment, Class)
+            .join(Assignment, Submission.assignment_id == Assignment.id)
+            .join(Class, Assignment.class_id == Class.id)
+            .where(
+                Submission.student_id == current_user.id,
+                Submission.status.in_(["graded", "returned"]),
+                Class.org_id == parsed_org,
+            )
+        )
+        for sub, assign, cls in sub_result.all():
+            subj = cls.subject or "General"
+            if subject and subj != subject:
+                continue
+            grade_data = sub.grade or {}
+            total = grade_data.get("totalScore", 0)
+            max_s = grade_data.get("maxScore", assign.points or 1)
+            if not max_s:
+                continue
+            pct = (total / max_s) * 100
+            entry = merged.setdefault(
+                subj, {"attempt_count": 0, "sum_pct": 0.0, "best": 0.0}
+            )
+            entry["attempt_count"] += 1
+            entry["sum_pct"] += pct
+            if pct > entry["best"]:
+                entry["best"] = pct
+
     return [
         {
-            "subject": r.subject,
-            "attempt_count": r.attempt_count,
-            "average_score": round(float(r.average_score or 0), 2),
-            "best_score": round(float(r.best_score or 0), 2),
+            "subject": subj,
+            "attempt_count": data["attempt_count"],
+            "average_score": round(
+                data["sum_pct"] / data["attempt_count"] if data["attempt_count"] else 0,
+                2,
+            ),
+            "best_score": round(data["best"], 2),
         }
-        for r in rows
+        for subj, data in merged.items()
     ]
 
 
@@ -692,6 +761,7 @@ async def submit_attempt_by_id(
 
     await _update_topic_mastery(current_user.id, assessment, evaluation, db)
     current_user.xp = (current_user.xp or 0) + attempt.xp_earned
+    await _evict_user_intelligence_cache(db, current_user.id)
 
     await db.commit()
     await db.refresh(attempt)
@@ -846,6 +916,7 @@ async def submit_attempt(
 
     # Award XP to user
     current_user.xp = (current_user.xp or 0) + attempt.xp_earned
+    await _evict_user_intelligence_cache(db, current_user.id)
 
     await db.commit()
     await db.refresh(attempt)
