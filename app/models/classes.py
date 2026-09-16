@@ -104,6 +104,7 @@ class Assignment(Base):
     rubric_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("rubrics.id"))
     lesson_plan_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("lesson_plans.id"), nullable=True)
     library_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("user_library_items.id", ondelete="SET NULL"), nullable=True)
+    public_library_file_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("public_files.id", ondelete="SET NULL"), nullable=True)
     assignment_type: Mapped[str] = mapped_column(String(20), default="assignment")  # "assignment" or "manual_exam"
     status: Mapped[str] = mapped_column(ASSIGNMENT_STATUS, default="draft")
     questions: Mapped[dict | None] = mapped_column(JSONB)  # Array of Question objects

@@ -33,6 +33,7 @@ async def create_assignment(payload: AssignmentCreate, current_user: CurrentUser
         rubric_id=uuid.UUID(payload.rubric_id) if payload.rubric_id else None,
         lesson_plan_id=uuid.UUID(payload.lesson_plan_id) if payload.lesson_plan_id else None,
         library_item_id=uuid.UUID(payload.library_item_id) if payload.library_item_id else None,
+        public_library_file_id=uuid.UUID(payload.public_library_file_id) if payload.public_library_file_id else None,
         status=payload.status,
         questions=payload.questions,
         attachments=payload.attachments,
@@ -159,7 +160,7 @@ async def update_assignment(
 
     updates = payload.model_dump(exclude_unset=True)
     # Convert string UUIDs to proper UUID objects
-    for uuid_field in ('rubric_id', 'lesson_plan_id', 'library_item_id'):
+    for uuid_field in ('rubric_id', 'lesson_plan_id', 'library_item_id', 'public_library_file_id'):
         if uuid_field in updates:
             val = updates[uuid_field]
             updates[uuid_field] = uuid.UUID(val) if val else None
