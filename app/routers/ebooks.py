@@ -598,6 +598,31 @@ async def get_audiobook(ebook_id: uuid.UUID, current_user: CurrentUser, db: DBSe
     return audiobook
 
 
+@router.get("/{ebook_id}/audiobook/stream-url")
+async def get_audiobook_stream_url(ebook_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
+    """Return a servable URL for the generated audiobook MP3, for the
+    browser <audio> element to stream directly. Storage is local-disk only
+    (STORAGE_ROOT), so this resolves audio_path to a path under the /uploads
+    static mount rather than a cloud/presigned URL — same pattern as
+    library.py's file-url endpoint."""
+    from pathlib import Path
+
+    result = await db.execute(
+        select(Audiobook).where(Audiobook.ebook_id == ebook_id, Audiobook.user_id == current_user.id)
+    )
+    audiobook = result.scalar_one_or_none()
+    if not audiobook or not audiobook.audio_path:
+        raise NotFoundException("Audiobook not found. Generate audio first.")
+
+    audio_file = Path(audiobook.audio_path)
+    if not audio_file.exists():
+        raise NotFoundException("Audio file not found on disk.")
+
+    storage_root = Path(settings.STORAGE_ROOT).resolve()
+    rel = audio_file.resolve().relative_to(storage_root)
+    return {"url": f"/uploads/{rel.as_posix()}"}
+
+
 @router.get("/{ebook_id}/download/audio")
 async def download_ebook_audio(ebook_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
     """Stream the generated audiobook MP3 for the given eBook."""
