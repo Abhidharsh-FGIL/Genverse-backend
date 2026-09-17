@@ -28,3 +28,26 @@ class StudyTimeDaily(Base):
         Index("idx_study_time_user_date", "user_id", "date"),
         Index("idx_study_time_org_date", "org_id", "date"),
     )
+
+
+class UserActivityPing(Base):
+    """Lightweight heartbeat sent by the frontend while a user is actively using the app.
+
+    One row per ping (client sends every ~60s while the tab is visible and the user
+    has had recent input). Consumed by the study-time aggregator as a generic activity
+    event, so time-in-app is captured regardless of which feature the user is on."""
+
+    __tablename__ = "user_activity_ping"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True)
+    subject: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    route: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_user_ping_user_created", "user_id", "created_at"),
+        Index("idx_user_ping_org_created", "org_id", "created_at"),
+        Index("idx_user_ping_created", "created_at"),
+    )

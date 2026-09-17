@@ -5114,12 +5114,14 @@ Return ONLY the JSON array. No markdown fences, no extra text.
         from app.models.assessment import AssessmentAttempt, TopicMastery, PracticeAssessment
 
         # ── Fetch all evaluated attempts + assessment metadata ──────────────
+        # Wider window (was 30) — the LLM needs enough evidence to spot
+        # topic-level weak areas across JEE/NEET/school-mix attempts.
         attempts_result = await db.execute(
             select(AssessmentAttempt, PracticeAssessment)
             .join(PracticeAssessment, AssessmentAttempt.assessment_id == PracticeAssessment.id)
             .where(AssessmentAttempt.user_id == user_id, AssessmentAttempt.status == "evaluated")
             .order_by(AssessmentAttempt.submitted_at.desc())
-            .limit(30)
+            .limit(80)
         )
         rows = attempts_result.all()
 
@@ -5128,7 +5130,7 @@ Return ONLY the JSON array. No markdown fences, no extra text.
             select(TopicMastery)
             .where(TopicMastery.user_id == user_id)
             .order_by(TopicMastery.mastery_level.desc())
-            .limit(20)
+            .limit(60)
         )
         mastery_data = mastery_result.scalars().all()
 
@@ -5170,9 +5172,13 @@ Return ONLY the JSON array. No markdown fences, no extra text.
         best_overall = round(max(all_pcts, default=0), 1)
 
         # ── Build text context for the AI prompt ────────────────────────────
+        # Include the ASSESSMENT TITLE — often it encodes exam-type + topic
+        # (e.g. "NEET Photosynthesis Mock Test", "JEE Circuits & Capacitors
+        # Test") which the LLM should surface in goals/weak areas verbatim.
         attempts_text = "\n".join(
             f"- [{a.submitted_at.strftime('%b %d') if a.submitted_at else 'N/A'}] "
-            f"{p.subject or 'General'} | Topics: {', '.join(p.topics or ['N/A'])} | "
+            f"\"{p.title or 'Untitled'}\" | {p.subject or 'General'} | "
+            f"Topics: {', '.join(p.topics or ['N/A'])} | "
             f"Difficulty: {p.difficulty} | Score: {a.percentage:.0f}%"
             for a, p in rows
         ) or "No assessment attempts yet."
@@ -5269,9 +5275,9 @@ Based on ALL this data, generate a coaching summary with this exact JSON structu
 }}
 
 Rules:
-- strengths: 1-3 items with highest mastery/scores (>= 65%)
-- weak_areas: 1-3 items that need attention (< 60% or low mastery)
-- goals: exactly 3-5 specific goals ordered by priority (highest first)
+- strengths: 1-5 items with highest mastery/scores (>= 65%). If the student has strong scores in multiple distinct subjects OR distinct exam contexts (e.g. JEE, NEET, school), list each one separately.
+- weak_areas: LIST EVERY struggling area with concrete evidence — one item per distinct weak topic or exam-context, not one blanket item per subject. Prefer topic-level granularity ("NEET Photosynthesis — 0/45", "JEE Electric Circuits — 12%") over broad subject labels ("Biology needs work"). 3-8 items expected when the student has taken ≥10 assessments.
+- goals: 5-10 specific goals ordered by priority (highest first). Each goal must target a DIFFERENT topic. Cover every weak_area with at least one goal.
 - goal priority: retry failed (<60%) = 85-95, improve weak = 70-84, upgrade difficulty = 55-70, explore new = 30-55
 - momentum: "improving" if recent scores are higher than older ones, "declining" if going down, "steady" otherwise
 - NEVER invent percentages, subject names, or topic names that are not present in the data above. If you cite a number in "summary", "detail", or elsewhere, it MUST appear verbatim in the OVERALL AVERAGE SCORE, PERSONAL BEST SCORE, PER-SUBJECT STATS, RECENT PRACTICE ATTEMPTS, TOPIC MASTERY, CLASS ASSIGNMENT PERFORMANCE, CLASS SUBJECT AVERAGES, or ORGANIZATION EXAM RESULTS sections.

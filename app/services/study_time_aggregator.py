@@ -1,26 +1,30 @@
 """
-Study Time Aggregator — derives daily study time from AiInteractionHistory
-and AssessmentAttempt timestamps.
+Study Time Aggregator — derives daily study time from AiInteractionHistory,
+AssessmentAttempt, and UserActivityPing (heartbeat) timestamps.
 
 Algorithm:
-1. Collect all timestamped events (AI interactions + assessment attempts) for a user/date.
+1. Collect all timestamped events (AI interactions + assessment attempts + heartbeats)
+   for a user/date.
 2. Sort by timestamp and cluster events within 30-minute gaps into sessions.
 3. Session duration = time between first and last event in cluster + 5 min for the tail.
 4. Assessment duration = submitted_at - started_at (capped at time_limit or 120 min).
 5. Group by subject and upsert into study_time_daily.
+
+Heartbeats let us count "just reading / browsing / using the app" as study time —
+without them, only chats and assessments would count.
 """
 
 import logging
 from datetime import datetime, timezone, timedelta, date as date_type
 from collections import defaultdict
 
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.models.ai import AiInteractionHistory
 from app.models.assessment import AssessmentAttempt, PracticeAssessment
-from app.models.study_time import StudyTimeDaily
+from app.models.study_time import StudyTimeDaily, UserActivityPing
 from app.models.organization import OrgMember
 
 logger = logging.getLogger(__name__)
@@ -31,6 +35,8 @@ SESSION_GAP_MINUTES = 30
 TAIL_MINUTES = 5
 # Maximum assessment duration cap (minutes)
 MAX_ASSESSMENT_MINUTES = 120
+# Retention: delete pings older than this many days (already aggregated into study_time_daily)
+PING_RETENTION_DAYS = 100
 
 
 async def aggregate_user_study_time(
@@ -63,12 +69,25 @@ async def aggregate_user_study_time(
         )
     )).all()
 
+    # 2b. Fetch heartbeat pings — captures "just reading / browsing" time
+    ping_rows = (await db.execute(
+        select(UserActivityPing).where(
+            UserActivityPing.user_id == user_id,
+            UserActivityPing.created_at >= day_start,
+            UserActivityPing.created_at < day_end,
+        ).order_by(UserActivityPing.created_at)
+    )).scalars().all()
+
     # 3. Build events list: (timestamp, subject, type, duration_override_minutes)
     events = []
     for row in ai_rows:
         ctx = row.context_snapshot or {}
         subject = ctx.get("subject") or "General"
         events.append((row.created_at, subject, "interaction", None))
+
+    for ping in ping_rows:
+        subject = (ping.subject or "").strip() or "General"
+        events.append((ping.created_at, subject, "ping", None))
 
     # Track assessment-specific minutes per subject
     assessment_stats: dict[str, dict] = defaultdict(lambda: {"count": 0, "minutes": 0})
@@ -191,24 +210,34 @@ async def aggregate_user_study_time(
 async def aggregate_all_users_yesterday(db: AsyncSession):
     """Aggregate study time for all users who had activity yesterday. Called from notification scheduler."""
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    day_start = datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc)
+    day_end = day_start + timedelta(days=1)
 
     # Find users who had AI interactions yesterday
     user_rows = (await db.execute(
         select(AiInteractionHistory.user_id).where(
-            AiInteractionHistory.created_at >= datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc),
-            AiInteractionHistory.created_at < datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc) + timedelta(days=1),
+            AiInteractionHistory.created_at >= day_start,
+            AiInteractionHistory.created_at < day_end,
         ).distinct()
     )).scalars().all()
 
     # Also find users who had assessment attempts yesterday
     attempt_users = (await db.execute(
         select(AssessmentAttempt.user_id).where(
-            AssessmentAttempt.started_at >= datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc),
-            AssessmentAttempt.started_at < datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc) + timedelta(days=1),
+            AssessmentAttempt.started_at >= day_start,
+            AssessmentAttempt.started_at < day_end,
         ).distinct()
     )).scalars().all()
 
-    all_users = set(user_rows) | set(attempt_users)
+    # Also find users who sent heartbeat pings yesterday
+    ping_users = (await db.execute(
+        select(UserActivityPing.user_id).where(
+            UserActivityPing.created_at >= day_start,
+            UserActivityPing.created_at < day_end,
+        ).distinct()
+    )).scalars().all()
+
+    all_users = set(user_rows) | set(attempt_users) | set(ping_users)
 
     # Look up org memberships for all active users so we can store org_id
     org_memberships: dict = {}
@@ -229,6 +258,15 @@ async def aggregate_all_users_yesterday(db: AsyncSession):
                 await aggregate_user_study_time(uid, yesterday, db, org_id=oid)
         except Exception as e:
             logger.warning("Study time aggregation failed for user %s: %s", uid, e)
+
+    # Retention: drop ping rows older than retention window (they're already aggregated)
+    try:
+        retention_cutoff = datetime.now(timezone.utc) - timedelta(days=PING_RETENTION_DAYS)
+        await db.execute(
+            delete(UserActivityPing).where(UserActivityPing.created_at < retention_cutoff)
+        )
+    except Exception as e:
+        logger.warning("Ping retention cleanup failed: %s", e)
 
     logger.info("[StudyTimeAggregator] Aggregated study time for %d users for %s", len(all_users), yesterday)
 
@@ -267,12 +305,28 @@ async def backfill_study_time(db: AsyncSession, days_back: int = 90):
         )
     )).all()
 
+    # Also ping user/date combos — heartbeat activity
+    ping_user_dates = (await db.execute(
+        select(
+            UserActivityPing.user_id,
+            func.date(UserActivityPing.created_at).label("day"),
+        ).where(
+            UserActivityPing.created_at >= start_dt,
+        ).group_by(
+            UserActivityPing.user_id,
+            func.date(UserActivityPing.created_at),
+        )
+    )).all()
+
     # Merge into a set of (user_id, date) pairs
     pairs = set()
     for uid, day in user_date_rows:
         if day:
             pairs.add((uid, day))
     for uid, day in attempt_user_dates:
+        if day:
+            pairs.add((uid, day))
+    for uid, day in ping_user_dates:
         if day:
             pairs.add((uid, day))
 
@@ -304,7 +358,10 @@ async def backfill_study_time(db: AsyncSession, days_back: int = 90):
 
 
 async def compute_realtime_study_minutes(user_id, target_date: date_type, db: AsyncSession) -> dict:
-    """Compute study time for a given date on the fly (not stored). Used for today's data."""
+    """Compute study time for a given date on the fly (not stored). Used for today's data.
+
+    Mirrors the logic in aggregate_user_study_time (30-min session clustering, 5-min tail)
+    so that today's on-dashboard number matches what the nightly aggregator will store."""
     day_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc)
     day_end = day_start + timedelta(days=1)
 
@@ -326,15 +383,27 @@ async def compute_realtime_study_minutes(user_id, target_date: date_type, db: As
         )
     )).all()
 
-    if not ai_rows and not attempt_rows:
+    ping_rows = (await db.execute(
+        select(UserActivityPing).where(
+            UserActivityPing.user_id == user_id,
+            UserActivityPing.created_at >= day_start,
+            UserActivityPing.created_at < day_end,
+        ).order_by(UserActivityPing.created_at)
+    )).scalars().all()
+
+    if not ai_rows and not attempt_rows and not ping_rows:
         return {"total_minutes": 0, "subjects": {}}
 
-    # Build events
-    events = []
+    # Build events: (timestamp, subject, duration_override)
+    events: list[tuple] = []
     for row in ai_rows:
         ctx = row.context_snapshot or {}
         subject = ctx.get("subject") or "General"
-        events.append((row.created_at, subject))
+        events.append((row.created_at, subject, None))
+
+    for ping in ping_rows:
+        subj = (ping.subject or "").strip() or "General"
+        events.append((ping.created_at, subj, None))
 
     for attempt, subject, time_limit in attempt_rows:
         subj = subject or "General"
@@ -344,28 +413,50 @@ async def compute_realtime_study_minutes(user_id, target_date: date_type, db: As
             duration = min(duration, cap)
         else:
             duration = TAIL_MINUTES
-        events.append((attempt.started_at, subj))
+        events.append((attempt.started_at, subj, duration))
 
     events.sort(key=lambda e: e[0])
 
-    # Session clustering
+    # Cluster events into 30-min-gap sessions, attribute time to each event's subject
     total = 0
     subjects: dict[str, int] = {}
-    for i in range(len(events)):
-        if i == 0:
-            gap = TAIL_MINUTES
+    clusters: list[list] = []
+    current: list = [events[0]]
+    for i in range(1, len(events)):
+        prev_ts = events[i - 1][0]
+        curr_ts = events[i][0]
+        if prev_ts.tzinfo is None:
+            prev_ts = prev_ts.replace(tzinfo=timezone.utc)
+        if curr_ts.tzinfo is None:
+            curr_ts = curr_ts.replace(tzinfo=timezone.utc)
+        if (curr_ts - prev_ts).total_seconds() / 60 <= SESSION_GAP_MINUTES:
+            current.append(events[i])
         else:
-            ts1 = events[i - 1][0]
-            ts2 = events[i][0]
-            if ts1.tzinfo is None:
-                ts1 = ts1.replace(tzinfo=timezone.utc)
-            if ts2.tzinfo is None:
-                ts2 = ts2.replace(tzinfo=timezone.utc)
-            gap_sec = (ts2 - ts1).total_seconds() / 60
-            gap = min(gap_sec, SESSION_GAP_MINUTES) if gap_sec <= SESSION_GAP_MINUTES else TAIL_MINUTES
+            clusters.append(current)
+            current = [events[i]]
+    clusters.append(current)
 
-        subj = events[i][1]
-        total += int(gap)
-        subjects[subj] = subjects.get(subj, 0) + int(gap)
+    for cluster in clusters:
+        if len(cluster) == 1:
+            _, subj, dur = cluster[0]
+            minutes = int(dur if dur else TAIL_MINUTES)
+            subjects[subj] = subjects.get(subj, 0) + minutes
+            total += minutes
+        else:
+            for j in range(len(cluster) - 1):
+                ts1 = cluster[j][0]
+                ts2 = cluster[j + 1][0]
+                if ts1.tzinfo is None:
+                    ts1 = ts1.replace(tzinfo=timezone.utc)
+                if ts2.tzinfo is None:
+                    ts2 = ts2.replace(tzinfo=timezone.utc)
+                gap_min = int((ts2 - ts1).total_seconds() / 60)
+                subj = cluster[j][1]
+                subjects[subj] = subjects.get(subj, 0) + gap_min
+                total += gap_min
+            _, last_subj, last_dur = cluster[-1]
+            tail = int(last_dur if last_dur else TAIL_MINUTES)
+            subjects[last_subj] = subjects.get(last_subj, 0) + tail
+            total += tail
 
     return {"total_minutes": total, "subjects": subjects}

@@ -66,7 +66,7 @@ from app.models.ai import (
     AiInteractionHistory,
     IntelligenceCache,
 )
-from app.models.study_time import StudyTimeDaily
+from app.models.study_time import StudyTimeDaily, UserActivityPing
 
 __all__ = [
     "User", "UserRole",
@@ -90,5 +90,5 @@ __all__ = [
     "PublicFolder", "PublicFile", "PublicFileChunk",
     "Feedback",
     "PromoCode", "PromoUsage",
-    "StudyTimeDaily",
+    "StudyTimeDaily", "UserActivityPing",
 ]

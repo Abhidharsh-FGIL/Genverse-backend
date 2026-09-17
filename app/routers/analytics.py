@@ -1,14 +1,65 @@
 import uuid
-from fastapi import APIRouter, Query
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+from fastapi import APIRouter, Query, Response
+from pydantic import BaseModel, Field
 from sqlalchemy import select, func, case, or_
 
 from app.dependencies import DBSession, CurrentUser
 from app.models.classes import Class, Assignment, Submission, ClassStudent
 from app.models.assessment import AssessmentAttempt, TopicMastery, PracticeAssessment
 from app.models.organization import Organization, OrgMember
+from app.models.study_time import UserActivityPing
 from app.models.user import User
 
 router = APIRouter()
+
+
+class ActivityPingIn(BaseModel):
+    subject: Optional[str] = Field(default=None, max_length=100)
+    route: Optional[str] = Field(default=None, max_length=255)
+    org_id: Optional[str] = None
+
+
+# Server-side rate limit: skip if the same user pinged within this many seconds
+PING_MIN_INTERVAL_SECONDS = 45
+
+
+@router.post("/activity-ping", status_code=204)
+async def activity_ping(
+    payload: ActivityPingIn,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """Heartbeat from an active client. The frontend calls this ~every 60s while the
+    tab is visible AND the user has had recent input. Rate-limited server-side to
+    at most one write per PING_MIN_INTERVAL_SECONDS per user to guard against
+    duplicates from React strict-mode remounts, focus-change bursts, etc."""
+    parsed_oid = _parse_org_id(payload.org_id)
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=PING_MIN_INTERVAL_SECONDS)
+    recent = (await db.execute(
+        select(UserActivityPing.id).where(
+            UserActivityPing.user_id == current_user.id,
+            UserActivityPing.created_at >= cutoff,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if recent is not None:
+        return Response(status_code=204)
+
+    subject = (payload.subject or "").strip()[:100] or None
+    route = (payload.route or "").strip()[:255] or None
+    db.add(UserActivityPing(
+        user_id=current_user.id,
+        org_id=parsed_oid,
+        subject=subject,
+        route=route,
+    ))
+    await db.commit()
+    return Response(status_code=204)
 
 
 def _parse_org_id(org_id: str | None):
@@ -1358,24 +1409,34 @@ async def get_org_study_time(
     period: str = Query("30d", pattern="^(7d|30d|90d)$"),
     class_id: uuid.UUID | None = Query(None),
 ):
-    """Organization-wide study time analytics for admins/teachers."""
-    from datetime import datetime, timezone, timedelta, date
+    """Organization-wide study time analytics for admins/teachers.
+
+    Combines pre-aggregated study_time_daily rows with today's realtime activity
+    (AI interactions, assessments, heartbeat pings) so numbers are never > 24h stale."""
+    from datetime import date
     from app.models.study_time import StudyTimeDaily
+    from app.services.study_time_aggregator import compute_realtime_study_minutes
 
     days = {"7d": 7, "30d": 30, "90d": 90}[period]
     today = date.today()
-    start_date = today - timedelta(days=days)
+    start_date = today - timedelta(days=days - 1)  # inclusive window of `days` days
 
-    # Get org member IDs (optionally filtered by class)
+    # Get org member IDs (optionally filtered by class), deduped
+    # Bug fix: a student could appear multiple times if they have duplicate OrgMember
+    # or ClassStudent rows. Dedupe here so downstream counts and per-user loops are correct.
     if class_id:
         member_ids_result = await db.execute(
-            select(ClassStudent.student_id).where(ClassStudent.class_id == class_id)
+            select(ClassStudent.student_id).where(ClassStudent.class_id == class_id).distinct()
         )
     else:
         member_ids_result = await db.execute(
-            select(OrgMember.user_id).where(OrgMember.org_id == org_id, OrgMember.status == "active", OrgMember.role == "student")
+            select(OrgMember.user_id).where(
+                OrgMember.org_id == org_id,
+                OrgMember.status == "active",
+                OrgMember.role == "student",
+            ).distinct()
         )
-    member_ids = [r[0] for r in member_ids_result.all()]
+    member_ids = list({r[0] for r in member_ids_result.all()})
 
     if not member_ids:
         return {
@@ -1384,28 +1445,78 @@ async def get_org_study_time(
             "top_students": [], "at_risk_students": [],
         }
 
-    # Fetch all study time rows for these members in the period
+    # Fetch all study time rows for these members in the period (excluding today —
+    # we'll overlay today's realtime numbers below so nothing is double-counted).
     rows = (await db.execute(
         select(StudyTimeDaily).where(
             StudyTimeDaily.user_id.in_(member_ids),
             StudyTimeDaily.org_id == org_id,
             StudyTimeDaily.date >= start_date,
-            StudyTimeDaily.date <= today,
+            StudyTimeDaily.date < today,
         )
     )).scalars().all()
 
-    org_total = sum(r.total_minutes for r in rows)
-    active_user_ids = {r.user_id for r in rows if r.total_minutes > 0}
+    # Also fetch stored today's rows so realtime can override them (in case a prior
+    # aggregation already wrote today).
+    stored_today_rows = (await db.execute(
+        select(StudyTimeDaily).where(
+            StudyTimeDaily.user_id.in_(member_ids),
+            StudyTimeDaily.org_id == org_id,
+            StudyTimeDaily.date == today,
+        )
+    )).scalars().all()
+
+    # Build stored today totals per (user_id, subject)
+    stored_today_by_user: dict[uuid.UUID, dict[str, int]] = defaultdict(dict)
+    for r in stored_today_rows:
+        stored_today_by_user[r.user_id][r.subject] = r.total_minutes
+
+    # Compute today's realtime per member; only replaces stored today values.
+    # Runs for every member so today's activity from unaggregated sources counts.
+    realtime_today: dict[uuid.UUID, dict[str, int]] = {}
+    for uid in member_ids:
+        rt = await compute_realtime_study_minutes(uid, today, db)
+        subjects = rt.get("subjects") or {}
+        if not subjects:
+            continue
+        # Merge with any stored-today rows: take the max per subject to avoid
+        # under-counting if the daily aggregator has already run mid-day.
+        stored = stored_today_by_user.get(uid, {})
+        merged = dict(stored)
+        for subj, mins in subjects.items():
+            merged[subj] = max(merged.get(subj, 0), int(mins))
+        realtime_today[uid] = merged
+
+    # Rebuild the row set as (user_id, date, subject, minutes) tuples so today's realtime
+    # cleanly replaces stored-today figures without double-counting.
+    combined: list[tuple[uuid.UUID, date, str, int]] = [
+        (r.user_id, r.date, r.subject, r.total_minutes) for r in rows
+    ]
+    # Include today's rows: from realtime if we computed it, else stored.
+    for uid in member_ids:
+        if uid in realtime_today:
+            for subj, mins in realtime_today[uid].items():
+                if mins > 0:
+                    combined.append((uid, today, subj, mins))
+        else:
+            for subj, mins in stored_today_by_user.get(uid, {}).items():
+                if mins > 0:
+                    combined.append((uid, today, subj, mins))
+
+    org_total = sum(mins for _, _, _, mins in combined)
+    active_user_ids = {uid for uid, _, _, mins in combined if mins > 0}
     active_students = len(active_user_ids)
+    # Divide by all members × period length to get org-wide daily avg
     avg_per_student_daily = round(org_total / max(len(member_ids), 1) / max(days, 1))
 
     # By date
     date_map: dict[str, int] = {}
     date_active: dict[str, set] = {}
-    for r in rows:
-        d = str(r.date)
-        date_map[d] = date_map.get(d, 0) + r.total_minutes
-        date_active.setdefault(d, set()).add(r.user_id)
+    for uid, d, _subj, mins in combined:
+        ds = str(d)
+        date_map[ds] = date_map.get(ds, 0) + mins
+        if mins > 0:
+            date_active.setdefault(ds, set()).add(uid)
     by_date = [
         {
             "date": str(today - timedelta(days=i)),
@@ -1417,17 +1528,17 @@ async def get_org_study_time(
 
     # By subject
     subject_map: dict[str, int] = {}
-    for r in rows:
-        subject_map[r.subject] = subject_map.get(r.subject, 0) + r.total_minutes
+    for _uid, _d, subj, mins in combined:
+        subject_map[subj] = subject_map.get(subj, 0) + mins
     by_subject = sorted(
-        [{"subject": s, "total_minutes": m} for s, m in subject_map.items()],
+        [{"subject": s, "total_minutes": m} for s, m in subject_map.items() if m > 0],
         key=lambda x: -x["total_minutes"],
     )[:10]
 
-    # Per-student totals
+    # Per-student totals across the period
     student_totals: dict[uuid.UUID, int] = {}
-    for r in rows:
-        student_totals[r.user_id] = student_totals.get(r.user_id, 0) + r.total_minutes
+    for uid, _d, _subj, mins in combined:
+        student_totals[uid] = student_totals.get(uid, 0) + mins
 
     # Get names
     name_result = await db.execute(
@@ -1435,47 +1546,84 @@ async def get_org_study_time(
     )
     name_map = {r.id: r.name or r.email or "Unknown" for r in name_result.all()}
 
-    # Top students
+    # Top students (only students with any activity in period)
     top_students = sorted(
         [
             {"user_id": str(uid), "name": name_map.get(uid, "Unknown"), "total_minutes": mins}
             for uid, mins in student_totals.items()
+            if mins > 0
         ],
         key=lambda x: -x["total_minutes"],
     )[:10]
 
-    # At-risk students: < 15 min/day average or no activity in last 3 days
+    # At-risk: < 15 min/day average OR no activity in last 3 days.
+    # Bug fix: for "days_inactive", look up the student's most recent activity
+    # date across ALL history — not just the current period — so we don't
+    # falsely report "30d inactive" when we simply have no record in the window.
     three_days_ago = today - timedelta(days=3)
     recent_active = set()
-    for r in rows:
-        if r.date >= three_days_ago:
-            recent_active.add(r.user_id)
+    per_user_period_dates: dict[uuid.UUID, list] = defaultdict(list)
+    for uid, d, _subj, mins in combined:
+        if mins > 0:
+            per_user_period_dates[uid].append(d)
+            if d >= three_days_ago:
+                recent_active.add(uid)
 
-    at_risk_students = []
+    # For candidates without recent activity in period, look up their all-time last active date
+    at_risk_candidates = []
     for uid in member_ids:
         total = student_totals.get(uid, 0)
         daily_avg = round(total / max(days, 1))
         inactive_recently = uid not in recent_active
-
         if daily_avg < 15 or inactive_recently:
-            days_inactive = 0
-            if inactive_recently:
-                # Calculate actual days inactive
-                user_dates = sorted([r.date for r in rows if r.user_id == uid], reverse=True)
-                if user_dates:
-                    days_inactive = (today - user_dates[0]).days
-                else:
-                    days_inactive = days  # no activity in entire period
+            at_risk_candidates.append((uid, total, daily_avg, inactive_recently))
 
-            at_risk_students.append({
-                "user_id": str(uid),
-                "name": name_map.get(uid, "Unknown"),
-                "total_minutes": total,
-                "daily_avg": daily_avg,
-                "days_inactive": days_inactive,
-            })
+    # Batch lookup all-time last active for candidates missing recent period activity
+    lookup_uids = [uid for uid, _t, _a, inactive in at_risk_candidates if inactive]
+    all_time_last: dict[uuid.UUID, date] = {}
+    if lookup_uids:
+        all_time_rows = (await db.execute(
+            select(StudyTimeDaily.user_id, func.max(StudyTimeDaily.date))
+            .where(
+                StudyTimeDaily.user_id.in_(lookup_uids),
+                StudyTimeDaily.org_id == org_id,
+                StudyTimeDaily.total_minutes > 0,
+            )
+            .group_by(StudyTimeDaily.user_id)
+        )).all()
+        for uid, last_d in all_time_rows:
+            if last_d is not None:
+                all_time_last[uid] = last_d
 
-    at_risk_students.sort(key=lambda x: x["total_minutes"])
+    at_risk_students = []
+    for uid, total, daily_avg, inactive_recently in at_risk_candidates:
+        days_inactive: int | None = 0
+        if inactive_recently:
+            # Prefer within-period last active if present (rare when inactive_recently
+            # is True, but possible: e.g. active 5 days ago in a 30d window).
+            period_dates = per_user_period_dates.get(uid, [])
+            if period_dates:
+                days_inactive = (today - max(period_dates)).days
+            elif uid in all_time_last:
+                days_inactive = (today - all_time_last[uid]).days
+            else:
+                # Truly never active — use None so UI can show "—" / "Never active"
+                # rather than misleadingly reporting "30d".
+                days_inactive = None
+
+        at_risk_students.append({
+            "user_id": str(uid),
+            "name": name_map.get(uid, "Unknown"),
+            "total_minutes": total,
+            "daily_avg": daily_avg,
+            "days_inactive": days_inactive,
+        })
+
+    # Sort: never-active first (None → treated as very stale), then by total ascending
+    at_risk_students.sort(key=lambda x: (
+        -(10**9) if x["days_inactive"] is None else -x["days_inactive"],
+        x["total_minutes"],
+    ))
 
     return {
         "org_total_minutes": org_total,
