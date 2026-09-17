@@ -433,7 +433,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
         spaceBefore=10, spaceAfter=12,
     ))
     if author:
-        story.append(Paragraph(f"{ui.get('by', 'by')} {_pdf_text(author)}", S["cov_author"]))
+        story.append(Paragraph(f"{_pdf_text(ui.get('by', 'by'))} {_pdf_text(author)}", S["cov_author"]))
     if cov_img:
         img = _rl_image(cov_img, CONTENT_W * 0.75, 2.8 * inch)
         if img:
@@ -444,13 +444,13 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
 
     # ── About This Book ───────────────────────────────────────────────────────
     if summary:
-        story.append(Paragraph(ui.get("about_this_book", "About This Book"), S["sec_title"]))
+        story.append(Paragraph(_pdf_text(ui.get("about_this_book", "About This Book")), S["sec_title"]))
         story.extend(_rich_text_flowables(summary, S))
         story.append(PageBreak())
 
     # ── Table of Contents ─────────────────────────────────────────────────────
     if toc:
-        story.append(Paragraph(ui.get("table_of_contents", "Table of Contents"), S["sec_title"]))
+        story.append(Paragraph(_pdf_text(ui.get("table_of_contents", "Table of Contents")), S["sec_title"]))
         story.append(Spacer(1, 0.2 * inch))
 
         pg_count  = ej.get("page_count", 15)
@@ -491,7 +491,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
         imgs   = ch_imgs.get(str(i), [])
 
         ch_story: list = [
-            Paragraph(f"{ui.get('chapter', 'CHAPTER').upper()} {ch_num}", S["eyebrow"]),
+            Paragraph(f"{_pdf_text(ui.get('chapter', 'CHAPTER').upper())} {_pdf_text(str(ch_num))}", S["eyebrow"]),
             Paragraph(_pdf_text(ch_ttl), S["ch_title"]),
             Spacer(1, 0.15 * inch),
         ]
@@ -513,7 +513,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
 
         # Key-points box
         if kps:
-            kp_inner: list = [Paragraph(ui.get("key_points", "KEY POINTS").upper(), S["kp_label"])]
+            kp_inner: list = [Paragraph(_pdf_text(ui.get("key_points", "KEY POINTS").upper()), S["kp_label"])]
             for kp in kps:
                 # U+2022 (bullet), not U+25B8 (triangle) \u2014 confirmed present in every
                 # font used here (Times-Roman and all registered Noto Sans <Script>
@@ -540,7 +540,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
     # ── Assessment ────────────────────────────────────────────────────────────
     if asmnt:
         story.append(PageBreak())
-        story.append(Paragraph(ui.get("assessment_questions", "Assessment Questions"), S["sec_title"]))
+        story.append(Paragraph(_pdf_text(ui.get("assessment_questions", "Assessment Questions")), S["sec_title"]))
         story.append(Spacer(1, 0.2 * inch))
         ch_abbr = ui.get("chapter", "Ch.")
         answer_label = ui.get("answer", "Answer")
@@ -548,7 +548,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
         def _qgroup(qs: list, label: str, qtype: str) -> None:
             if not qs:
                 return
-            story.append(Paragraph(label, S["aq_grp"]))
+            story.append(Paragraph(_pdf_text(label), S["aq_grp"]))
             for j, q in enumerate(qs):
                 ch_ref = q.get("chapter_number", "")
                 blk: list = [
@@ -576,7 +576,7 @@ def generate_pdf(ebook_json: dict, book_title: str, language: str | None = "en")
         story.append(PageBreak())
         story += [
             Spacer(1, 1.5 * inch),
-            Paragraph(ui.get("thank_you", "Thank You"), S["ty_title"]),
+            Paragraph(_pdf_text(ui.get("thank_you", "Thank You")), S["ty_title"]),
             Spacer(1, 0.2 * inch),
             Paragraph(_pdf_markup(thanks), S["ty_text"]),
         ]
