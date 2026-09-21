@@ -45,6 +45,7 @@ class AssessmentResponse(BaseModel):
     negative_marking: bool = False
     negative_mark_value: float = 0.25
     exam_type: Optional[str] = None
+    language: Optional[str] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -143,4 +144,5 @@ class AssessmentSaveRequest(BaseModel):
     negative_marking: bool = False
     negative_mark_value: float = 0.25
     exam_type: Optional[str] = None
+    language: Optional[str] = None
     questions: List[Any] = []
