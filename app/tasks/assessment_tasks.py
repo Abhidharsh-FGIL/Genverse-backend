@@ -150,7 +150,7 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
     allowed_types = set(params.get("allowed_types", ["mcq"]))
     _log.info("[Assessment-Celery] Filtering by allowed_types=%s", allowed_types)
 
-    question_json, answer_key_json = ai.finalize_generated_questions(raw, allowed_types)
+    question_json, answer_key_json = await ai.finalize_generated_questions(raw, allowed_types)
 
     _log.info("[Assessment-Celery] After filtering: %d questions passed (from %d raw)", len(question_json), len(raw))
 

@@ -1894,6 +1894,13 @@ MATH NOTATION — CRITICAL:
 2. NEVER output bare LaTeX commands (\\frac, \\begin, \\sqrt, \\tan, \\sin, \\theta, etc.) outside $ or $$ delimiters.
 3. NEVER use Unicode math characters (², ³, θ, α, β, π, ∑, →, −, ·, ∞, etc.) in option values or formulas — use LaTeX inside $...$ instead (e.g. write $\\theta$ not θ, write $x^2$ not x², write $\\tan^2\\theta - 1 = \\sec^2\\theta$ not tan²θ−1=sec²θ).
 4. Plain English words in question text do NOT need delimiters; ONLY mathematical expressions get $...$.
+5. CHEMISTRY — ALWAYS use the mhchem \\ce{{...}} macro for every chemical formula and equation, never bare chemical notation inside plain $...$. Correct: $\\ce{{NaHCO3}}$, $\\ce{{Na2CO3}}$, $\\ce{{HCl}}$, $\\ce{{H2SO4 -> 2H+ + SO4^2-}}$. WRONG: $NaHCO3$, $HCl$ (renders as italic math variables N·a·H·C·O, not upright chemistry notation) — this applies everywhere a formula appears: question text, options, correct_answer, AND explanation.
+6. UNITS: numbers with units use \\mathrm{{}} inside math, e.g. $25\\,\\mathrm{{mL}}$, $0.1\\,\\mathrm{{M}}$, $10.0\\,\\mathrm{{g}}$ — not bare "25 mL" mixed with unrelated $ signs.
+7. PERCENT: a percent sign inside math MUST be escaped as \\% (e.g. $15.90\\%$). A percent in plain prose outside math has no backslash (e.g. "a 15.90% yield").
+8. DELIMITER BALANCE IS MANDATORY: every $ that opens inline math MUST have a matching closing $ later in the SAME string, and every $$ must have a matching closing $$. NEVER emit a lone/unclosed $ (e.g. "$15.90\\%" with no closing $ is INVALID and will be rejected). Before writing each "options" array, re-check every entry for a balanced dollar count.
+9. Pure-number or pure-text options that contain NO math (no formula, no percent-in-math, no chemistry) should be written as plain text with NO $ at all — e.g. option "True" or option "Paris" must never be wrapped in $...$.
+10. NEVER use $ to denote currency — write "Rs." or "USD" instead; a bare $ is reserved exclusively for opening/closing math.
+11. JSON ESCAPING REMINDER: this response is a JSON string value, so every literal backslash in your LaTeX must be written as \\\\ in the JSON (e.g. the macro \\ce becomes \\\\ce in the JSON text) so it decodes back to a single backslash.
 
 ⚠️ FINAL CHECKS BEFORE OUTPUT:
 1. Verify every "type" field is one of {allowed_types_str}.
@@ -2230,12 +2237,22 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
         return None
 
     @staticmethod
-    def finalize_generated_questions(raw: list, allowed_types: set) -> tuple[list, list]:
+    async def finalize_generated_questions(raw: list, allowed_types: set) -> tuple[list, list]:
         """Shared post-processing: filter generated questions by allowed type and
         build the (question_json, answer_key_json) pair the router/Celery task and
         the DB expect. Used by both the Celery task and the in-process SSE fallback
-        so the two code paths can't drift apart."""
+        so the two code paths can't drift apart.
+
+        Also runs the LaTeX validator (app/services/latex_validator.py) over the
+        finalized questions and logs any that fail — unbalanced $ delimiters,
+        unbalanced braces within a math segment, or a chemistry formula left
+        bare instead of wrapped in \\ce{...}. Flagged questions are logged, not dropped:
+        silently shrinking the assessment is worse than shipping a question that
+        (after the Phase 2 prompt fix) should be rare, and the frontend's MathText
+        fallback still renders flagged content as visible raw text rather than
+        crashing."""
         import uuid as _uuid
+        from app.services.latex_validator import repair_common_latex_issues
         question_json = []
         answer_key_json = []
         for q in raw:
@@ -2266,10 +2283,16 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             # whether the generation prompt/schema should have prevented this.
             if q_type in ("mcq", "true_false") and (not opts or len(opts) < 2):
                 continue
+            # Best-effort repair (unbalanced leading $, double-escaped \\ce,
+            # stray \% outside math) before the question is saved — catches
+            # the common shapes the validator below would otherwise just flag.
+            repaired_opts = (
+                [repair_common_latex_issues(str(o)) for o in opts] if isinstance(opts, list) else opts
+            )
             question_json.append({
                 "id": qid, "type": q_type, "subtype": q.get("subtype"),
-                "text": q.get("text") or q.get("question", ""),
-                "options": opts, "pairs": q.get("pairs"),
+                "text": repair_common_latex_issues(q.get("text") or q.get("question", "")),
+                "options": repaired_opts, "pairs": q.get("pairs"),
                 "points": q.get("marks") or q.get("points") or 1,
                 "blooms_level": q.get("blooms_level"),
                 "image_url": q.get("image_url"),
@@ -2277,9 +2300,27 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             })
             answer_key_json.append({
                 "id": qid,
-                "correctAnswer": q.get("correct_answer") or q.get("correctAnswer", ""),
-                "explanation": q.get("explanation", ""),
+                "correctAnswer": repair_common_latex_issues(
+                    q.get("correct_answer") or q.get("correctAnswer", "")
+                ),
+                "explanation": repair_common_latex_issues(q.get("explanation", "")),
             })
+
+        try:
+            from app.services.latex_validator import validate_questions_latex
+            # Validate against answer_key_json's explanation/correct_answer too,
+            # not just question_json's stem/options — merge them per id so the
+            # validator sees the full set of fields shown anywhere in the UI.
+            merged = [
+                {**qj, "correct_answer": ak["correctAnswer"], "explanation": ak["explanation"]}
+                for qj, ak in zip(question_json, answer_key_json)
+            ]
+            issues = await validate_questions_latex(merged)
+            for qid, msgs in issues.items():
+                print(f"[LatexValidator] question {qid} flagged: {'; '.join(msgs)}", flush=True)
+        except Exception as e:
+            print(f"[LatexValidator] validation pass failed, skipping: {type(e).__name__}: {e}", flush=True)
+
         return question_json, answer_key_json
 
     async def auto_evaluate_attempt(self, questions: List[dict], responses: dict) -> dict:
@@ -5708,6 +5749,13 @@ MATH NOTATION — CRITICAL:
 2. NEVER output bare LaTeX commands (\\frac, \\begin, \\sqrt, \\tan, \\sin, \\theta, etc.) outside $ or $$ delimiters.
 3. NEVER use Unicode math characters (², ³, θ, α, β, π, ∑, →, −, ·, ∞, etc.) in option values or formulas — use LaTeX inside $...$ instead (e.g. write $\\theta$ not θ, write $x^2$ not x², write $\\tan^2\\theta - 1 = \\sec^2\\theta$ not tan²θ−1=sec²θ).
 4. Plain English words in question text do NOT need delimiters; ONLY mathematical expressions get $...$.
+5. CHEMISTRY — ALWAYS use the mhchem \\ce{{...}} macro for every chemical formula and equation, never bare chemical notation inside plain $...$. Correct: $\\ce{{NaHCO3}}$, $\\ce{{Na2CO3}}$, $\\ce{{HCl}}$, $\\ce{{H2SO4 -> 2H+ + SO4^2-}}$. WRONG: $NaHCO3$, $HCl$ (renders as italic math variables N·a·H·C·O, not upright chemistry notation) — this applies everywhere a formula appears: question text, options, correct_answer, AND explanation.
+6. UNITS: numbers with units use \\mathrm{{}} inside math, e.g. $25\\,\\mathrm{{mL}}$, $0.1\\,\\mathrm{{M}}$, $10.0\\,\\mathrm{{g}}$ — not bare "25 mL" mixed with unrelated $ signs.
+7. PERCENT: a percent sign inside math MUST be escaped as \\% (e.g. $15.90\\%$). A percent in plain prose outside math has no backslash (e.g. "a 15.90% yield").
+8. DELIMITER BALANCE IS MANDATORY: every $ that opens inline math MUST have a matching closing $ later in the SAME string, and every $$ must have a matching closing $$. NEVER emit a lone/unclosed $ (e.g. "$15.90\\%" with no closing $ is INVALID and will be rejected). Before writing each "options" array, re-check every entry for a balanced dollar count.
+9. Pure-number or pure-text options that contain NO math (no formula, no percent-in-math, no chemistry) should be written as plain text with NO $ at all — e.g. option "True" or option "Paris" must never be wrapped in $...$.
+10. NEVER use $ to denote currency — write "Rs." or "USD" instead; a bare $ is reserved exclusively for opening/closing math.
+11. JSON ESCAPING REMINDER: this response is a JSON string value, so every literal backslash in your LaTeX must be written as \\\\ in the JSON (e.g. the macro \\ce becomes \\\\ce in the JSON text) so it decodes back to a single backslash.
 
 Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""
 

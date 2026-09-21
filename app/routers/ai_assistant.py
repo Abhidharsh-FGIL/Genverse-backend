@@ -1642,7 +1642,7 @@ async def generate_practice_assessment_stream(
 
                 yield f"data: {json.dumps({'stage': 'processing', 'progress': 80, 'message': 'Processing and validating questions...'})}\n\n"
 
-                question_json, answer_key_json = AIService.finalize_generated_questions(raw, allowed_types)
+                question_json, answer_key_json = await AIService.finalize_generated_questions(raw, allowed_types)
 
                 yield f"data: {json.dumps({'stage': 'complete', 'progress': 100, 'message': f'{len(question_json)} questions generated successfully!', 'question_json': question_json, 'answer_key_json': answer_key_json})}\n\n"
                 yield "data: [DONE]\n\n"
