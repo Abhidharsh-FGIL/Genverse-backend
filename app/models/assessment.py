@@ -27,6 +27,7 @@ class PracticeAssessment(Base):
     is_adaptive: Mapped[bool] = mapped_column(Boolean, default=False)
     negative_marking: Mapped[bool] = mapped_column(Boolean, default=False)
     negative_mark_value: Mapped[float] = mapped_column(Float, default=0.25)
+    exam_type: Mapped[str | None] = mapped_column(String(20))  # "jee" | "neet" | None (default/non-competitive)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

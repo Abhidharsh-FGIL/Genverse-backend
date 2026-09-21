@@ -20,6 +20,7 @@ class AssessmentCreate(BaseModel):
     negative_marking: bool = False
     negative_mark_value: float = 0.25
     language: Optional[str] = None
+    exam_type: Optional[str] = None  # "jee" | "neet" | None
 
 
 class GenerateAssessmentRequest(AssessmentCreate):
@@ -43,6 +44,7 @@ class AssessmentResponse(BaseModel):
     is_adaptive: bool
     negative_marking: bool = False
     negative_mark_value: float = 0.25
+    exam_type: Optional[str] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -140,4 +142,5 @@ class AssessmentSaveRequest(BaseModel):
     time_limit: Optional[int] = None
     negative_marking: bool = False
     negative_mark_value: float = 0.25
+    exam_type: Optional[str] = None
     questions: List[Any] = []

@@ -138,6 +138,7 @@ async def generate_assessment(payload: GenerateAssessmentRequest, current_user: 
         is_adaptive=payload.is_adaptive,
         negative_marking=payload.negative_marking,
         negative_mark_value=payload.negative_mark_value,
+        exam_type=payload.exam_type,
     )
     db.add(assessment)
     await db.commit()
@@ -369,6 +370,7 @@ async def save_assessment(payload: AssessmentSaveRequest, current_user: CurrentU
         time_limit=payload.time_limit,
         negative_marking=payload.negative_marking,
         negative_mark_value=payload.negative_mark_value,
+        exam_type=payload.exam_type,
     )
     db.add(assessment)
     await db.commit()
