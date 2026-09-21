@@ -818,20 +818,29 @@ async def send_message_stream(
     canned = _get_canned_response(payload.message) if _canned_ok_language else None
 
     async def event_stream():
+        import json
         full_response = ""
 
+        # Each SSE event carries a JSON payload ({"delta": "..."}) rather than
+        # raw text with newlines escaped as literal "\n". The old raw-text
+        # scheme was fundamentally ambiguous: a real newline and a genuine
+        # LaTeX command that starts with "\n" (\neq, \nabla, \nexists, \notin,
+        # \ncong, ...) are byte-identical once escaped, so the frontend could
+        # never reliably tell them apart — confirmed in practice, since $a
+        # \neq 0$ appears verbatim in raw model output. JSON encoding removes
+        # the ambiguity entirely: a real newline is \n inside a JSON string
+        # (a control escape JSON itself defines), while a literal backslash
+        # is always \\ — no collision with any LaTeX command is possible.
         if canned:
             full_response = canned
-            encoded = canned.replace('\n', '\\n')
-            yield f"data: {encoded}\n\n"
+            yield f"data: {json.dumps({'delta': canned})}\n\n"
         else:
             try:
                 # Gemini chunks are already sub-divided to ≤15 chars in _stream_gemini,
                 # so send each token straight through — no buffering needed.
-                # The newline escape keeps SSE framing intact.
                 async for chunk in ai.stream_chat(messages=messages, context=payload.context, chat_settings=chat_settings or None, has_files=has_files):
                     full_response += chunk
-                    yield f"data: {chunk.replace(chr(10), chr(92) + 'n')}\n\n"
+                    yield f"data: {json.dumps({'delta': chunk})}\n\n"
             except Exception as e:
                 import traceback
                 print(f"[StreamChat] Streaming error: {e}", flush=True)
@@ -839,7 +848,7 @@ async def send_message_stream(
                 # Send a user-visible error so the chat doesn't appear blank
                 if not full_response:
                     error_msg = AIService.error_message("generation_failed", rag_language)
-                    yield f"data: {error_msg}\n\n"
+                    yield f"data: {json.dumps({'delta': error_msg})}\n\n"
                     full_response = error_msg
 
         # Save assistant message after streaming completes
