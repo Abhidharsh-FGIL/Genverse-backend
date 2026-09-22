@@ -1919,6 +1919,8 @@ MATH NOTATION — CRITICAL:
 9. Pure-number or pure-text options that contain NO math (no formula, no percent-in-math, no chemistry) should be written as plain text with NO $ at all — e.g. option "True" or option "Paris" must never be wrapped in $...$.
 10. NEVER use $ to denote currency — write "Rs." or "USD" instead; a bare $ is reserved exclusively for opening/closing math.
 11. JSON ESCAPING REMINDER: this response is a JSON string value, so every literal backslash in your LaTeX must be written as \\\\ in the JSON (e.g. the macro \\ce becomes \\\\ce in the JSON text) so it decodes back to a single backslash.
+12. NEVER use \\( \\) or \\[ \\] delimiters, in ANY field (text, options, correct_answer, explanation) — $...$ and $$...$$ are the ONLY accepted delimiters, with no exceptions. A single question mixing both delimiter styles is INVALID output.
+13. Options contain ONLY the option content itself — never prefix an option with "A.", "B.", "1.", etc.; the option letter/number is assigned by the application, not by you.
 
 ⚠️ FINAL CHECKS BEFORE OUTPUT:
 1. Verify every "type" field is one of {allowed_types_str}.
@@ -2270,7 +2272,10 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
         fallback still renders flagged content as visible raw text rather than
         crashing."""
         import uuid as _uuid
-        from app.services.latex_validator import repair_common_latex_issues
+        from app.services.latex_validator import (
+            repair_common_latex_issues, strip_option_prefix, repair_correct_answer,
+            NO_OPTION_TYPES, CORRECT_ANSWER_STRIP_TYPES,
+        )
         question_json = []
         answer_key_json = []
         for q in raw:
@@ -2295,32 +2300,96 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             opts = q.get("options")
             if isinstance(opts, dict):
                 opts = list(opts.values())
+            # Schema consistency: fill/short/long questions must never carry an
+            # options array — the prompt already says "options": null for these
+            # types, but nothing previously enforced it, and the model
+            # occasionally attaches one anyway (observed: a SHORT question
+            # rendered with stray MCQ-looking options in the review/take UI).
+            # Force it to None regardless of what the model produced, rather
+            # than trusting the type/options pairing to always be consistent.
+            if q_type in NO_OPTION_TYPES:
+                opts = None
             # Safety net: an MCQ/true-false question with no (or a single) option
             # is unusable in the review/take UI — it renders a choice-less answer
             # list. Drop it rather than shipping a broken question, regardless of
             # whether the generation prompt/schema should have prevented this.
+            # A literal tuple, not CORRECT_ANSWER_STRIP_TYPES — this checks a
+            # different invariant (an option list long enough to be usable)
+            # that only coincidentally shares the same two type names today;
+            # extending CORRECT_ANSWER_STRIP_TYPES later must not silently
+            # change which question types this drop-filter applies to.
             if q_type in ("mcq", "true_false") and (not opts or len(opts) < 2):
                 continue
             # Best-effort repair (unbalanced leading $, double-escaped \\ce,
-            # stray \% outside math) before the question is saved — catches
-            # the common shapes the validator below would otherwise just flag.
+            # stray \% outside math, a stray "A. " label prefix) before the
+            # question is saved — catches the common shapes the validator
+            # below would otherwise just flag. Each option's own list
+            # position is passed to strip_option_prefix so a leading
+            # "A. "/"1. " is only treated as a stray duplicate label when it
+            # matches that position (see strip_option_prefix's docstring) —
+            # otherwise genuine content like an option reading "A. Einstein"
+            # would get silently corrupted to "Einstein".
             repaired_opts = (
-                [repair_common_latex_issues(str(o)) for o in opts] if isinstance(opts, list) else opts
+                [repair_common_latex_issues(strip_option_prefix(str(o), i)) for i, o in enumerate(opts)]
+                if isinstance(opts, list) else opts
             )
+            # Match questions carry their pairs alongside options — repair
+            # each pair's left/right the same way every other field is
+            # repaired above, so a broken $ delimiter in a match pair
+            # doesn't ship unrepaired (this was previously the one field
+            # with no LaTeX safety net at all).
+            raw_pairs = q.get("pairs")
+            repaired_pairs = raw_pairs
+            if q_type == "match" and isinstance(raw_pairs, list):
+                repaired_pairs = []
+                for i, pair in enumerate(raw_pairs):
+                    if not isinstance(pair, dict):
+                        repaired_pairs.append(pair)
+                        continue
+                    new_pair = dict(pair)
+                    for side in ("left", "right"):
+                        if pair.get(side) is not None:
+                            # Same position-aware label strip as options
+                            # (see strip_option_prefix) — a match item can
+                            # carry the same duplicate-label artifact an
+                            # MCQ option does.
+                            new_pair[side] = repair_common_latex_issues(strip_option_prefix(str(pair[side]), i))
+                    repaired_pairs.append(new_pair)
             question_json.append({
                 "id": qid, "type": q_type, "subtype": q.get("subtype"),
                 "text": repair_common_latex_issues(q.get("text") or q.get("question", "")),
-                "options": repaired_opts, "pairs": q.get("pairs"),
+                "options": repaired_opts, "pairs": repaired_pairs,
                 "points": q.get("marks") or q.get("points") or 1,
                 "blooms_level": q.get("blooms_level"),
                 "image_url": q.get("image_url"),
                 "option_images": q.get("option_images"),
             })
+            # `or` here would silently discard a legitimately falsy value —
+            # a true_false question whose model output is the JSON boolean
+            # `false` (plausible: nothing in the schema enforces the string
+            # "False") has q.get("correct_answer") return Python False,
+            # which `or` would treat as "missing" and fall through to the
+            # empty-string default, dropping the real answer entirely.
+            # `is not None` treats only an ACTUALLY absent key as missing.
+            _raw_ca = q.get("correct_answer")
+            raw_correct_answer = str(_raw_ca if _raw_ca is not None else q.get("correctAnswer", ""))
+            # correct_answer must match one of `repaired_opts` verbatim for
+            # MCQ/true_false grading (exact-string comparison) — derive it
+            # from whichever original option it matches (so it inherits that
+            # option's already-position-aware repair) rather than running an
+            # independent, unguarded strip on it; skip entirely for
+            # free-form short/fill/long answers, where a leading "A." could
+            # be genuine answer content, not an option label. Both branches
+            # of repair_correct_answer already return a LaTeX-repaired value
+            # (see its docstring), so it replaces rather than precedes the
+            # repair_common_latex_issues call below.
+            if q_type in CORRECT_ANSWER_STRIP_TYPES:
+                raw_correct_answer = repair_correct_answer(raw_correct_answer, opts, repaired_opts)
+            else:
+                raw_correct_answer = repair_common_latex_issues(raw_correct_answer)
             answer_key_json.append({
                 "id": qid,
-                "correctAnswer": repair_common_latex_issues(
-                    q.get("correct_answer") or q.get("correctAnswer", "")
-                ),
+                "correctAnswer": raw_correct_answer,
                 "explanation": repair_common_latex_issues(q.get("explanation", "")),
             })
 
@@ -5774,6 +5843,8 @@ MATH NOTATION — CRITICAL:
 9. Pure-number or pure-text options that contain NO math (no formula, no percent-in-math, no chemistry) should be written as plain text with NO $ at all — e.g. option "True" or option "Paris" must never be wrapped in $...$.
 10. NEVER use $ to denote currency — write "Rs." or "USD" instead; a bare $ is reserved exclusively for opening/closing math.
 11. JSON ESCAPING REMINDER: this response is a JSON string value, so every literal backslash in your LaTeX must be written as \\\\ in the JSON (e.g. the macro \\ce becomes \\\\ce in the JSON text) so it decodes back to a single backslash.
+12. NEVER use \\( \\) or \\[ \\] delimiters, in ANY field (text, options, correct_answer, explanation) — $...$ and $$...$$ are the ONLY accepted delimiters, with no exceptions. A single question mixing both delimiter styles is INVALID output.
+13. Options contain ONLY the option content itself — never prefix an option with "A.", "B.", "1.", etc.; the option letter/number is assigned by the application, not by you.
 
 Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""
 

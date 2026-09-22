@@ -321,6 +321,12 @@ async def save_paper(
             ))
 
     # Create questions
+    from app.services.latex_validator import (
+        repair_common_latex_issues, strip_option_prefix, repair_correct_answer,
+        validate_questions_latex, option_text, NO_OPTION_TYPES,
+        OPTION_BEARING_TYPES, CORRECT_ANSWER_STRIP_TYPES,
+    )
+    _latex_check_batch: list[dict] = []
     for i, q in enumerate(questions_data):
         # Determine source_type from the subject config
         q_subject = q.get("subject", "")
@@ -330,29 +336,120 @@ async def save_paper(
                 source_type = sc.get("sourceType", "online")
                 break
 
-        # For match questions, store pairs alongside options in the JSONB field
-        q_options = q.get("options")
-        if q.get("type") == "match" and q.get("pairs"):
-            q_options = {"options": q_options, "pairs": q.get("pairs")}
+        q_type = q.get("type", "mcq")
+        opts = q.get("options")
+        # Schema consistency: fill/short/long questions must never carry an
+        # options array (same gap, and same fix, as the personal Assessment
+        # Hub's finalize_generated_questions — this path previously had no
+        # such guard at all).
+        if q_type in NO_OPTION_TYPES:
+            opts = None
+        is_option_bearing = q_type in OPTION_BEARING_TYPES
+        original_opts = opts if isinstance(opts, list) else None
+        # repaired_opt_texts is the plain-text-only parallel to `opts` below
+        # — repair_correct_answer needs to compare/derive against option TEXT
+        # specifically, never the full option object (an option can be a
+        # dict carrying e.g. an image_url alongside "text").
+        repaired_opt_texts = None
+        if isinstance(opts, list) and is_option_bearing:
+            new_opts = []
+            repaired_opt_texts = []
+            for i, o in enumerate(opts):
+                # Each option's own position is passed so a leading "A. "/
+                # "1. " is only stripped when it's the label a
+                # duplicate-prefix bug would actually produce at that
+                # position — see strip_option_prefix's docstring for why an
+                # unguarded strip would corrupt genuine content like
+                # "A. Einstein". option_text() (not the bare str() builtin)
+                # extracts the actual text out of a dict-shaped option so
+                # the rest of the object isn't turned into a stringified
+                # dict repr.
+                repaired_text = repair_common_latex_issues(strip_option_prefix(option_text(o), i))
+                repaired_opt_texts.append(repaired_text)
+                new_opts.append({**o, "text": repaired_text} if isinstance(o, dict) else repaired_text)
+            opts = new_opts
+
+        correct_answer = q.get("correctAnswer")
+        if correct_answer is not None:
+            correct_answer = str(correct_answer)
+            if q_type in CORRECT_ANSWER_STRIP_TYPES:
+                # Derived from whichever original option it matches, so it
+                # inherits that option's position-aware repair instead of an
+                # independent, unguarded strip (see repair_correct_answer,
+                # whose return value is already fully LaTeX-repaired either
+                # way — this replaces rather than precedes the plain
+                # repair_common_latex_issues call below). Matched/derived
+                # against plain option TEXT (repaired_opt_texts), never the
+                # dict-shaped `opts` — correct_answer is always a string.
+                correct_answer = repair_correct_answer(correct_answer, original_opts, repaired_opt_texts)
+            else:
+                correct_answer = repair_common_latex_issues(correct_answer)
+
+        question_text = repair_common_latex_issues(q.get("text", ""))
+        # Preserves the None vs "" distinction a caller may intentionally
+        # send (repair_common_latex_issues is itself a no-op on either
+        # falsy value, via its own `if not text: return text` guard) —
+        # collapsing an explicit "" to None here was a real, unintended
+        # behavior change caught in review.
+        explanation = repair_common_latex_issues(q.get("explanation"))
+
+        # For match questions, store pairs alongside options in the JSONB
+        # field — repair each pair's left/right the same way question
+        # text/options are repaired above; this went unrepaired before
+        # (caught in review), the one field in a match question with no
+        # LaTeX safety net at all despite this whole pass existing to add one.
+        q_pairs = q.get("pairs")
+        if q_type == "match" and isinstance(q_pairs, list):
+            repaired_pairs = []
+            for i, pair in enumerate(q_pairs):
+                if not isinstance(pair, dict):
+                    repaired_pairs.append(pair)
+                    continue
+                new_pair = dict(pair)
+                for side in ("left", "right"):
+                    if pair.get(side) is not None:
+                        # Same position-aware label strip as options (see
+                        # strip_option_prefix) — a match item can carry the
+                        # same duplicate-label artifact an MCQ option does.
+                        new_pair[side] = repair_common_latex_issues(strip_option_prefix(str(pair[side]), i))
+                repaired_pairs.append(new_pair)
+            q_pairs = repaired_pairs
+        q_options = opts
+        if q_type == "match" and q_pairs:
+            q_options = {"options": opts, "pairs": q_pairs}
 
         question = EvaluationQuestion(
             paper_id=paper.id,
-            question_type=q.get("type", "mcq"),
-            question_text=q.get("text", ""),
+            question_type=q_type,
+            question_text=question_text,
             options=q_options,
-            correct_answer=str(q.get("correctAnswer", "")) if q.get("correctAnswer") is not None else None,
+            correct_answer=correct_answer,
             marks=q.get("points", q.get("marks", 1.0)),
             negative_marks=0.0,
             subject=q_subject,
             chapter=q.get("chapter"),
             difficulty=config.get("difficulty"),
-            explanation=q.get("explanation"),
+            explanation=explanation,
             source_type=source_type,
             blooms_level=q.get("blooms_level"),
             is_ai_generated=True,
             order_index=i,
         )
         db.add(question)
+        _latex_check_batch.append({
+            "id": q.get("id") or f"idx{i}",
+            "text": question_text,
+            "explanation": explanation,
+            "correct_answer": correct_answer,
+            "options": opts if isinstance(opts, list) else None,
+        })
+
+    try:
+        latex_issues = await validate_questions_latex(_latex_check_batch)
+        for qid, msgs in latex_issues.items():
+            logger.warning(f"[EvaluationHub] question {qid} in paper {paper.id} flagged: {'; '.join(msgs)}")
+    except Exception as e:
+        logger.warning(f"[EvaluationHub] LaTeX validation pass failed, skipping: {type(e).__name__}: {e}")
 
     await db.commit()
     await db.refresh(paper)
@@ -583,11 +680,15 @@ async def list_chapters(
 async def add_question(
     paper_id: uuid.UUID, payload: EvalQuestionCreate, current_user: CurrentUser, db: DBSession
 ):
+    from app.services.latex_validator import NO_OPTION_TYPES
+    # Schema consistency: fill/short/long questions must never carry an
+    # options array, regardless of what the client sent.
+    options = None if payload.question_type in NO_OPTION_TYPES else payload.options
     question = EvaluationQuestion(
         paper_id=paper_id,
         question_type=payload.question_type,
         question_text=payload.question_text,
-        options=payload.options,
+        options=options,
         correct_answer=payload.correct_answer,
         marks=payload.marks,
         negative_marks=payload.negative_marks,
@@ -635,8 +736,17 @@ async def update_question(
     question = result.scalar_one_or_none()
     if not question:
         raise NotFoundException("Question not found")
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    for key, value in updates.items():
         setattr(question, key, value)
+    from app.services.latex_validator import NO_OPTION_TYPES
+    # Schema consistency: EvalQuestionUpdate has no question_type field (type
+    # is fixed at creation), but it does allow "options" alone to change —
+    # re-check against the question's existing type after applying updates
+    # so a PATCH can't leave a fill/short/long question with a stray
+    # options array.
+    if question.question_type in NO_OPTION_TYPES:
+        question.options = None
     await db.commit()
     await db.refresh(question)
     return question

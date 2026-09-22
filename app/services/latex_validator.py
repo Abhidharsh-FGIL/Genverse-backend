@@ -26,6 +26,18 @@ from __future__ import annotations
 
 import re
 
+# The ONE definition of which question types carry an "options"
+# array/correct_answer that needs label-stripping, shared by every caller
+# that applies these rules (app/services/ai_service.py, app/routers/
+# evaluation.py, scripts/migrate_latex_normalize.py, scripts/
+# migrate_evaluation_latex_normalize.py) — previously each of those
+# reimplemented the same literal tuples independently, so a future new
+# question type had to be added in lockstep across all of them or the
+# schema-consistency rule silently broke in whichever copy was missed.
+NO_OPTION_TYPES = ("fill", "short", "long")
+OPTION_BEARING_TYPES = ("mcq", "true_false", "match")
+CORRECT_ANSWER_STRIP_TYPES = ("mcq", "true_false")
+
 _DISPLAY_RE = re.compile(r"\$\$([\s\S]+?)\$\$")
 _INLINE_RE = re.compile(r"(?<!\$)\$(?!\$)([^\n$]+?)\$(?!\$)")
 
@@ -158,7 +170,82 @@ def repair_common_latex_issues(text: str) -> str:
     return result
 
 
-def _option_text(opt) -> str:
+_OPTION_PREFIX_RE = re.compile(r"^\s*([A-Za-z]|\d{1,2})[.)]\s+")
+
+
+def _expected_option_labels(index: int) -> set[str]:
+    """The label(s) a duplicate-prefix bug would plausibly use for the
+    option AT THIS POSITION — "A"/"a" for index 0, "B"/"b" for index 1, ...,
+    plus the 1-based digit form ("1", "2", ...). Anything else at the start
+    of this option's text is real content, not a stray label."""
+    labels = {str(index + 1)}
+    if 0 <= index < 26:
+        letter = chr(ord("A") + index)
+        labels.add(letter)
+        labels.add(letter.lower())
+    return labels
+
+
+def strip_option_prefix(text: str, index: int | None = None) -> str:
+    """Strips a leading "A. "/"B) "/"1. " style label the model sometimes adds
+    to an option despite being told not to (the prompt's own option letters
+    are assigned by the frontend, not embedded in the stored text) — e.g.
+    "A. 2" -> "2". Conservative: only strips a SINGLE short label at the very
+    start, never touches anything else in the string.
+
+    `index` is this option's 0-based position in its own options list, when
+    known. A bare regex match on "letter/digit + '.'/')' + space" is NOT
+    enough on its own — real option content legitimately starts that way
+    (an option whose actual answer is "A. Einstein" or a match-question item
+    "1. Inertia"), and blindly stripping it silently corrupts that content.
+    When `index` is given, the match is only treated as a stray duplicate
+    label if it's the label that would ACTUALLY be assigned to this
+    position (e.g. only "A."/"1." at index 0, only "B."/"2." at index 1) —
+    the one case a model erroneously prefixing its own answer key would
+    actually produce. `index=None` (e.g. for a correct_answer string that
+    isn't itself a positioned list entry) falls back to the older
+    unconditional strip, kept for backward compatibility."""
+    if not text:
+        return text
+    m = _OPTION_PREFIX_RE.match(text)
+    if not m:
+        return text
+    if index is not None and m.group(1) not in _expected_option_labels(index):
+        return text
+    return text[m.end():]
+
+
+def repair_correct_answer(raw_correct_answer, original_options, repaired_options) -> str:
+    """Derives a schema-consistent correct_answer for mcq/true_false
+    questions FROM the (already position-aware repaired) options list
+    whenever it matches one of the original option strings, instead of
+    independently re-running strip_option_prefix on it — correct_answer on
+    its own carries no positional information, so a second, unguarded strip
+    there would reintroduce exactly the false-positive risk `index` exists
+    to prevent in strip_option_prefix (e.g. a correct_answer of "A.
+    Einstein" losing "A. " even though the model never duplicated a label).
+    The match is whitespace-insensitive (.strip()) so incidental spacing
+    differences between an option and its answer-key copy — plausible model
+    output noise, not a real content difference — don't defeat it. When
+    correct_answer still doesn't match any original option (e.g. it was
+    genuinely paraphrased/truncated), no positional signal exists to guard a
+    strip, so only repair_common_latex_issues is applied — per the prompt's
+    own instructions correct_answer is supposed to match an option verbatim,
+    so a non-match at that point is already anomalous data, and guessing at
+    a strip there would risk the exact corruption this function exists to
+    prevent, for a case that should be rare in the first place. EITHER WAY
+    the return value is already fully LaTeX-repaired — callers should use
+    this in place of, not in addition to, their own repair_common_latex_issues
+    call on this field."""
+    text = str(raw_correct_answer) if raw_correct_answer is not None else ""
+    if isinstance(original_options, list) and isinstance(repaired_options, list):
+        for i, opt in enumerate(original_options):
+            if option_text(opt).strip() == text.strip() and i < len(repaired_options):
+                return repaired_options[i]
+    return repair_common_latex_issues(text)
+
+
+def option_text(opt) -> str:
     if isinstance(opt, dict):
         return str(opt.get("text", ""))
     return str(opt) if opt is not None else ""
@@ -181,7 +268,7 @@ async def validate_questions_latex(questions: list[dict]) -> dict[str, list[str]
         opts = q.get("options")
         if isinstance(opts, list):
             for oi, opt in enumerate(opts):
-                field_texts.append((qid, f"option[{oi}]", _option_text(opt)))
+                field_texts.append((qid, f"option[{oi}]", option_text(opt)))
 
     issues: dict[str, list[str]] = {}
 

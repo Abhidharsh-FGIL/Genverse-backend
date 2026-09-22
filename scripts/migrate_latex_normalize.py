@@ -31,19 +31,18 @@ from sqlalchemy import select
 
 from app.database import AsyncSessionLocal, engine
 from app.models.assessment import PracticeAssessment
-from app.services.latex_validator import repair_common_latex_issues, validate_questions_latex
-
-
-def _option_text(opt) -> str:
-    if isinstance(opt, dict):
-        return str(opt.get("text", ""))
-    return str(opt) if opt is not None else ""
+from app.services.latex_validator import (
+    repair_common_latex_issues, strip_option_prefix, repair_correct_answer,
+    validate_questions_latex, option_text as _option_text,
+    NO_OPTION_TYPES, OPTION_BEARING_TYPES, CORRECT_ANSWER_STRIP_TYPES,
+)
 
 
 def _repair_question(q: dict) -> tuple[dict, list[str]]:
     """Returns (repaired_question, [field names that actually changed])."""
     changed: list[str] = []
     out = dict(q)
+    q_type = (q.get("type") or "").lower()
 
     text = q.get("text") or ""
     new_text = repair_common_latex_issues(text)
@@ -57,21 +56,31 @@ def _repair_question(q: dict) -> tuple[dict, list[str]]:
         out["explanation"] = new_explanation
         changed.append("explanation")
 
-    for key in ("correct_answer", "correctAnswer"):
-        if key in q and q[key] is not None:
-            original = str(q[key])
-            repaired = repair_common_latex_issues(original)
-            if repaired != original:
-                out[key] = repaired
-                changed.append(key)
-
     opts = q.get("options")
-    if isinstance(opts, list):
+    # Schema consistency: fill/short/long questions must never carry an
+    # options array — same guard added to finalize_generated_questions,
+    # applied retroactively to already-stored data here.
+    original_opt_texts: list[str] | None = None
+    repaired_opt_texts: list[str] | None = None
+    if q_type in NO_OPTION_TYPES and opts is not None:
+        out["options"] = None
+        changed.append("options(nulled: wrong type)")
+    elif isinstance(opts, list):
+        original_opt_texts = [_option_text(opt) for opt in opts]
         new_opts = []
+        repaired_opt_texts = []
         any_opt_changed = False
-        for opt in opts:
+        for i, opt in enumerate(opts):
             original = _option_text(opt)
-            repaired = repair_common_latex_issues(original)
+            repaired = original
+            # Each option's own list position is passed so a leading
+            # "A. "/"1. " is only stripped when it's the label a
+            # duplicate-prefix bug would actually produce at that position —
+            # otherwise genuine content like "A. Einstein" gets corrupted.
+            if q_type in OPTION_BEARING_TYPES:
+                repaired = strip_option_prefix(repaired, i)
+            repaired = repair_common_latex_issues(repaired)
+            repaired_opt_texts.append(repaired)
             if repaired != original:
                 any_opt_changed = True
             if isinstance(opt, dict):
@@ -82,11 +91,26 @@ def _repair_question(q: dict) -> tuple[dict, list[str]]:
             out["options"] = new_opts
             changed.append("options")
 
+    for key in ("correct_answer", "correctAnswer"):
+        if key in q and q[key] is not None:
+            original = str(q[key])
+            repaired = original
+            if q_type in CORRECT_ANSWER_STRIP_TYPES:
+                # Derived from whichever original option it matches (already
+                # fully LaTeX-repaired either way — see repair_correct_answer),
+                # instead of an independent, unguarded strip.
+                repaired = repair_correct_answer(repaired, original_opt_texts, repaired_opt_texts)
+            else:
+                repaired = repair_common_latex_issues(repaired)
+            if repaired != original:
+                out[key] = repaired
+                changed.append(key)
+
     pairs = q.get("pairs")
     if isinstance(pairs, list):
         new_pairs = []
         any_pair_changed = False
-        for pair in pairs:
+        for i, pair in enumerate(pairs):
             if not isinstance(pair, dict):
                 new_pairs.append(pair)
                 continue
@@ -94,7 +118,10 @@ def _repair_question(q: dict) -> tuple[dict, list[str]]:
             for side in ("left", "right"):
                 if side in pair and pair[side] is not None:
                     original = str(pair[side])
-                    repaired = repair_common_latex_issues(original)
+                    # Same position-aware label strip as options (see
+                    # strip_option_prefix) — a match item can carry the same
+                    # duplicate-label artifact an MCQ option does.
+                    repaired = repair_common_latex_issues(strip_option_prefix(original, i))
                     if repaired != original:
                         new_pair[side] = repaired
                         any_pair_changed = True
