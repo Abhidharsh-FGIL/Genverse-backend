@@ -234,3 +234,46 @@ def test_known_limitation_line_break_without_space_outside_environment():
     assert collapse_over_escaped_commands(protected) == protected
     # A following space is also enough:
     assert collapse_over_escaped_commands(r"$$a\\ b$$") == r"$$a\\ b$$"
+
+
+# ── the prompts must never ask the model to double-escape again ──────────────
+
+def test_no_prompt_instructs_double_escaping():
+    r"""A regression guard on the root cause. In the SOURCE file a run of 6+
+    backslashes before a command character means the model is being shown 3+,
+    which decodes to a doubled backslash — the bug."""
+    import re
+    from pathlib import Path
+    src = Path(AIService.__module__.replace(".", "/") + ".py")
+    if not src.exists():
+        src = Path("app/services/ai_service.py")
+    offenders = []
+    for i, line in enumerate(src.read_text(encoding="utf-8").splitlines(), 1):
+        if re.search(r"\\{6,}(?=[A-Za-z,^])", line):
+            offenders.append(f"line {i}: {line.strip()[:120]}")
+    assert not offenders, "prompt instructs over-escaping:\n" + "\n".join(offenders)
+
+
+def test_assessment_prompt_mentions_no_json_escaping():
+    prompt = AIService()._build_assessment_prompt(
+        subject="Physics", topics=["Friction"], grade=11, board="CBSE",
+        difficulty="medium", question_count=3, question_types=["fill"], mode="practice",
+    )
+    lowered = prompt.lower()
+    assert "double-escaped" not in lowered
+    assert "json escaping reminder" not in lowered
+    # ...and it still teaches the conventions we do want:
+    assert r"\theta" in prompt and r"\ce" in prompt and r"\mathrm" in prompt
+
+
+def test_prompt_forbids_blanks_inside_math_spans():
+    r"""Prompt rule 14, added after a real stored question ($4^2 = ___$) was
+    found failing a KaTeX parse: "___" inside math is a subscript operator
+    with nothing to subscript."""
+    prompt = AIService()._build_assessment_prompt(
+        subject="Physics", topics=["Friction"], grade=11, board="CBSE",
+        difficulty="medium", question_count=3, question_types=["fill"], mode="practice",
+    )
+    assert "BLANKS GO OUTSIDE MATH" in prompt
+    assert r"$4^2 = $ ___" in prompt      # the correct form is shown
+    assert r"$4^2 = ___$" in prompt       # ...next to the wrong one

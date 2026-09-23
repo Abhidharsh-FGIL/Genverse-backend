@@ -46,7 +46,13 @@ async def lifespan(app: FastAPI):
     payment_reconciliation_task = asyncio.create_task(run_payment_reconciliation())
     # One-time backfill of study time data (runs in background, doesn't block startup)
     backfill_task = asyncio.create_task(_backfill_study_time_if_needed())
+    # Resolve whether real KaTeX validation is usable now, so a missing Node or
+    # katex package is a visible WARNING at boot and a /health field, rather
+    # than a silent downgrade discovered later. Never blocks startup.
+    from app.services.katex_check import probe as _katex_probe
+    katex_probe_task = asyncio.create_task(_katex_probe())
     yield
+    katex_probe_task.cancel()
     renewal_task.cancel()
     notification_task.cancel()
     stale_attempt_task.cancel()
@@ -105,10 +111,14 @@ async def root():
 @app.get("/health", tags=["Health"])
 async def health_check():
     from app.build_info import build_info
+    from app.services.katex_check import status as katex_status
     # The revision is included here as well as on /version so an existing
     # health check/uptime monitor reports which code is actually running,
-    # without anyone having to call a second endpoint.
-    return {"status": "healthy", **build_info()}
+    # without anyone having to call a second endpoint. katex_validation says
+    # whether generated assessments are being checked with the real KaTeX
+    # parser or only the structural fallback — "unavailable" is a degraded
+    # (not broken) state: generation still works, validation is just weaker.
+    return {"status": "healthy", **build_info(), **katex_status()}
 
 
 @app.get("/version", tags=["Health"])

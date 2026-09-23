@@ -54,7 +54,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.models.assessment import PracticeAssessment
 from app.services.latex_validator import (
     collapse_over_escaped_commands, has_over_escaped_command,
-    extract_math_segments, option_text, _ENV_SPAN_RE,
+    extract_math_segments, option_text, math_environment_spans,
 )
 from app.services.katex_check import check_segments
 
@@ -68,10 +68,9 @@ SCALAR_FIELDS = ("text", "question", "correct_answer", "correctAnswer", "explana
 
 # ─── transformation ──────────────────────────────────────────────────────────
 
-def _env_bodies(text: str) -> list[str]:
-    r"""Every \begin{...}...\end{...} span in `text`, verbatim. Comparing these
-    before and after is what proves no genuine line break was destroyed."""
-    return [m.group(0) for m in _ENV_SPAN_RE.finditer(text)] if text else []
+# Comparing these before and after a transformation is what proves no genuine
+# line break was destroyed; see latex_validator.math_environment_spans.
+_env_bodies = math_environment_spans
 
 
 def collapse_question(q: dict) -> tuple[dict, list[tuple[str, str, str]]]:
@@ -238,7 +237,7 @@ async def do_migration(Session, args, url: str) -> int:
         samples: list[tuple[str, str, str, str, str, str]] = []
         changed_rows: list[tuple] = []          # (assessment, new_question_json)
         backup_rows: list[dict] = []
-        post_segments: dict[str, list[tuple[str, str]]] = {}
+        post_segments: dict[str, list[tuple[str, str, str, bool]]] = {}
         residual: list[str] = []
 
         for a in assessments:
@@ -277,13 +276,18 @@ async def do_migration(Session, args, url: str) -> int:
                             samples.append(
                                 (str(a.id), a.title or "", str(q.get("id")), field, before, after)
                             )
-                    for t in all_text(new_q):
-                        for seg in extract_math_segments(t):
-                            post_segments.setdefault(seg, []).append(
-                                (str(a.id), str(q.get("id")))
-                            )
                     if has_over_escaped_command(" ".join(all_text(new_q))):
                         residual.append(f"assessment {a.id} question {q.get('id')!r}")
+
+                # KaTeX-validate EVERY question's post-transform state, not just
+                # the changed ones. A question this migration did not touch can
+                # still be broken for an unrelated reason, and the point of the
+                # list is "what needs a human", not "what did I break".
+                for t in all_text(new_q):
+                    for seg in extract_math_segments(t):
+                        post_segments.setdefault(seg, []).append(
+                            (str(a.id), a.title or "", str(q.get("id")), bool(changes))
+                        )
                 new_qjson.append(new_q)
 
             if row_changed:
@@ -293,13 +297,14 @@ async def do_migration(Session, args, url: str) -> int:
 
         # Real KaTeX parse of every post-migration math segment.
         katex_errors = await check_segments(list(post_segments))
-        failing: dict[str, list[str]] = {}
+        # (assessment_id, title, question_id, was_changed) -> [error, ...]
+        failing: dict[tuple, list[str]] = {}
         if katex_errors:
             for seg, msg in katex_errors.items():
-                for aid, qid in post_segments.get(seg, []):
-                    failing.setdefault(f"assessment {aid} question {qid}", []).append(
-                        f"{msg[:120]} (segment {seg!r})"
-                    )
+                for owner in post_segments.get(seg, []):
+                    failing.setdefault(owner, []).append(f"{msg[:130]} | segment {seg!r}")
+        failing_assessments = {k[0] for k in failing}
+        failing_changed = {k for k in failing if k[3]}
 
         # ── report ──────────────────────────────────────────────────────────
         print("─" * 78)
@@ -316,7 +321,9 @@ async def do_migration(Session, args, url: str) -> int:
         if katex_errors is None:
             print(f"  questions failing KaTeX        : (checker unavailable — install node+katex)")
         else:
-            print(f"  questions failing KaTeX        : {len(failing)}")
+            print(f"  questions failing KaTeX        : {len(failing)}"
+                  f"  across {len(failing_assessments)} assessment(s)")
+            print(f"     ...of which this migration changed: {len(failing_changed)}")
         print(f"  over-escapes still present     : {len(residual)}  (must be 0)")
         print()
 
@@ -328,11 +335,22 @@ async def do_migration(Session, args, url: str) -> int:
             return 2
 
         if failing:
-            print("Questions still failing a real KaTeX parse after transformation:")
-            for key, msgs in list(failing.items())[:25]:
-                print(f"   {key}")
-                for m in msgs[:2]:
-                    print(f"      {m}")
+            print("─" * 78)
+            print("NEEDS MANUAL REVIEW OR REGENERATION")
+            print("These questions still fail a REAL KaTeX parse after the collapse.")
+            print("This migration cannot fix them — it only un-doubles backslashes.")
+            print("─" * 78)
+            for (aid, title, qid, was_changed) in sorted(failing, key=lambda k: (k[1], k[2])):
+                tag = "changed by this migration" if was_changed else "pre-existing, untouched"
+                print(f"  question id : {qid}")
+                print(f"  assessment  : {aid}  [{title[:50]}]")
+                print(f"  status      : {tag}")
+                for m in failing[(aid, title, qid, was_changed)][:3]:
+                    print(f"  error       : {m}")
+                print()
+            print(f"  TOTAL: {len(failing)} question(s) across "
+                  f"{len(failing_assessments)} assessment(s) need manual attention.")
+            print(f"  Question IDs: {', '.join(sorted(k[2] for k in failing))}")
             print()
 
         if residual:

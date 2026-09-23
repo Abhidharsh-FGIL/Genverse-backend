@@ -1950,6 +1950,7 @@ MATH NOTATION — CRITICAL:
 11. Write LaTeX exactly as you normally would, with a single backslash before every command (\\theta, \\frac, \\ce, \\mathrm, \\circ). Do not think about JSON string escaping at all — that is handled for you.
 12. NEVER use \\( \\) or \\[ \\] delimiters, in ANY field (text, options, correct_answer, explanation) — $...$ and $$...$$ are the ONLY accepted delimiters, with no exceptions. A single question mixing both delimiter styles is INVALID output.
 13. Options contain ONLY the option content itself — never prefix an option with "A.", "B.", "1.", etc.; the option letter/number is assigned by the application, not by you.
+14. BLANKS GO OUTSIDE MATH: the ___ placeholder in a fill-in-the-blank question must never sit inside a $...$ or $$...$$ span. "___" is not valid LaTeX — an underscore there is a subscript operator with nothing to subscript, which is a hard parse error and renders as red error text. Close the math first, then write the blank: correct "$4^2 = $ ___" and "The mass is ___ $\\mathrm{{kg}}$"; WRONG "$4^2 = ___$" and "$m = ___\\,\\mathrm{{kg}}$". The same applies to any blank written as ___ , ____ or \\underline{{}}.
 
 ⚠️ FINAL CHECKS BEFORE OUTPUT:
 1. Verify every "type" field is one of {allowed_types_str}.
@@ -6004,6 +6005,7 @@ MATH NOTATION — CRITICAL:
 11. Write LaTeX exactly as you normally would, with a single backslash before every command (\\theta, \\frac, \\ce, \\mathrm, \\circ). Do not think about JSON string escaping at all — that is handled for you.
 12. NEVER use \\( \\) or \\[ \\] delimiters, in ANY field (text, options, correct_answer, explanation) — $...$ and $$...$$ are the ONLY accepted delimiters, with no exceptions. A single question mixing both delimiter styles is INVALID output.
 13. Options contain ONLY the option content itself — never prefix an option with "A.", "B.", "1.", etc.; the option letter/number is assigned by the application, not by you.
+14. BLANKS GO OUTSIDE MATH: the ___ placeholder in a fill-in-the-blank question must never sit inside a $...$ or $$...$$ span. "___" is not valid LaTeX — an underscore there is a subscript operator with nothing to subscript, which is a hard parse error and renders as red error text. Close the math first, then write the blank: correct "$4^2 = $ ___" and "The mass is ___ $\\mathrm{{kg}}$"; WRONG "$4^2 = ___$" and "$m = ___\\,\\mathrm{{kg}}$". The same applies to any blank written as ___ , ____ or \\underline{{}}.
 
 Return ONLY the raw JSON array. No markdown fences, no explanation text outside the array."""
 

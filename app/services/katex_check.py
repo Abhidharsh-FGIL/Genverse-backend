@@ -23,24 +23,72 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
 _JS = Path(__file__).parent / "js" / "katex_check.js"
 _UNAVAILABLE_LOGGED = False
 _TIMEOUT_SECONDS = 30
+_log = logging.getLogger(__name__)
+
+# Whether real KaTeX validation is usable, resolved by probe() and reported on
+# /health. None means "not probed yet". This is deliberately observable state:
+# the fallback to structural-only checks is silent by design (generation must
+# never break because a validator is missing), and silent degradation that
+# nobody can see is how a weakened safety net goes unnoticed for months.
+_STATUS: dict = {"available": None, "reason": "not probed"}
+
+
+def status() -> dict:
+    """Current KaTeX validation status, for /health."""
+    available = _STATUS["available"]
+    return {
+        "katex_validation": (
+            "active" if available else ("unavailable" if available is False else "unknown")
+        ),
+        "katex_validation_detail": _STATUS["reason"],
+    }
+
+
+def _mark_unavailable(reason: str) -> None:
+    _STATUS.update(available=False, reason=reason)
+
+
+def _mark_available() -> None:
+    _STATUS.update(available=True, reason="real KaTeX parser in use")
 
 
 def _log_unavailable(reason: str) -> None:
     global _UNAVAILABLE_LOGGED
+    _mark_unavailable(reason)
     if not _UNAVAILABLE_LOGGED:
         _UNAVAILABLE_LOGGED = True
-        print(
-            f"[KatexCheck] real KaTeX validation unavailable ({reason}); "
-            f"falling back to structural checks only. Install Node and the "
-            f"katex package, or set KATEX_MODULE_PATH, to enable it.",
-            flush=True,
+        _log.warning(
+            "[KatexCheck] real KaTeX validation UNAVAILABLE (%s). Generated "
+            "assessments will be checked with structural rules only, so a "
+            "question whose math fails a real KaTeX parse can still be saved. "
+            "Install Node and the katex package, or set KATEX_MODULE_PATH, to "
+            "enable it. Generation itself is unaffected.",
+            reason,
         )
+
+
+async def probe() -> dict:
+    """Run one throwaway check so the KaTeX status is known before any
+    assessment is generated, instead of being discovered mid-save. Called at
+    startup; never raises, and never blocks startup on failure."""
+    try:
+        result = await check_segments([r"\theta"])
+    except Exception as e:  # pragma: no cover - defensive
+        _log_unavailable(f"probe raised {type(e).__name__}: {e}")
+        return status()
+    if result is None:
+        # check_segments already logged the specific reason.
+        return status()
+    _mark_available()
+    _log.info("[KatexCheck] real KaTeX validation active")
+    return status()
 
 
 async def check_segments(segments: list[str]) -> dict[str, str] | None:
@@ -90,6 +138,7 @@ async def check_segments(segments: list[str]) -> dict[str, str] | None:
     if not result.get("ok"):
         _log_unavailable(result.get("reason", "unknown"))
         return None
+    _mark_available()
     return result.get("errors") or {}
 
 

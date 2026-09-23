@@ -265,6 +265,16 @@ def collapse_over_escaped_commands(text: str) -> str:
     return result
 
 
+def math_environment_spans(text: str) -> list[str]:
+    r"""Every \begin{env}...\end{env} span in `text`, verbatim, for the
+    line-break environments this module protects. Public because the migration
+    script and its tests compare these before and after a transformation to
+    prove no genuine "\\" row separator was destroyed."""
+    if not text:
+        return []
+    return [m.group(0) for m in _ENV_SPAN_RE.finditer(text)]
+
+
 def has_over_escaped_command(text: str) -> bool:
     """True if `text` still contains a doubled backslash before a LaTeX command
     character inside a math span — the invariant the regression test asserts is
