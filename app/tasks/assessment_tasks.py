@@ -161,6 +161,29 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
 
     _log.info("[Assessment-Celery] After filtering: %d questions passed (from %d raw)", len(question_json), len(raw))
 
+    # A generation that produced nothing is a FAILURE, and must not be reported
+    # as one that succeeded. This used to publish stage="complete" with the
+    # message "0 questions generated successfully!" — the client only showed an
+    # error because it separately noticed question_json was empty, and the logs
+    # recorded the task as succeeded. POST /assessments/generate already raises
+    # 502 in this situation; the two paths disagreed.
+    if not question_json:
+        _log.error(
+            "[Assessment-Celery] Generation produced NO questions (raw=%d). "
+            "Publishing an error rather than a false success.", len(raw),
+        )
+        _publish(r, channel, {
+            "stage": "error",
+            "progress": 0,
+            "message": (
+                "The AI provider did not return any questions. This is usually a "
+                "provider quota or billing limit rather than a problem with your "
+                "request — please try again shortly, and if it persists check the "
+                "AI provider account status."
+            ),
+        })
+        return
+
     # Stage 3: Complete
     _publish(r, channel, {
         "stage": "complete",

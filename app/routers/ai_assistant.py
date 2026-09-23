@@ -1658,6 +1658,13 @@ async def generate_practice_assessment_stream(
                     question_json, answer_key_json, allowed_types
                 )
 
+                # Same rule as the Celery path: nothing generated is an error,
+                # not a "complete" with a success message.
+                if not question_json:
+                    yield f"data: {json.dumps({'stage': 'error', 'progress': 0, 'message': 'The AI provider did not return any questions. This is usually a provider quota or billing limit rather than a problem with your request — please try again shortly, and if it persists check the AI provider account status.'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
                 yield f"data: {json.dumps({'stage': 'complete', 'progress': 100, 'message': f'{len(question_json)} questions generated successfully!', 'question_json': question_json, 'answer_key_json': answer_key_json})}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as exc:

@@ -2162,19 +2162,60 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             "response_schema": array_schema,
         })
 
+        # Pass 1 preferentially uses Gemini's structured output (response_schema),
+        # which constrains the JSON shape far better than prompting alone. But it
+        # is ONE provider: this path used to `return []` the moment Gemini raised,
+        # with no fallback at all, so a Gemini outage or a billing 402 took out
+        # every JEE/NEET generation while the standard path — which goes through
+        # self.chat() and its Gemini -> OpenAI -> Anthropic chain — kept working.
+        # Observed in production as "402 RESOURCE_EXHAUSTED ... prepayment credits
+        # are depleted" followed by a 2.3-second task that reported success with
+        # zero questions.
         raw_text = ""
+        failure_reason = ""
         try:
             client = self._get_gemini_async()
             if client:
                 resp = await _gemini_generate_with_retry(client, settings.AI_PRIMARY_MODEL, prompt, cfg)
                 raw_text = resp.text or ""
+            else:
+                # Previously silent: raw_text stayed "" and the function returned
+                # [] with nothing logged at all, so a missing key looked identical
+                # to the model returning nothing.
+                failure_reason = "no Gemini client configured"
+                print(f"[ExamAssessment:{exam_type}] Pass 1 skipped: {failure_reason}", flush=True)
         except Exception as e:
-            print(f"[ExamAssessment:{exam_type}] Pass 1 failed: {type(e).__name__}: {e}", flush=True)
-            return []
+            failure_reason = f"{type(e).__name__}: {e}"
+            print(f"[ExamAssessment:{exam_type}] Pass 1 failed: {failure_reason}", flush=True)
 
         questions = self._extract_json_array(raw_text)
+
         if not questions:
-            print(f"[ExamAssessment:{exam_type}] Pass 1 returned no parseable questions", flush=True)
+            # Fall back to the same multi-provider chat() the standard assessment
+            # path uses. It cannot enforce response_schema on OpenAI/Anthropic, but
+            # the prompt already specifies the JSON shape and _extract_json_array
+            # parses it — exactly how the standard path has always worked. Slightly
+            # less constrained output beats no assessment at all.
+            print(
+                f"[ExamAssessment:{exam_type}] Pass 1 produced nothing"
+                f"{f' ({failure_reason})' if failure_reason else ''}; "
+                f"falling back to the multi-provider chat path",
+                flush=True,
+            )
+            try:
+                fallback_text = await self.chat([{"role": "user", "content": prompt}])
+                questions = self._extract_json_array(fallback_text)
+            except Exception as e:
+                print(f"[ExamAssessment:{exam_type}] Fallback also failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                questions = []
+            if questions:
+                print(f"[ExamAssessment:{exam_type}] Fallback recovered "
+                      f"{len(questions)} question(s)", flush=True)
+
+        if not questions:
+            print(f"[ExamAssessment:{exam_type}] No parseable questions from any "
+                  f"provider; giving up", flush=True)
             return []
 
         # ── Pass 2: generate images for whichever questions/options were flagged.
