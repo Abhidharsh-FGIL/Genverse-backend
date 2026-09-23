@@ -2423,59 +2423,126 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 "explanation": repair_common_latex_issues(q.get("explanation", "")),
             })
 
+        # The ONE validation gate (app/services/question_validation.py), shared
+        # with every other path that can persist questions so none of them can
+        # be bypassed. Validation runs over the merged view so the answer key's
+        # correct_answer/explanation are checked too, then the flags are copied
+        # back onto the question objects that actually get stored.
         try:
-            from app.services.latex_validator import (
-                validate_questions_latex, has_over_escaped_command,
-            )
-            from app.services.katex_check import check_question_fields
-            # Validate against answer_key_json's explanation/correct_answer too,
-            # not just question_json's stem/options — merge them per id so the
-            # validator sees the full set of fields shown anywhere in the UI.
+            from app.services.question_validation import validate_and_flag
             merged = [
                 {**qj, "correct_answer": ak["correctAnswer"], "explanation": ak["explanation"]}
                 for qj, ak in zip(question_json, answer_key_json)
             ]
-            issues = await validate_questions_latex(merged)
-
-            # A real KaTeX parse of every math segment. This catches what the
-            # structural checks cannot (e.g. "37^\\circ", a hard parse error),
-            # and the over-escape detector below catches what KaTeX cannot
-            # ("$\\theta$" parses fine as a line break plus the word "theta",
-            # so it renders wrong without ever raising). The two are
-            # complementary and both are needed.
-            for qid, msgs in (await check_question_fields(merged)).items():
-                issues.setdefault(qid, []).extend(msgs)
-
-            for q in merged:
-                qid = str(q.get("id") or "")
-                for field in ("text", "correct_answer", "explanation"):
-                    if has_over_escaped_command(str(q.get(field) or "")):
-                        issues.setdefault(qid, []).append(
-                            f"over-escaped LaTeX backslash survived repair in {field}"
-                        )
-                for i, opt in enumerate(q.get("options") or []):
-                    if has_over_escaped_command(option_text(opt)):
-                        issues.setdefault(qid, []).append(
-                            f"over-escaped LaTeX backslash survived repair in option[{i}]"
-                        )
-
-            # Never save silently broken content: mark the question so the UI
-            # can show a review badge instead of rendering corruption as if it
-            # were fine. Flagged questions are kept, not dropped — silently
-            # shrinking an assessment is worse, and a flagged question still
-            # renders as visible raw text rather than crashing.
-            flagged = {qid: msgs for qid, msgs in issues.items() if msgs}
+            merged, stats = await validate_and_flag(
+                merged, repair=False, context="generation/finalize",
+            )
+            by_id = {str(m.get("id") or ""): m for m in merged}
             for q in question_json:
-                msgs = flagged.get(str(q.get("id") or ""))
-                if msgs:
+                m = by_id.get(str(q.get("id") or ""))
+                if m and m.get("needs_review"):
                     q["needs_review"] = True
-                    q["review_reason"] = "; ".join(msgs)[:500]
-            for qid, msgs in flagged.items():
-                print(f"[LatexValidator] question {qid} FLAGGED FOR REVIEW: {'; '.join(msgs)}", flush=True)
+                    q["review_reason"] = m.get("review_reason")
         except Exception as e:
-            print(f"[LatexValidator] validation pass failed, skipping: {type(e).__name__}: {e}", flush=True)
+            import logging as _logging
+            _logging.getLogger(__name__).exception(
+                "[LatexValidator] validation pass failed, skipping: %s: %s",
+                type(e).__name__, e,
+            )
 
         return question_json, answer_key_json
+
+    @staticmethod
+    def _build_latex_repair_prompt(broken: list) -> str:
+        """The shared retry prompt. Pins everything except the notation: a
+        flagged question is a formatting failure, not a pedagogy failure, so
+        silently swapping in differently-worded content would change the
+        assessment the teacher configured."""
+        return (
+            "The LaTeX notation in the following assessment questions is malformed. "
+            "Each question carries a \"_problem\" field describing what a real KaTeX "
+            "parse found wrong with it.\n\n"
+            "Rewrite ONLY the mathematical notation so every expression parses in KaTeX. "
+            "Keep each question's meaning, wording, difficulty, options, correct answer, "
+            "id, type, subtype, marks and blooms_level EXACTLY as they are — change "
+            "nothing but the notation.\n\n"
+            "If a field contains stray control characters or obviously truncated/garbled "
+            "text, reconstruct the intended expression from the rest of the question "
+            "(its answer and explanation usually show what it should have been).\n\n"
+            "LaTeX conventions:\n"
+            "- Inline math in $...$, display math in $$...$$; every $ must be closed.\n"
+            "- Never put two math spans next to each other with no separator "
+            "(\"$^{10}$$\\ce{B}$\" is wrong — write \"$^{10}\\ce{B}$\").\n"
+            "- One backslash before each command: \\theta, \\frac{a}{b}, \\circ, \\cos, \\sqrt{x}.\n"
+            "- Chemistry uses \\ce{...}, e.g. $\\ce{H2SO4}$.\n"
+            "- Units use a thin space then \\mathrm{}, e.g. $5\\,\\mathrm{kg}$.\n"
+            "- A fill-in-the-blank ___ goes OUTSIDE math: \"$4^2 = $ ___\", never \"$4^2 = ___$\".\n"
+            "- Never use Unicode math characters (\u03b8, \u03c0, \u00b2) \u2014 use LaTeX instead.\n\n"
+            "Return ONLY a JSON array of the corrected question objects, dropping the "
+            "\"_problem\" field. No markdown fences, no commentary.\n\n"
+            f"{json.dumps(broken, ensure_ascii=False, indent=1)}"
+        )
+
+    async def repair_flagged_raw_questions(self, questions: list, max_attempts: int = 2) -> list:
+        """Retry for paths that keep the model's own question shape (correct_answer/
+        marks in the question object) rather than the split question_json/answer_key
+        pair — currently POST /assessments/generate, i.e. the Daily Challenge.
+
+        Same contract as repair_flagged_questions: notation only, bounded attempts,
+        and anything still broken keeps needs_review and is saved WITH the flag
+        rather than dropped.
+        """
+        from app.services.question_validation import validate_and_flag
+        import logging as _logging
+        log = _logging.getLogger(__name__)
+
+        for attempt in range(1, max_attempts + 1):
+            flagged_idx = [i for i, q in enumerate(questions)
+                           if isinstance(q, dict) and q.get("needs_review")]
+            if not flagged_idx:
+                break
+            log.info("[LatexRepair] raw-shape attempt %d for %d flagged question(s)",
+                     attempt, len(flagged_idx))
+
+            broken = []
+            for i in flagged_idx:
+                q = dict(questions[i])
+                q["_problem"] = q.pop("review_reason", "")
+                q.pop("needs_review", None)
+                broken.append(q)
+
+            try:
+                response = await self.chat(
+                    [{"role": "user", "content": self._build_latex_repair_prompt(broken)}]
+                )
+                rewritten = self._extract_json_array(response)
+            except Exception as e:
+                log.warning("[LatexRepair] attempt %d failed: %s: %s", attempt, type(e).__name__, e)
+                break
+            if not rewritten:
+                log.warning("[LatexRepair] attempt %d returned nothing parseable", attempt)
+                break
+
+            rewritten, _ = await validate_and_flag(
+                [q for q in rewritten if isinstance(q, dict)],
+                context=f"latex-repair-retry attempt {attempt}",
+            )
+            by_id = {str(q.get("id")): q for q in rewritten}
+            for i in flagged_idx:
+                candidate = by_id.get(str(questions[i].get("id")))
+                if candidate and not candidate.get("needs_review"):
+                    questions[i] = candidate
+                    log.info("[LatexRepair] question %s repaired on attempt %d",
+                             questions[i].get("id"), attempt)
+
+        for q in questions:
+            if isinstance(q, dict) and q.get("needs_review"):
+                log.warning(
+                    "[LatexRepair] question %s still flagged after %d attempt(s); "
+                    "saving WITH needs_review: %s",
+                    q.get("id"), max_attempts, str(q.get("review_reason"))[:200],
+                )
+        return questions
 
     async def repair_flagged_questions(
         self,
@@ -2520,24 +2587,7 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                     "_problem": q.get("review_reason"),
                 })
 
-            prompt = (
-                "The LaTeX notation in the following assessment questions is malformed. "
-                "Each question carries a \"_problem\" field describing what a real KaTeX "
-                "parse found wrong with it.\n\n"
-                "Rewrite ONLY the mathematical notation so every expression parses in KaTeX. "
-                "Keep each question's meaning, wording, difficulty, options, correct answer, "
-                "id, type, subtype, marks and blooms_level EXACTLY as they are — change "
-                "nothing but the notation.\n\n"
-                "LaTeX conventions:\n"
-                "- Inline math in $...$, display math in $$...$$; every $ must be closed.\n"
-                "- One backslash before each command: \\theta, \\frac{a}{b}, \\circ, \\cos, \\sqrt{x}.\n"
-                "- Chemistry uses \\ce{...}, e.g. $\\ce{H2SO4}$.\n"
-                "- Units use a thin space then \\mathrm{}, e.g. $5\\,\\mathrm{kg}$.\n"
-                "- Never use Unicode math characters (\u03b8, \u03c0, \u00b2) \u2014 use LaTeX instead.\n\n"
-                "Return ONLY a JSON array of the corrected question objects, dropping the "
-                "\"_problem\" field. No markdown fences, no commentary.\n\n"
-                f"{json.dumps(broken, ensure_ascii=False, indent=1)}"
-            )
+            prompt = self._build_latex_repair_prompt(broken)
 
             try:
                 response = await self.chat([{"role": "user", "content": prompt}])

@@ -24,7 +24,10 @@ surface flagged questions.
 """
 from __future__ import annotations
 
+import logging
 import re
+
+_log = logging.getLogger(__name__)
 
 # The ONE definition of which question types carry an "options"
 # array/correct_answer that needs label-stripping, shared by every caller
@@ -244,24 +247,81 @@ def _collapse_in_math_segment(segment: str) -> str:
     return "".join(out)
 
 
+# ─── Math-span protection: sentinels and SAFE restoration ────────────────────
+#
+# Several repairs below work only on the text OUTSIDE math spans, so the spans
+# are swapped for sentinels, the repair runs, and the spans are put back.
+#
+# Restoring this naively destroys content, and did so in production. The two
+# protection passes run in sequence — display math first, then inline — so an
+# inline span can end up CONTAINING a display sentinel. That happens whenever
+# the model writes two adjacent inline spans with no separator ("$^{10}$$\ce{B}$"):
+# the "$$" in the middle is read as display math, matched greedily to the next
+# "$$", and everything between is swallowed into one sentinel; the surrounding
+# "$...$" is then protected as a second, OUTER sentinel that contains the first.
+#
+# Restoring forward with str.replace(..., 1) then silently fails: by the time
+# the loop reaches the inner sentinel it is no longer in `result` at all (it is
+# nested inside a later entry), so the replace is a no-op, and the outer
+# restore re-inserts text that still carries the raw \x02...\x03 bytes. The
+# stored question then contains literal control characters, KaTeX refuses it,
+# and the swallowed text is gone for good.
+#
+# Restoring in REVERSE index order fixes the nesting (an outer sentinel always
+# has a higher index than the inner one it contains), and the loop repeats
+# until no sentinel remains in case of deeper nesting. `assert_no_sentinels`
+# is the backstop: these functions must NEVER return text containing a
+# sentinel, so a caller that cannot fully restore returns its input untouched
+# rather than emitting corruption.
+_SENTINEL_START = "\x02"
+_SENTINEL_END = "\x03"
+
+
+def contains_sentinel(text: str) -> bool:
+    """True if `text` carries a raw protection sentinel. In stored content this
+    always means a previous repair corrupted it (see above)."""
+    return bool(text) and (_SENTINEL_START in text or _SENTINEL_END in text)
+
+
+def _restore_protected(result: str, protected: list[str], prefix: str) -> str:
+    """Put protected spans back, innermost-last, repeating until stable."""
+    for _ in range(len(protected) + 1):
+        if _SENTINEL_START not in result:
+            break
+        for i in range(len(protected) - 1, -1, -1):
+            result = result.replace(f"{_SENTINEL_START}{prefix}{i}{_SENTINEL_END}",
+                                    protected[i])
+    return result
+
+
 def collapse_over_escaped_commands(text: str) -> str:
     """Collapse "\\\\theta" -> "\\theta" (and \\, \\circ, \\cos, \\mathrm, ...)
     inside math spans only, preserving genuine LaTeX line breaks."""
     if not text or "\\\\" not in text:
+        return text
+    if contains_sentinel(text):
+        # Already carries control characters from an earlier failed restore —
+        # running sentinel-based protection over it would compound the damage.
         return text
 
     segments: list[str] = []
 
     def _protect(m: re.Match) -> str:
         segments.append(_collapse_in_math_segment(m.group(0)))
-        return f"\x02C{len(segments) - 1}\x03"
+        return f"{_SENTINEL_START}C{len(segments) - 1}{_SENTINEL_END}"
 
     # Display math first, so its "$" characters can't be mistaken for inline
     # delimiters by the second pass (same ordering extract_math_segments uses).
     result = _DISPLAY_RE.sub(_protect, text)
     result = _INLINE_RE.sub(_protect, result)
-    for i, seg in enumerate(segments):
-        result = result.replace(f"\x02C{i}\x03", seg, 1)
+    result = _restore_protected(result, segments, "C")
+    if contains_sentinel(result):
+        _log.error(
+            "[LatexValidator] collapse_over_escaped_commands could not restore "
+            "every protected span; returning the input unchanged rather than "
+            "emitting control characters. input=%r", text[:200],
+        )
+        return text
     return result
 
 
@@ -297,6 +357,16 @@ def repair_common_latex_issues(text: str) -> str:
     any math span."""
     if not text:
         return text
+    if contains_sentinel(text):
+        # Already-corrupted content (control characters from an earlier failed
+        # restore). Repairing it is not possible — the swallowed text is gone —
+        # and protecting it again would only nest more sentinels. Leave it for
+        # the validator to flag and a human to regenerate.
+        _log.warning(
+            "[LatexValidator] input already contains protection sentinels "
+            "(previously corrupted); leaving it unchanged: %r", text[:200],
+        )
+        return text
 
     result = repair_unbalanced_leading_dollar(text)
     result = _collapse_stray_triple_dollar(result)
@@ -313,15 +383,21 @@ def repair_common_latex_issues(text: str) -> str:
 
     def _protect(m: re.Match) -> str:
         protected.append(m.group(0))
-        return f"\x02P{len(protected) - 1}\x03"
+        return f"{_SENTINEL_START}P{len(protected) - 1}{_SENTINEL_END}"
 
     result = _DISPLAY_RE.sub(_protect, result)
     result = _INLINE_RE.sub(_protect, result)
     # Whatever's left is outside any math span — a literal \% here is prose
     # that over-escaped a percent sign, not valid TeX.
     result = result.replace("\\%", "%")
-    for i, original in enumerate(protected):
-        result = result.replace(f"\x02P{i}\x03", original, 1)
+    result = _restore_protected(result, protected, "P")
+    if contains_sentinel(result):
+        _log.error(
+            "[LatexValidator] repair_common_latex_issues could not restore every "
+            "protected span; returning the input unchanged rather than emitting "
+            "control characters. input=%r", text[:200],
+        )
+        return text
 
     return result
 
@@ -407,6 +483,31 @@ def option_text(opt) -> str:
     return str(opt) if opt is not None else ""
 
 
+# C0 control characters that must never appear in question content. \t, \n and
+# \r are legitimate (a multi-line stem), everything else is corruption:
+#   - \x02/\x03 are this module's own protection sentinels, left behind by a
+#     failed restore (see _restore_protected).
+#   - \x08, \x0c, \x0b are what json.loads() produces from a LaTeX command that
+#     was under-escaped in the model's JSON ("\begin" -> backspace + "egin",
+#     "\frac" -> form-feed + "rac").
+# Either way the text is broken in a way KaTeX rejects, and this check finds it
+# with no Node/katex dependency at all — which matters, because the structural
+# checks are the only ones that still run when real KaTeX validation is
+# unavailable, and they were previously blind to this entire class.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def has_control_characters(text: str) -> bool:
+    """True if `text` contains a C0 control character other than tab/newline/CR."""
+    return bool(text) and bool(_CONTROL_CHAR_RE.search(text))
+
+
+def describe_control_characters(text: str) -> str:
+    """Human-readable list of the offending code points, for the log/flag."""
+    found = sorted({ord(c) for c in _CONTROL_CHAR_RE.findall(text or "")})
+    return ", ".join(f"U+{cp:04X}" for cp in found)
+
+
 async def validate_questions_latex(questions: list[dict]) -> dict[str, list[str]]:
     """Returns {question_id: [issue, ...]} for every question with a LaTeX
     problem in text/options/correct_answer/explanation. Empty dict means
@@ -429,6 +530,13 @@ async def validate_questions_latex(questions: list[dict]) -> dict[str, list[str]
     issues: dict[str, list[str]] = {}
 
     for qid, field, text in field_texts:
+        if has_control_characters(text):
+            issues.setdefault(qid, []).append(
+                f"control characters ({describe_control_characters(text)}) in {field} — "
+                f"content is corrupted and text may have been lost; regenerate this "
+                f"question rather than editing it: {text[:120]!r}"
+            )
+
         if has_unbalanced_dollar(text):
             issues.setdefault(qid, []).append(f"unbalanced $ delimiter in {field}: {text!r}")
 

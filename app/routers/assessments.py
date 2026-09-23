@@ -121,6 +121,20 @@ async def generate_assessment(payload: GenerateAssessmentRequest, current_user: 
             detail="The AI couldn't generate questions right now. Please try again in a moment.",
         )
 
+    # This endpoint used to persist raw model output with NO repair and NO
+    # validation of any kind — the only generation path that did. It keeps its
+    # own question shape on purpose (the Daily Challenge quiz reads
+    # correct_answer/marks straight out of question_json), so it runs the shared
+    # validation gate rather than finalize_generated_questions, which reshapes.
+    from app.services.question_validation import validate_and_flag
+    questions, _stats = await validate_and_flag(
+        questions, context=f"POST /assessments/generate user={current_user.id}",
+    )
+    if _stats["flagged"]:
+        # Same repair retry the SSE/Celery paths run, so a flagged question gets
+        # a chance to be fixed here too instead of being saved broken.
+        questions = await ai.repair_flagged_raw_questions(questions)
+
     assessment = PracticeAssessment(
         created_by=current_user.id,
         org_id=_parse_org_id(payload.org_id),
@@ -356,6 +370,16 @@ async def daily_challenge_history(
 @router.post("/", response_model=AssessmentResponse, status_code=status.HTTP_201_CREATED)
 async def save_assessment(payload: AssessmentSaveRequest, current_user: CurrentUser, db: DBSession):
     """Save a reviewed/edited set of questions to the library (no AI generation)."""
+    # Accepts questions straight from the client (the review screen's Save),
+    # so it is a persistence path like any other and must not be able to store
+    # unvalidated content. repair=True because a human may have hand-edited the
+    # LaTeX here; flags set by generation are preserved and re-evaluated.
+    from app.services.question_validation import validate_and_flag
+    validated_questions, _stats = await validate_and_flag(
+        list(payload.questions or []),
+        context=f"POST /assessments save user={current_user.id}",
+    )
+
     assessment = PracticeAssessment(
         created_by=current_user.id,
         org_id=_parse_org_id(payload.org_id),
@@ -367,7 +391,7 @@ async def save_assessment(payload: AssessmentSaveRequest, current_user: CurrentU
         difficulty=payload.difficulty,
         mode=payload.mode,
         question_count=len(payload.questions),
-        question_json=payload.questions,
+        question_json=validated_questions,
         time_limit=payload.time_limit,
         negative_marking=payload.negative_marking,
         negative_mark_value=payload.negative_mark_value,
@@ -801,6 +825,17 @@ async def update_assessment(assessment_id: uuid.UUID, payload: dict, current_use
     assessment = result.scalar_one_or_none()
     if not assessment:
         raise NotFoundException("Assessment not found")
+
+    # Same gate as every other persistence path — an edit is just another way
+    # to store questions, and it must not be able to write content that a fresh
+    # generation would have been flagged for.
+    if isinstance(payload.get("question_json"), list):
+        from app.services.question_validation import validate_and_flag
+        payload = dict(payload)
+        payload["question_json"], _stats = await validate_and_flag(
+            list(payload["question_json"]),
+            context=f"PATCH /assessments/{assessment_id} user={current_user.id}",
+        )
 
     allowed_fields = {
         "title", "subject", "difficulty", "mode", "question_json",

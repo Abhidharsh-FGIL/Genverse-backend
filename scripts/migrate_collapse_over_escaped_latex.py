@@ -55,6 +55,7 @@ from app.models.assessment import PracticeAssessment
 from app.services.latex_validator import (
     collapse_over_escaped_commands, has_over_escaped_command,
     extract_math_segments, option_text, math_environment_spans,
+    has_control_characters, describe_control_characters,
 )
 from app.services.katex_check import check_segments
 
@@ -239,6 +240,7 @@ async def do_migration(Session, args, url: str) -> int:
         backup_rows: list[dict] = []
         post_segments: dict[str, list[tuple[str, str, str, bool]]] = {}
         residual: list[str] = []
+        corrupted: list[tuple] = []
 
         for a in assessments:
             qjson = a.question_json
@@ -278,6 +280,22 @@ async def do_migration(Session, args, url: str) -> int:
                             )
                     if has_over_escaped_command(" ".join(all_text(new_q))):
                         residual.append(f"assessment {a.id} question {q.get('id')!r}")
+
+                # Control characters mean an earlier repair pass corrupted this
+                # question (a stranded \x02P<n>\x03 protection sentinel) and
+                # SWALLOWED text in the process. That loss is not recoverable
+                # from the stored row, so this is reported as a separate
+                # category: these need regenerating, not migrating.
+                for field, value in [(f, v) for f, v in
+                                     [(k, q.get(k)) for k in
+                                      ("text", "question", "correct_answer",
+                                       "correctAnswer", "explanation")]
+                                     if isinstance(v, str)]:
+                    if has_control_characters(value):
+                        corrupted.append((
+                            str(a.id), a.title or "", str(q.get("id")), field,
+                            describe_control_characters(value), value[:140],
+                        ))
 
                 # KaTeX-validate EVERY question's post-transform state, not just
                 # the changed ones. A question this migration did not touch can
@@ -325,6 +343,9 @@ async def do_migration(Session, args, url: str) -> int:
                   f"  across {len(failing_assessments)} assessment(s)")
             print(f"     ...of which this migration changed: {len(failing_changed)}")
         print(f"  over-escapes still present     : {len(residual)}  (must be 0)")
+        corrupted_qids = {(c[0], c[2]) for c in corrupted}
+        print(f"  CORRUPTED (control characters) : {len(corrupted_qids)} question(s)"
+              f"  <- unrecoverable, needs regeneration")
         print()
 
         if env_violations:
@@ -357,6 +378,24 @@ async def do_migration(Session, args, url: str) -> int:
             print("Questions STILL containing an over-escaped backslash:")
             for r in residual[:25]:
                 print(f"   {r}")
+            print()
+
+        if corrupted:
+            print("─" * 78)
+            print("CORRUPTED — TEXT WAS LOST, REGENERATION REQUIRED")
+            print("These carry stray control characters from an earlier repair pass that")
+            print("failed to restore a protected math span. The swallowed text is GONE")
+            print("from the stored row, so no migration can recover it — regenerate the")
+            print("question. (The bug that caused this is fixed; see latex_validator.)")
+            print("─" * 78)
+            for aid, title, qid, field, codes, preview in corrupted[:25]:
+                print(f"  question id : {qid}   field: {field}   chars: {codes}")
+                print(f"  assessment  : {aid}  [{title[:50]}]")
+                print(f"  content     : {preview!r}")
+                print()
+            print(f"  TOTAL: {len(corrupted_qids)} question(s) across "
+                  f"{len({c[0] for c in corrupted})} assessment(s).")
+            print(f"  Question IDs: {', '.join(sorted({c[2] for c in corrupted}))}")
             print()
 
         if samples:
