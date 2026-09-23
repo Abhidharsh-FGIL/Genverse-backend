@@ -183,3 +183,62 @@ async def test_retry_keeps_the_flag_when_the_model_cannot_fix_it(monkeypatch):
     out = await AIService().repair_flagged_raw_questions(questions, max_attempts=2)
     assert len(out) == 1, "must be kept, not dropped"
     assert out[0]["needs_review"] is True
+
+
+# ── the marker is now visible, and must still never leak ─────────────────────
+
+from app.services.latex_validator import _sentinel, _SENTINEL_OPEN  # noqa: E402
+
+REPORTED_STEM = (
+    r"Naturally occurring boron consists of two isotopes, $^{10}$$\ce{B}$ "
+    r"(atomic mass = $10.01\,\mathrm{u}$) and $^{11}$$\ce{B}$ "
+    r"(atomic mass = $11.01\,\mathrm{u}$)."
+)
+
+# Anything a C0 control character check would catch, for the "never emit an
+# invisible byte" assertion.
+import re as _re  # noqa: E402
+_CONTROL_RE = _re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def test_the_marker_is_visible_not_a_control_character():
+    r"""A leak must be obvious in a diff, a log and on screen — the whole
+    reason the old \x02/\x03 scheme hid this bug for so long."""
+    marker = _sentinel("P", 0)
+    assert marker == "⟦PROTECT:P0⟧"
+    assert not _CONTROL_RE.search(marker)
+    assert marker.isprintable()
+
+
+@pytest.mark.parametrize("src", [
+    REPORTED_STEM,
+    r"$^{10}$$\ce{B}$",
+    r"$^{10}\ce{B}$ and $^{11}\ce{B}$",
+    r"$\ce{H2SO4}$ reacts with $\ce{NaHCO3}$",
+    r"$\frac{\ce{H2O}}{\ce{CO2}}$",
+    r"$a$$b$$c$$d$",
+    r"$A = \begin{pmatrix} 2 & 3 \\ 1 & 4 \end{pmatrix}$",
+    r"$f(x) = \begin{cases} x^2 & x \ge 0 \\ -x & x < 0 \end{cases}$",
+    r"50% of $\ce{NaCl}$ and $x^2$",
+    "plain prose, no math at all",
+])
+def test_no_marker_and_no_control_character_ever_reaches_the_output(src):
+    for fn in (repair_common_latex_issues, collapse_over_escaped_commands):
+        out = fn(src)
+        assert _SENTINEL_OPEN not in out, f"{fn.__name__} leaked a marker: {out!r}"
+        assert not contains_sentinel(out), f"{fn.__name__} leaked: {out!r}"
+        assert not _CONTROL_RE.search(out), f"{fn.__name__} emitted a control char: {out!r}"
+
+
+def test_the_reported_stem_keeps_both_isotopes():
+    out = repair_common_latex_issues(REPORTED_STEM)
+    assert "^{11}" in out, "the second isotope must not be swallowed"
+    assert "10.01" in out and "11.01" in out
+    assert out == REPORTED_STEM
+
+
+def test_detection_covers_both_the_new_and_legacy_marker_forms():
+    assert contains_sentinel("a⟦PROTECT:P0⟧b")
+    assert contains_sentinel("a\x02P0\x03b")          # legacy, still in stored data
+    assert not contains_sentinel(r"$\theta$ normal text")
+    assert not contains_sentinel("")

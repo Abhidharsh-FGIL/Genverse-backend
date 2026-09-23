@@ -273,24 +273,45 @@ def _collapse_in_math_segment(segment: str) -> str:
 # is the backstop: these functions must NEVER return text containing a
 # sentinel, so a caller that cannot fully restore returns its input untouched
 # rather than emitting corruption.
-_SENTINEL_START = "\x02"
-_SENTINEL_END = "\x03"
+# The marker is deliberately VISIBLE. It used to be the control characters
+# \x02 and \x03, which meant a leak was invisible: the stored question looked
+# fine in a diff, in a log and in most terminals, and only surfaced as garbage
+# on screen ("\u00b9\u2070\u010e002P0\u010e003B") long after it was saved. Mathematical white
+# square brackets are effectively absent from real assessment content, cannot
+# appear in LaTeX, are not regex-special, and — the point — a leak is obvious
+# at a glance anywhere the text is looked at. KaTeX also rejects them outright
+# ("Unexpected character"), so a leak that does escape is caught rather than
+# silently rendered.
+_SENTINEL_OPEN = "\u27e6PROTECT:"
+_SENTINEL_CLOSE = "\u27e7"
+
+# Legacy control-character sentinels from before this scheme existed. Stored
+# data still carries them, so detection has to recognise both forms.
+_LEGACY_SENTINEL_CHARS = ("\x02", "\x03")
+
+
+def _sentinel(prefix: str, index: int) -> str:
+    return f"{_SENTINEL_OPEN}{prefix}{index}{_SENTINEL_CLOSE}"
 
 
 def contains_sentinel(text: str) -> bool:
-    """True if `text` carries a raw protection sentinel. In stored content this
+    """True if `text` carries a protection marker, in either the current
+    visible form or the legacy control-character form. In stored content this
     always means a previous repair corrupted it (see above)."""
-    return bool(text) and (_SENTINEL_START in text or _SENTINEL_END in text)
+    if not text:
+        return False
+    if _SENTINEL_OPEN in text or _SENTINEL_CLOSE in text:
+        return True
+    return any(c in text for c in _LEGACY_SENTINEL_CHARS)
 
 
 def _restore_protected(result: str, protected: list[str], prefix: str) -> str:
     """Put protected spans back, innermost-last, repeating until stable."""
     for _ in range(len(protected) + 1):
-        if _SENTINEL_START not in result:
+        if _SENTINEL_OPEN not in result:
             break
         for i in range(len(protected) - 1, -1, -1):
-            result = result.replace(f"{_SENTINEL_START}{prefix}{i}{_SENTINEL_END}",
-                                    protected[i])
+            result = result.replace(_sentinel(prefix, i), protected[i])
     return result
 
 
@@ -308,7 +329,7 @@ def collapse_over_escaped_commands(text: str) -> str:
 
     def _protect(m: re.Match) -> str:
         segments.append(_collapse_in_math_segment(m.group(0)))
-        return f"{_SENTINEL_START}C{len(segments) - 1}{_SENTINEL_END}"
+        return _sentinel("C", len(segments) - 1)
 
     # Display math first, so its "$" characters can't be mistaken for inline
     # delimiters by the second pass (same ordering extract_math_segments uses).
@@ -383,7 +404,7 @@ def repair_common_latex_issues(text: str) -> str:
 
     def _protect(m: re.Match) -> str:
         protected.append(m.group(0))
-        return f"{_SENTINEL_START}P{len(protected) - 1}{_SENTINEL_END}"
+        return _sentinel("P", len(protected) - 1)
 
     result = _DISPLAY_RE.sub(_protect, result)
     result = _INLINE_RE.sub(_protect, result)

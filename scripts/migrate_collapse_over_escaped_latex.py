@@ -55,7 +55,7 @@ from app.models.assessment import PracticeAssessment
 from app.services.latex_validator import (
     collapse_over_escaped_commands, has_over_escaped_command,
     extract_math_segments, option_text, math_environment_spans,
-    has_control_characters, describe_control_characters,
+    has_control_characters, describe_control_characters, contains_sentinel,
 )
 from app.services.katex_check import check_segments
 
@@ -64,6 +64,11 @@ from app.services.katex_check import check_segments
 # correct_answer/explanation, while the frontend's edit-save path writes
 # correctAnswer, so a migration that knew only one spelling would silently
 # skip every question that had been edited (or every one that had not).
+# Either marker form, so a leak is reported whichever scheme produced it.
+_PLACEHOLDER_PATTERN = re.compile(
+    "\u27e6PROTECT:[A-Z]?\\d+\u27e7" "|" "\x02[A-Z]?\\d+\x03"
+)
+
 SCALAR_FIELDS = ("text", "question", "correct_answer", "correctAnswer", "explanation")
 
 
@@ -291,10 +296,18 @@ async def do_migration(Session, args, url: str) -> int:
                                       ("text", "question", "correct_answer",
                                        "correctAnswer", "explanation")]
                                      if isinstance(v, str)]:
-                    if has_control_characters(value):
+                    if has_control_characters(value) or contains_sentinel(value):
+                        # Name the shape so the remedy is obvious: a stranded
+                        # PROTECT placeholder means text was swallowed and is
+                        # unrecoverable, whereas a stray control character from
+                        # a JSON escape (\b -> backspace) is corruption of a
+                        # different origin. Neither is guessed at here.
+                        marker = _PLACEHOLDER_PATTERN.search(value)
+                        kind = (f"stranded placeholder {marker.group(0)!r}" if marker
+                                else f"control chars {describe_control_characters(value)}")
                         corrupted.append((
                             str(a.id), a.title or "", str(q.get("id")), field,
-                            describe_control_characters(value), value[:140],
+                            kind, value[:140],
                         ))
 
                 # KaTeX-validate EVERY question's post-transform state, not just
@@ -389,7 +402,8 @@ async def do_migration(Session, args, url: str) -> int:
             print("question. (The bug that caused this is fixed; see latex_validator.)")
             print("─" * 78)
             for aid, title, qid, field, codes, preview in corrupted[:25]:
-                print(f"  question id : {qid}   field: {field}   chars: {codes}")
+                print(f"  question id : {qid}   field: {field}")
+                print(f"  found       : {codes}")
                 print(f"  assessment  : {aid}  [{title[:50]}]")
                 print(f"  content     : {preview!r}")
                 print()
