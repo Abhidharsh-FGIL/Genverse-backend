@@ -104,4 +104,19 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    return {"status": "healthy"}
+    from app.build_info import build_info
+    # The revision is included here as well as on /version so an existing
+    # health check/uptime monitor reports which code is actually running,
+    # without anyone having to call a second endpoint.
+    return {"status": "healthy", **build_info()}
+
+
+@app.get("/version", tags=["Health"])
+async def version():
+    """The deployed revision, so it can be checked from outside the host."""
+    from app.build_info import build_info
+    return {
+        "service": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        **build_info(),
+    }

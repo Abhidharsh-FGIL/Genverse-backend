@@ -190,3 +190,47 @@ def test_json_escapes_preserves_matrix_line_break():
     followed by a space, not a command character."""
     assert _decode(r'"$\\begin{pmatrix}1&2\\\\ 3&4\\end{pmatrix}$"') == \
         r"$\begin{pmatrix}1&2\\ 3&4\end{pmatrix}$"
+
+
+# ── Line-break edge cases (Step 2) ───────────────────────────────────────────
+
+def test_line_break_before_newline_is_preserved():
+    r"""A "\\" followed by an actual newline character, not just a space."""
+    src = "$$a \\\\\nb$$"
+    assert collapse_over_escaped_commands(src) == src
+    src_no_space = "$$a\\\\\nb$$"
+    assert collapse_over_escaped_commands(src_no_space) == src_no_space
+
+
+def test_line_break_at_end_of_math_span_is_preserved():
+    for src in (r"$$a \\$$", r"$$a\\$$", r"$$\begin{aligned}x \\\end{aligned}$$"):
+        assert collapse_over_escaped_commands(src) == src
+
+
+def test_nested_environments_are_preserved():
+    r"""The outermost \begin/\end pair is skipped, which covers everything
+    nested inside it — including a separator with no following space."""
+    src = r"$\begin{aligned}\begin{cases}x\\y\end{cases}\\ z\end{aligned}$"
+    assert collapse_over_escaped_commands(src) == src
+    src2 = r"$$\begin{aligned} A &= \begin{pmatrix}1&2\\3&4\end{pmatrix} \\ B &= 0 \end{aligned}$$"
+    assert collapse_over_escaped_commands(src2) == src2
+
+
+def test_known_limitation_line_break_without_space_outside_environment():
+    r"""DOCUMENTED LIMITATION, asserted so it stays a conscious decision.
+
+    "$$a\\b$$" is a genuine line break, but with no following space and no
+    enclosing environment neither guard applies, so it collapses. See the
+    rationale in latex_validator.py: the shape is vanishingly rare (0 of 31
+    real stored runs), while refusing to collapse before a letter would leave
+    \\theta / \\cos / \\circ — the actual reported bug — unrepaired.
+
+    The documented workaround is to write multi-row display math as an
+    environment, which IS protected:
+    """
+    assert collapse_over_escaped_commands(r"$$a\\b$$") == r"$$a\b$$"
+    # ...and the workaround genuinely works:
+    protected = r"$$\begin{gathered}a\\b\end{gathered}$$"
+    assert collapse_over_escaped_commands(protected) == protected
+    # A following space is also enough:
+    assert collapse_over_escaped_commands(r"$$a\\ b$$") == r"$$a\\ b$$"

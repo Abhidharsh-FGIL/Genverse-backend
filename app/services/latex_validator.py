@@ -178,7 +178,23 @@ def _collapse_stray_triple_dollar(text: str) -> str:
 #      excluded.
 #   2. Whole \begin{...}...\end{...} environments are skipped verbatim, so a
 #      separator written with no following space ("\begin{cases}x\\y\end{cases}")
-#      survives guard 1 not applying to it.
+#      survives guard 1 not applying to it. Nested environments are covered too,
+#      because the outermost \begin/\end pair is what gets skipped.
+#
+# KNOWN, DELIBERATE LIMITATION: a genuine line break with NO following space and
+# NO enclosing environment — "$$a\\b$$" — is collapsed to "$$a\b$$". Neither
+# guard applies to it, and the character stream alone cannot distinguish it from
+# an over-escaped "\b". The trade is made knowingly and in favour of collapsing,
+# because:
+#   - the shape is vanishingly rare (all 31 multi-backslash runs in real stored
+#     assessment data are "\\" + a space, inside a pmatrix/bmatrix), whereas
+#     over-escaped commands starting with a letter are the entire reported bug;
+#   - refusing to collapse before a letter would leave "\\theta", "\\cos" and
+#     "\\circ" broken, which is the thing this function exists to fix;
+#   - a multi-row display block should be written as an environment anyway, and
+#     any such block IS protected by guard 2.
+# The behaviour is asserted in tests/test_latex_escaping.py so it stays a
+# conscious decision rather than an accident.
 #
 # Anything outside a $...$ / $$...$$ math span is left completely alone: a
 # backslash run in prose is far more likely to be a Windows path or a Python
@@ -194,10 +210,18 @@ _LINEBREAK_ENVS = (
 # A single-backslash \begin{env}...\end{env} span. The (?<!\\) guards mean an
 # already-over-escaped "\\begin{...}" does NOT match, so such a block is still
 # handed to the collapser (it needs repairing like any other doubled command).
+# The "(?:\\\\)*" before each \begin/\end absorbs an EVEN number of preceding
+# backslashes, which is what tells a real command from an over-escaped one: in
+# "x \\\\\end{aligned}" the \end is preceded by a complete "\\" line break (even,
+# so \end is genuine and the environment must still be recognised), whereas in
+# an over-escaped "\\end{cases}" it is preceded by a single stray backslash
+# (odd, so this is not a real \end and the block SHOULD be collapsed). A plain
+# (?<!\\) lookbehind cannot express that: it rejected both, so a trailing row
+# separator silently disabled the environment guard around it.
 _ENV_SPAN_RE = re.compile(
-    r"(?<!\\)\\begin\{(" + "|".join(_LINEBREAK_ENVS) + r")\*?\}"
+    r"(?<!\\)(?:\\\\)*\\begin\{(" + "|".join(_LINEBREAK_ENVS) + r")\*?\}"
     r"[\s\S]*?"
-    r"(?<!\\)\\end\{\1\*?\}"
+    r"(?<!\\)(?:\\\\)*\\end\{\1\*?\}"
 )
 
 # 2+ backslashes immediately followed by a character that can only begin a
