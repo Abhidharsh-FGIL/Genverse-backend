@@ -139,16 +139,32 @@ def repair_unbalanced_leading_dollar(text: str) -> str:
     return text + "$"
 
 
+def _collapse_stray_triple_dollar(text: str) -> str:
+    """Collapses a stray extra "$" the model sometimes appends right after a
+    legitimate "$$...$$" close (e.g. "...^{1/n}$$$." — confirmed real
+    generation output, caught via a screenshot of a rendered question) back
+    down to a clean "$$". Mirrors the frontend's identical repair
+    (remix-of-genverse-eduverse/src/shared/math-content/normalizeMath.ts,
+    collapseStrayTripleDollar) — see its comment for why exactly 3 "$" is
+    unambiguous (never valid syntax on its own) and why the match is scoped
+    to only fire before whitespace/punctuation/end-of-string, so a
+    display-math block immediately followed by a genuine inline formula with
+    no separator is left untouched."""
+    return re.sub(r"\${3}(?=[\s.,;:!?)\]]|$)", "$$", text)
+
+
 def repair_common_latex_issues(text: str) -> str:
     """Safe, conservative repairs applied before validation/save — used by
     both the one-off DB migration script (scripts/migrate_latex_normalize.py)
     and finalize_generated_questions. Mirrors the frontend normalizer's
-    fixes: unbalanced leading $, double-escaped macro backslashes, and a
-    stray \\% that sits outside any math span."""
+    fixes: unbalanced leading $, double-escaped macro backslashes, a stray
+    extra "$" after a display-math close, and a stray \\% that sits outside
+    any math span."""
     if not text:
         return text
 
     result = repair_unbalanced_leading_dollar(text)
+    result = _collapse_stray_triple_dollar(result)
     # \\ce{...} -> \ce{...}: an LLM sometimes double-escapes a backslash when
     # asked to copy LaTeX verbatim into a JSON string.
     result = re.sub(r"\\{2,}([a-zA-Z]+\{)", r"\\\1", result)
