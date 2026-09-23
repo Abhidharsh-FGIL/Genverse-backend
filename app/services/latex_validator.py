@@ -153,6 +153,107 @@ def _collapse_stray_triple_dollar(text: str) -> str:
     return re.sub(r"\${3}(?=[\s.,;:!?)\]]|$)", "$$", text)
 
 
+# ─── Over-escaped backslash collapsing ───────────────────────────────────────
+#
+# An LLM asked to emit LaTeX inside a JSON string sometimes escapes the
+# backslash a SECOND time, so "$\theta$" arrives as "$\\theta$" once the JSON
+# is decoded. In TeX a doubled backslash is a LINE BREAK, so the damage is
+# visible rather than subtle: "\\theta" renders as a line break followed by
+# italic "theta", "5\\,\\mathrm{kg}" renders as "5", a line break, then a
+# literal ", kg", and "37^\\circ" is an outright parse error that KaTeX shows
+# as red source text. Those are exactly the three symptoms reported from the
+# Assessment Hub.
+#
+# Collapsing has to be surgical, because a doubled backslash is ALSO valid,
+# intentional LaTeX: it is the row separator inside matrix/cases/aligned
+# blocks. Two independent guards keep genuine separators safe.
+#
+#   1. The character AFTER the run. A real "\\" separator is always followed
+#      by whitespace, a digit, "[" (as in "\\[1em]"), "*" or the end of the
+#      segment — never directly by a command letter. Every one of the 31
+#      multi-backslash runs found in real stored assessment data is "\\"
+#      followed by a space, inside a pmatrix/bmatrix. So the lookahead below
+#      admits ONLY characters that can start a LaTeX command, a spacing macro
+#      or a script marker, and digits/whitespace/"["/"*" are deliberately
+#      excluded.
+#   2. Whole \begin{...}...\end{...} environments are skipped verbatim, so a
+#      separator written with no following space ("\begin{cases}x\\y\end{cases}")
+#      survives guard 1 not applying to it.
+#
+# Anything outside a $...$ / $$...$$ math span is left completely alone: a
+# backslash run in prose is far more likely to be a Windows path or a Python
+# escape in a programming question than broken LaTeX.
+
+# Environments whose "\\" is a genuine row/line separator.
+_LINEBREAK_ENVS = (
+    "cases", "aligned", "align", "alignat", "gathered", "gather", "split",
+    "matrix", "pmatrix", "bmatrix", "Bmatrix", "vmatrix", "Vmatrix",
+    "smallmatrix", "array", "substack", "multline", "eqnarray",
+)
+
+# A single-backslash \begin{env}...\end{env} span. The (?<!\\) guards mean an
+# already-over-escaped "\\begin{...}" does NOT match, so such a block is still
+# handed to the collapser (it needs repairing like any other doubled command).
+_ENV_SPAN_RE = re.compile(
+    r"(?<!\\)\\begin\{(" + "|".join(_LINEBREAK_ENVS) + r")\*?\}"
+    r"[\s\S]*?"
+    r"(?<!\\)\\end\{\1\*?\}"
+)
+
+# 2+ backslashes immediately followed by a character that can only begin a
+# LaTeX command (letter), a spacing macro (\, \; \! \:) or a script marker
+# (^ _). Whitespace, digits, "[" and "*" are excluded so genuine line breaks
+# never match.
+_OVER_ESCAPED_RE = re.compile(r"\\{2,}(?=[A-Za-z,;!:^_])")
+
+
+def _collapse_in_math_segment(segment: str) -> str:
+    """Collapse over-escaped commands inside ONE math segment, leaving any
+    line-break environment (cases/aligned/pmatrix/...) byte-for-byte intact."""
+    out: list[str] = []
+    pos = 0
+    for m in _ENV_SPAN_RE.finditer(segment):
+        out.append(_OVER_ESCAPED_RE.sub(lambda _m: "\\", segment[pos:m.start()]))
+        out.append(m.group(0))  # environment body preserved verbatim
+        pos = m.end()
+    out.append(_OVER_ESCAPED_RE.sub(lambda _m: "\\", segment[pos:]))
+    return "".join(out)
+
+
+def collapse_over_escaped_commands(text: str) -> str:
+    """Collapse "\\\\theta" -> "\\theta" (and \\, \\circ, \\cos, \\mathrm, ...)
+    inside math spans only, preserving genuine LaTeX line breaks."""
+    if not text or "\\\\" not in text:
+        return text
+
+    segments: list[str] = []
+
+    def _protect(m: re.Match) -> str:
+        segments.append(_collapse_in_math_segment(m.group(0)))
+        return f"\x02C{len(segments) - 1}\x03"
+
+    # Display math first, so its "$" characters can't be mistaken for inline
+    # delimiters by the second pass (same ordering extract_math_segments uses).
+    result = _DISPLAY_RE.sub(_protect, text)
+    result = _INLINE_RE.sub(_protect, result)
+    for i, seg in enumerate(segments):
+        result = result.replace(f"\x02C{i}\x03", seg, 1)
+    return result
+
+
+def has_over_escaped_command(text: str) -> bool:
+    """True if `text` still contains a doubled backslash before a LaTeX command
+    character inside a math span — the invariant the regression test asserts is
+    never true for stored content."""
+    if not text or "\\\\" not in text:
+        return False
+    for seg in extract_math_segments(text):
+        stripped = _ENV_SPAN_RE.sub("", seg)
+        if _OVER_ESCAPED_RE.search(stripped):
+            return True
+    return False
+
+
 def repair_common_latex_issues(text: str) -> str:
     """Safe, conservative repairs applied before validation/save — used by
     both the one-off DB migration script (scripts/migrate_latex_normalize.py)
@@ -165,9 +266,14 @@ def repair_common_latex_issues(text: str) -> str:
 
     result = repair_unbalanced_leading_dollar(text)
     result = _collapse_stray_triple_dollar(result)
-    # \\ce{...} -> \ce{...}: an LLM sometimes double-escapes a backslash when
-    # asked to copy LaTeX verbatim into a JSON string.
-    result = re.sub(r"\\{2,}([a-zA-Z]+\{)", r"\\\1", result)
+    # Collapse every over-escaped LaTeX command, not just the brace-form ones.
+    # The previous rule here was re.sub(r"\\{2,}([a-zA-Z]+\{)", ...), which
+    # required a "{" immediately after the command name — so it repaired
+    # \\mathrm{kg} and \\frac{a}{b} but silently left \\theta, \\,,
+    # \\circ, \\cos, \\sin and \\mu_s doubled. That is precisely why a
+    # reported question rendered "\mathrm{kg}" correctly while the "\," right
+    # in front of it still came out as a line break plus a stray comma.
+    result = collapse_over_escaped_commands(result)
 
     protected: list[str] = []
 

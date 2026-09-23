@@ -1572,6 +1572,14 @@ Answer:"""
         'r': ('right', 'rho', 'rangle', 'rfloor', 'rceil', 'rm'),
     }
 
+    # Characters that can directly follow a backslash in real LaTeX: a command
+    # name, a spacing macro (\, \; \! \:) or a script marker (^ _). Used to
+    # tell an over-escaped command from a genuine "\\" line break, which is
+    # always followed by whitespace, a digit, "[" or end-of-segment.
+    _COMMAND_START_CHARS = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ,;!:^_"
+    )
+
     @staticmethod
     def _fix_json_escapes(s: str) -> str:
         """Repair invalid JSON backslash escapes produced by LLM-generated LaTeX.
@@ -1586,8 +1594,29 @@ Answer:"""
             if ch == '\\' and i + 1 < n:
                 nxt = s[i + 1]
                 if nxt == '\\':
-                    out.append('\\\\')
-                    i += 2
+                    # Consume the WHOLE run so an over-escaped one can be
+                    # collapsed instead of copied through. In raw JSON text a
+                    # correctly written command is "\\cmd" (2 chars, decodes to
+                    # one backslash); 4+ chars decode to a doubled backslash,
+                    # which TeX reads as a line break and is the Assessment Hub
+                    # corruption. A genuine line break is also 4 chars in JSON
+                    # text, so the run is only collapsed when what FOLLOWS it
+                    # can start a command/spacing macro/script marker — real
+                    # separators are followed by whitespace, a digit or "[".
+                    # This branch used to emit '\\\\' and skip 2, which preserved
+                    # any run length verbatim: the function could only ever ADD
+                    # escaping, never remove it, so over-escaped output reached
+                    # storage untouched.
+                    j = i
+                    while j < n and s[j] == '\\':
+                        j += 1
+                    run = j - i
+                    after = s[j] if j < n else ''
+                    if run >= 4 and after in AIService._COMMAND_START_CHARS:
+                        out.append('\\\\')  # -> exactly one backslash after decoding
+                    else:
+                        out.append('\\' * run)
+                    i = j
                 elif nxt == 'u':
                     if i + 5 < n and all(c in '0123456789abcdefABCDEF' for c in s[i+2:i+6]):
                         out.append(s[i:i+6])
@@ -1918,7 +1947,7 @@ MATH NOTATION — CRITICAL:
 8. DELIMITER BALANCE IS MANDATORY: every $ that opens inline math MUST have a matching closing $ later in the SAME string, and every $$ must have a matching closing $$. NEVER emit a lone/unclosed $ (e.g. "$15.90\\%" with no closing $ is INVALID and will be rejected). Before writing each "options" array, re-check every entry for a balanced dollar count.
 9. Pure-number or pure-text options that contain NO math (no formula, no percent-in-math, no chemistry) should be written as plain text with NO $ at all — e.g. option "True" or option "Paris" must never be wrapped in $...$.
 10. NEVER use $ to denote currency — write "Rs." or "USD" instead; a bare $ is reserved exclusively for opening/closing math.
-11. JSON ESCAPING REMINDER: this response is a JSON string value, so every literal backslash in your LaTeX must be written as \\\\ in the JSON (e.g. the macro \\ce becomes \\\\ce in the JSON text) so it decodes back to a single backslash.
+11. Write LaTeX exactly as you normally would, with a single backslash before every command (\\theta, \\frac, \\ce, \\mathrm, \\circ). Do not think about JSON string escaping at all — that is handled for you.
 12. NEVER use \\( \\) or \\[ \\] delimiters, in ANY field (text, options, correct_answer, explanation) — $...$ and $$...$$ are the ONLY accepted delimiters, with no exceptions. A single question mixing both delimiter styles is INVALID output.
 13. Options contain ONLY the option content itself — never prefix an option with "A.", "B.", "1.", etc.; the option letter/number is assigned by the application, not by you.
 
@@ -2274,7 +2303,7 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
         import uuid as _uuid
         from app.services.latex_validator import (
             repair_common_latex_issues, strip_option_prefix, repair_correct_answer,
-            NO_OPTION_TYPES, CORRECT_ANSWER_STRIP_TYPES,
+            option_text, NO_OPTION_TYPES, CORRECT_ANSWER_STRIP_TYPES,
         )
         question_json = []
         answer_key_json = []
@@ -2394,7 +2423,10 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
             })
 
         try:
-            from app.services.latex_validator import validate_questions_latex
+            from app.services.latex_validator import (
+                validate_questions_latex, has_over_escaped_command,
+            )
+            from app.services.katex_check import check_question_fields
             # Validate against answer_key_json's explanation/correct_answer too,
             # not just question_json's stem/options — merge them per id so the
             # validator sees the full set of fields shown anywhere in the UI.
@@ -2403,11 +2435,139 @@ Return ONLY the raw JSON array. No markdown fences, no explanation text outside 
                 for qj, ak in zip(question_json, answer_key_json)
             ]
             issues = await validate_questions_latex(merged)
-            for qid, msgs in issues.items():
-                print(f"[LatexValidator] question {qid} flagged: {'; '.join(msgs)}", flush=True)
+
+            # A real KaTeX parse of every math segment. This catches what the
+            # structural checks cannot (e.g. "37^\\circ", a hard parse error),
+            # and the over-escape detector below catches what KaTeX cannot
+            # ("$\\theta$" parses fine as a line break plus the word "theta",
+            # so it renders wrong without ever raising). The two are
+            # complementary and both are needed.
+            for qid, msgs in (await check_question_fields(merged)).items():
+                issues.setdefault(qid, []).extend(msgs)
+
+            for q in merged:
+                qid = str(q.get("id") or "")
+                for field in ("text", "correct_answer", "explanation"):
+                    if has_over_escaped_command(str(q.get(field) or "")):
+                        issues.setdefault(qid, []).append(
+                            f"over-escaped LaTeX backslash survived repair in {field}"
+                        )
+                for i, opt in enumerate(q.get("options") or []):
+                    if has_over_escaped_command(option_text(opt)):
+                        issues.setdefault(qid, []).append(
+                            f"over-escaped LaTeX backslash survived repair in option[{i}]"
+                        )
+
+            # Never save silently broken content: mark the question so the UI
+            # can show a review badge instead of rendering corruption as if it
+            # were fine. Flagged questions are kept, not dropped — silently
+            # shrinking an assessment is worse, and a flagged question still
+            # renders as visible raw text rather than crashing.
+            flagged = {qid: msgs for qid, msgs in issues.items() if msgs}
+            for q in question_json:
+                msgs = flagged.get(str(q.get("id") or ""))
+                if msgs:
+                    q["needs_review"] = True
+                    q["review_reason"] = "; ".join(msgs)[:500]
+            for qid, msgs in flagged.items():
+                print(f"[LatexValidator] question {qid} FLAGGED FOR REVIEW: {'; '.join(msgs)}", flush=True)
         except Exception as e:
             print(f"[LatexValidator] validation pass failed, skipping: {type(e).__name__}: {e}", flush=True)
 
+        return question_json, answer_key_json
+
+    async def repair_flagged_questions(
+        self,
+        question_json: list,
+        answer_key_json: list,
+        allowed_types: set,
+        max_attempts: int = 2,
+    ) -> tuple[list, list]:
+        """Re-ask the model to fix the LaTeX of any question finalize_generated_
+        questions flagged, so broken notation is never saved silently.
+
+        Only the NOTATION is regenerated — the prompt below pins the question's
+        wording, options, answer, difficulty and topic, because a flagged
+        question is a formatting failure, not a pedagogy failure, and silently
+        swapping in a differently-worded question would change the assessment
+        the teacher configured. Each rewritten question goes back through
+        finalize_generated_questions, so it is repaired and re-validated on
+        exactly the same terms as the original; it is only swapped in if it
+        comes back unflagged. After `max_attempts` the question keeps its
+        needs_review flag and is saved WITH that flag rather than dropped.
+        """
+        flagged_idx = [i for i, q in enumerate(question_json) if q.get("needs_review")]
+        if not flagged_idx:
+            return question_json, answer_key_json
+
+        import logging as _logging
+        log = _logging.getLogger(__name__)
+
+        for attempt in range(1, max_attempts + 1):
+            if not flagged_idx:
+                break
+            log.info("[LatexRepair] attempt %d for %d flagged question(s)", attempt, len(flagged_idx))
+
+            broken = []
+            for i in flagged_idx:
+                q, a = question_json[i], answer_key_json[i]
+                broken.append({
+                    "id": q.get("id"), "type": q.get("type"), "subtype": q.get("subtype"),
+                    "text": q.get("text"), "options": q.get("options"), "pairs": q.get("pairs"),
+                    "correct_answer": a.get("correctAnswer"), "explanation": a.get("explanation"),
+                    "marks": q.get("points"), "blooms_level": q.get("blooms_level"),
+                    "_problem": q.get("review_reason"),
+                })
+
+            prompt = (
+                "The LaTeX notation in the following assessment questions is malformed. "
+                "Each question carries a \"_problem\" field describing what a real KaTeX "
+                "parse found wrong with it.\n\n"
+                "Rewrite ONLY the mathematical notation so every expression parses in KaTeX. "
+                "Keep each question's meaning, wording, difficulty, options, correct answer, "
+                "id, type, subtype, marks and blooms_level EXACTLY as they are — change "
+                "nothing but the notation.\n\n"
+                "LaTeX conventions:\n"
+                "- Inline math in $...$, display math in $$...$$; every $ must be closed.\n"
+                "- One backslash before each command: \\theta, \\frac{a}{b}, \\circ, \\cos, \\sqrt{x}.\n"
+                "- Chemistry uses \\ce{...}, e.g. $\\ce{H2SO4}$.\n"
+                "- Units use a thin space then \\mathrm{}, e.g. $5\\,\\mathrm{kg}$.\n"
+                "- Never use Unicode math characters (\u03b8, \u03c0, \u00b2) \u2014 use LaTeX instead.\n\n"
+                "Return ONLY a JSON array of the corrected question objects, dropping the "
+                "\"_problem\" field. No markdown fences, no commentary.\n\n"
+                f"{json.dumps(broken, ensure_ascii=False, indent=1)}"
+            )
+
+            try:
+                response = await self.chat([{"role": "user", "content": prompt}])
+                rewritten = self._extract_json_array(response)
+            except Exception as e:
+                log.warning("[LatexRepair] attempt %d failed: %s: %s", attempt, type(e).__name__, e)
+                break
+            if not rewritten:
+                log.warning("[LatexRepair] attempt %d returned nothing parseable", attempt)
+                break
+
+            fixed_q, fixed_a = await AIService.finalize_generated_questions(rewritten, allowed_types)
+            by_id = {str(q.get("id")): (q, a) for q, a in zip(fixed_q, fixed_a)}
+
+            still_flagged = []
+            for i in flagged_idx:
+                qid = str(question_json[i].get("id"))
+                candidate = by_id.get(qid)
+                if candidate and not candidate[0].get("needs_review"):
+                    question_json[i], answer_key_json[i] = candidate
+                    log.info("[LatexRepair] question %s repaired on attempt %d", qid, attempt)
+                else:
+                    still_flagged.append(i)
+            flagged_idx = still_flagged
+
+        for i in flagged_idx:
+            log.warning(
+                "[LatexRepair] question %s still flagged after %d attempt(s); saving "
+                "with needs_review set: %s",
+                question_json[i].get("id"), max_attempts, question_json[i].get("review_reason"),
+            )
         return question_json, answer_key_json
 
     async def auto_evaluate_attempt(self, questions: List[dict], responses: dict) -> dict:
@@ -3012,14 +3172,12 @@ Return ONLY valid JSON in this exact structure:
         "  - Code blocks: <pre><code class=\"language-python\">code here</code></pre> (use the correct language class).\n"
         "    IMPORTANT: Preserve proper indentation and newlines inside code blocks.\n"
         "  - Inline code: <code>variable_name</code>\n"
-        "  - Math/equations: Use LaTeX — inline: $E = mc^2$, block: $$\\\\int_0^\\\\infty e^{-x}\\\\,dx = 1$$\n"
-        "  - Trig/log operators: use \\\\sin, \\\\cos, \\\\tan, \\\\cot, \\\\sec, \\\\csc, \\\\log, \\\\ln, \\\\exp, \\\\lim — NEVER \\\\text{sin} or \\\\operatorname{sin}\n"
-        "  - Fractions: \\\\frac{numerator}{denominator}  — e.g. $\\\\frac{\\\\pi}{2}$\n"
-        "  - Greek letters: \\\\pi, \\\\theta, \\\\alpha, \\\\beta, \\\\gamma, \\\\delta, \\\\omega, \\\\Sigma, etc.\n"
-        "  - CRITICAL — JSON ESCAPING: ALL LaTeX backslashes in the JSON string MUST be double-escaped.\n"
-        "    Write \\\\\\\\sin  not  \\\\sin  (the JSON decoder halves every double-backslash).\n"
-        "    Example correct: \"$y = \\\\\\\\sin(x)$\"   → after JSON decode → $y = \\\\sin(x)$ → KaTeX renders correctly.\n"
-        "    Example WRONG:   \"$y = \\\\sin(x)$\"       → \\\\s is invalid JSON / \\\\t becomes a tab character.\n"
+        "  - Math/equations: Use LaTeX — inline: $E = mc^2$, block: $$\\int_0^\\infty e^{-x}\\,dx = 1$$\n"
+        "  - Trig/log operators: use \\sin, \\cos, \\tan, \\cot, \\sec, \\csc, \\log, \\ln, \\exp, \\lim — NEVER \\text{sin} or \\operatorname{sin}\n"
+        "  - Fractions: \\frac{numerator}{denominator}  — e.g. $\\frac{\\pi}{2}$\n"
+        "  - Greek letters: \\pi, \\theta, \\alpha, \\beta, \\gamma, \\delta, \\omega, \\Sigma, etc.\n"
+        "  - Chemistry: wrap every formula in the mhchem macro, e.g. $\\ce{H2SO4}$, $\\ce{NaHCO3}$\n"
+        "  - Units: $25\\,\\mathrm{mL}$, $9.8\\,\\mathrm{m/s^2}$ — a thin space then \\mathrm{} for the unit\n"
         "  - Do NOT wrap paragraphs in <p> tags — just use blank lines between them.\n"
         "  - NEVER use markdown: no **bold**, no *italic*, no # headings, no - bullet lists, no ```code fences```."
     )
@@ -3414,11 +3572,12 @@ LANGUAGE — STRICT: Write ALL questions, options, and answers ENTIRELY in {lang
 
 MATH FORMATTING (mandatory):
 - Wrap ALL mathematical expressions in LaTeX delimiters: inline $...$ or block $$...$$
-- Use proper LaTeX operators: \\\\sin, \\\\cos, \\\\tan, \\\\log, \\\\frac{{a}}{{b}}, \\\\sqrt{{x}}
-- Greek letters: \\\\theta, \\\\pi, \\\\alpha, \\\\beta — NOT Unicode θ, π, α
+- Use proper LaTeX operators: \\sin, \\cos, \\tan, \\log, \\frac{{a}}{{b}}, \\sqrt{{x}}
+- Greek letters: \\theta, \\pi, \\alpha, \\beta — NOT Unicode θ, π, α
 - Superscripts/subscripts: $x^{{2}}$, $x_{{n}}$ (always with braces in LaTeX)
-- Example question: "Which identity is correct? A) $\\\\sin^{{2}}(\\\\theta) + \\\\cos^{{2}}(\\\\theta) = 1$"
-- ALL backslashes in JSON strings MUST be double-escaped (\\\\\\\\sin not \\\\sin)
+- Chemistry: wrap every formula in \\ce{{...}}, e.g. $\\ce{{H2SO4}}$
+- Units: a thin space then \\mathrm{{}}, e.g. $25\\,\\mathrm{{mL}}$
+- Example question: "Which identity is correct? A) $\\sin^{{2}}(\\theta) + \\cos^{{2}}(\\theta) = 1$"
 
 Chapter summaries:
 {chapter_context}
@@ -5842,7 +6001,7 @@ MATH NOTATION — CRITICAL:
 8. DELIMITER BALANCE IS MANDATORY: every $ that opens inline math MUST have a matching closing $ later in the SAME string, and every $$ must have a matching closing $$. NEVER emit a lone/unclosed $ (e.g. "$15.90\\%" with no closing $ is INVALID and will be rejected). Before writing each "options" array, re-check every entry for a balanced dollar count.
 9. Pure-number or pure-text options that contain NO math (no formula, no percent-in-math, no chemistry) should be written as plain text with NO $ at all — e.g. option "True" or option "Paris" must never be wrapped in $...$.
 10. NEVER use $ to denote currency — write "Rs." or "USD" instead; a bare $ is reserved exclusively for opening/closing math.
-11. JSON ESCAPING REMINDER: this response is a JSON string value, so every literal backslash in your LaTeX must be written as \\\\ in the JSON (e.g. the macro \\ce becomes \\\\ce in the JSON text) so it decodes back to a single backslash.
+11. Write LaTeX exactly as you normally would, with a single backslash before every command (\\theta, \\frac, \\ce, \\mathrm, \\circ). Do not think about JSON string escaping at all — that is handled for you.
 12. NEVER use \\( \\) or \\[ \\] delimiters, in ANY field (text, options, correct_answer, explanation) — $...$ and $$...$$ are the ONLY accepted delimiters, with no exceptions. A single question mixing both delimiter styles is INVALID output.
 13. Options contain ONLY the option content itself — never prefix an option with "A.", "B.", "1.", etc.; the option letter/number is assigned by the application, not by you.
 

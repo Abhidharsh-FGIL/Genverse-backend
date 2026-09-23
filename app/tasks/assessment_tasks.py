@@ -152,6 +152,13 @@ async def _do_generate(ai, params: dict, channel: str, r: sync_redis.Redis):
 
     question_json, answer_key_json = await ai.finalize_generated_questions(raw, allowed_types)
 
+    # Never save silently broken LaTeX: re-ask the model to fix the notation of
+    # any question the validator flagged, then keep whatever is still broken
+    # flagged (needs_review) so the UI can badge it for a human.
+    question_json, answer_key_json = await ai.repair_flagged_questions(
+        question_json, answer_key_json, allowed_types
+    )
+
     _log.info("[Assessment-Celery] After filtering: %d questions passed (from %d raw)", len(question_json), len(raw))
 
     # Stage 3: Complete

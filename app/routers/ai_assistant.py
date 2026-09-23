@@ -1652,6 +1652,11 @@ async def generate_practice_assessment_stream(
                 yield f"data: {json.dumps({'stage': 'processing', 'progress': 80, 'message': 'Processing and validating questions...'})}\n\n"
 
                 question_json, answer_key_json = await AIService.finalize_generated_questions(raw, allowed_types)
+                # Same LaTeX repair retry the Celery path runs, so the two
+                # generation paths can't drift apart.
+                question_json, answer_key_json = await ai.repair_flagged_questions(
+                    question_json, answer_key_json, allowed_types
+                )
 
                 yield f"data: {json.dumps({'stage': 'complete', 'progress': 100, 'message': f'{len(question_json)} questions generated successfully!', 'question_json': question_json, 'answer_key_json': answer_key_json})}\n\n"
                 yield "data: [DONE]\n\n"
