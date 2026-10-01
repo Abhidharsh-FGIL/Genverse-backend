@@ -80,9 +80,11 @@ async def audio_qa(payload: AudioQARequest, current_user: CurrentUser, db: DBSes
     await points_service.deduct(user_id=current_user.id, action="basic_chat", db=db)
 
     ai = get_ai_service()
+    # `language` is a separate request field here; put it in the context so the
+    # prompt's <language> section matches it (AI tailoring plan, Phase 2 addition 4).
     response_text = await ai.chat(
         messages=[{"role": "user", "content": payload.question}],
-        context=payload.context,
+        context={**(payload.context or {}), "language": payload.language},
     )
 
     return AudioQAResponse(

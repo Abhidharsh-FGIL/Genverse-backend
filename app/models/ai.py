@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime
 from sqlalchemy import String, Boolean, Integer, Float, DateTime, Text, func, ForeignKey, UniqueConstraint
+from sqlalchemy import false as sa_false, true as sa_true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -45,16 +46,17 @@ class AiChatSetting(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     chat_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("ai_chats.id", ondelete="CASCADE"), nullable=False, unique=True)
-    difficulty: Mapped[str] = mapped_column(String(20), default="medium")
-    personality: Mapped[str] = mapped_column(String(50), default="helpful")
-    content_length: Mapped[str] = mapped_column(String(20), default="medium")
+    # Defaults mirror app/schemas/ai_payloads.CHAT_SETTINGS_DEFAULTS (audit I1).
+    difficulty: Mapped[str] = mapped_column(String(20), default="medium", server_default="medium")
+    personality: Mapped[str] = mapped_column(String(50), default="mentor", server_default="mentor")
+    content_length: Mapped[str] = mapped_column(String(20), default="summary", server_default="summary")
     explain_3ways: Mapped[bool] = mapped_column(Boolean, default=False)
     mind_map: Mapped[bool] = mapped_column(Boolean, default=False)
     infographic: Mapped[bool] = mapped_column(Boolean, default=False)
-    examples: Mapped[bool] = mapped_column(Boolean, default=True)
+    examples: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())  # audit P2
     output_mode: Mapped[str] = mapped_column(String(50), default="text")
     # Enhancement feature toggles
-    student_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    student_mode: Mapped[bool] = mapped_column(Boolean, default=True, server_default=sa_true())
     video_refs: Mapped[bool] = mapped_column(Boolean, default=False)
     followup: Mapped[bool] = mapped_column(Boolean, default=False)
     practice: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -80,7 +82,7 @@ class AiContextSession(Base):
     tone: Mapped[str] = mapped_column(String(50), default="helpful")
     difficulty: Mapped[str] = mapped_column(String(20), default="medium")
     output_mode: Mapped[str] = mapped_column(String(50), default="text")
-    student_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    student_mode: Mapped[bool] = mapped_column(Boolean, default=True, server_default=sa_true())  # audit I1
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

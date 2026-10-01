@@ -36,6 +36,67 @@ def _get_guard_client():
         )
     return _guard_gemini_client
 
+_guard_openai_client = None
+
+
+def _get_guard_openai_client():
+    global _guard_openai_client
+    if _guard_openai_client is None:
+        from app.config import settings
+        if not settings.OPENAI_API_KEY:
+            return None
+        from openai import AsyncOpenAI
+        _guard_openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    return _guard_openai_client
+
+
+def log_fail_open(reason: str) -> None:
+    """Every fail-open is a WARNING with its reason, so it is visible in logs
+    (AI tailoring plan, pre-Phase-3 item 4)."""
+    logger.warning("content_guard.fail_open reason=%s", reason)
+
+
+async def _run_classifier(prompt: str) -> str:
+    """Classifier text from the primary model, else the fallback provider.
+
+    The caller's time budget (stream_chat: 0.5 s via asyncio.wait_for) covers
+    both attempts. Providers whose circuit breaker is open are skipped.
+    """
+    from app.config import settings
+    from app.services import provider_health
+
+    errors: list[str] = []
+    model = settings.AI_PRIMARY_MODEL
+    if provider_health.is_open("gemini", model):
+        errors.append("gemini: circuit breaker open")
+    else:
+        try:
+            response = await _get_guard_client().aio.models.generate_content(model=model, contents=prompt)
+            return response.text or ""
+        except Exception as exc:
+            provider_health.record_failure("gemini", model, exc)
+            errors.append(f"gemini: {type(exc).__name__}: {str(exc)[:120]}")
+
+    fallback = settings.AI_FALLBACK_MODEL
+    client = _get_guard_openai_client()
+    if client is None:
+        errors.append("openai: not configured")
+    elif provider_health.is_open("openai", fallback):
+        errors.append("openai: circuit breaker open")
+    else:
+        try:
+            response = await client.chat.completions.create(
+                model=fallback,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            return response.choices[0].message.content or ""
+        except Exception as exc:
+            provider_health.record_failure("openai", fallback, exc)
+            errors.append(f"openai: {type(exc).__name__}: {str(exc)[:120]}")
+    raise RuntimeError("all guard classifiers failed — " + " | ".join(errors))
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -171,6 +232,53 @@ OUTPUT_REPLACEMENT_MESSAGE = {
         "هل يمكنك إعادة صياغة سؤالك؟ أنا هنا لمساعدتك في تعلّمك!"
     ),
 }
+
+# Hindi / Tamil versions (AI tailoring plan, Phase 3). DRAFT translations —
+# need native-speaker review before release (plan D12).
+BLOCK_MESSAGES["harmful"]["hi"] = (
+    "मैं इस विषय में मदद नहीं कर सकता। यह सहायक छात्रों को पढ़ाई और स्कूल के विषयों में मदद करने के लिए बनाया गया है। 📚\n\n"
+    "अगर आपका गणित, विज्ञान, इतिहास या किसी भी पढ़ाई के विषय पर कोई प्रश्न है, तो मुझे मदद करके खुशी होगी!"
+)
+BLOCK_MESSAGES["harmful"]["ta"] = (
+    "இந்தத் தலைப்பில் என்னால் உதவ முடியாது. இந்த உதவியாளர் மாணவர்களின் படிப்புக்கும் பள்ளிப் பாடங்களுக்கும் உதவுவதற்காக உருவாக்கப்பட்டது. 📚\n\n"
+    "கணிதம், அறிவியல், வரலாறு அல்லது நீங்கள் படிக்கும் எந்தப் பாடம் பற்றியும் கேள்வி இருந்தால், மகிழ்ச்சியுடன் உதவுகிறேன்!"
+)
+BLOCK_MESSAGES["sensitive"]["hi"] = (
+    "इस विषय पर मैं यहाँ बात नहीं कर सकता। आइए अपनी बातचीत पढ़ाई पर ही रखें। 😊\n\n"
+    "आप किस विषय या टॉपिक में मदद चाहते हैं?"
+)
+BLOCK_MESSAGES["sensitive"]["ta"] = (
+    "இந்தத் தலைப்பைப் பற்றி இங்கே பேச இயலாது. நம் உரையாடலைப் படிப்பின் மீதே வைத்துக்கொள்வோம். 😊\n\n"
+    "எந்தப் பாடம் அல்லது தலைப்பில் உங்களுக்கு உதவி வேண்டும்?"
+)
+REDIRECT_MESSAGES["non_educational"]["hi"] = (
+    "अरे! यह दिलचस्प लगता है, लेकिन मैं आपका पढ़ाई का साथी हूँ — पढ़ाई और स्कूल के विषयों में मदद करना मेरा काम है। "
+    "मैं आपके लिए यह कर सकता हूँ:\n\n"
+    "📚 **कोई भी अवधारणा समझाना** — किसी भी विषय की, आपके स्तर पर\n"
+    "✏️ **होमवर्क में मदद** — प्रश्नों को चरण-दर-चरण हल करना\n"
+    "🧠 **अभ्यास और दोहराई** — खुद को परखने के लिए प्रश्न बनाना\n"
+    "🔍 **कठिन विषयों को आसान बनाना**\n"
+    "🎯 **परीक्षा की तैयारी** — सुझाव, महत्वपूर्ण प्रश्न और जल्दी दोहराई\n\n"
+    "तो, आज आप क्या पढ़ रहे हैं? मैं मदद के लिए तैयार हूँ! 🚀"
+)
+REDIRECT_MESSAGES["non_educational"]["ta"] = (
+    "சுவாரஸ்யமாக இருக்கிறது! ஆனால் நான் உங்கள் படிப்புத் துணை — படிப்பிலும் பள்ளிப் பாடங்களிலும் உதவுவதுதான் என் வேலை. "
+    "உங்களுக்காக நான் செய்யக்கூடியவை:\n\n"
+    "📚 **எந்தக் கருத்தையும் விளக்குதல்** — எந்தப் பாடமானாலும், உங்கள் நிலைக்கு ஏற்ப\n"
+    "✏️ **வீட்டுப்பாடத்தில் உதவி** — கணக்குகளைப் படிப்படியாகத் தீர்த்தல்\n"
+    "🧠 **பயிற்சியும் மீள்பார்வையும்** — உங்களைச் சோதித்துக்கொள்ள வினாக்கள் உருவாக்குதல்\n"
+    "🔍 **கடினமான தலைப்புகளை எளிதாக்குதல்**\n"
+    "🎯 **தேர்வுத் தயாரிப்பு** — குறிப்புகள், முக்கிய வினாக்கள், விரைவு மீள்பார்வை\n\n"
+    "இன்று என்ன படிக்கிறீர்கள்? உதவத் தயாராக இருக்கிறேன்! 🚀"
+)
+OUTPUT_REPLACEMENT_MESSAGE["hi"] = (
+    "मैंने एक उत्तर तैयार किया था, लेकिन जाँच में पाया कि उसमें ऐसी सामग्री थी जो पढ़ाई के माहौल के लिए उचित नहीं है।\n\n"
+    "क्या आप अपना प्रश्न दूसरे शब्दों में पूछ सकते हैं? मैं आपकी पढ़ाई में मदद के लिए यहाँ हूँ!"
+)
+OUTPUT_REPLACEMENT_MESSAGE["ta"] = (
+    "ஒரு பதிலை உருவாக்கினேன், ஆனால் சரிபார்த்தபோது அதில் கல்விச் சூழலுக்குப் பொருந்தாத உள்ளடக்கம் இருந்தது.\n\n"
+    "உங்கள் கேள்வியை வேறு வார்த்தைகளில் கேட்க முடியுமா? உங்கள் படிப்புக்கு உதவ நான் இங்கே இருக்கிறேன்!"
+)
 
 # ---------------------------------------------------------------------------
 # Grade-relevance prompt templates (injected into system prompt)
@@ -338,8 +446,6 @@ class ContentGuardService:
             return GuardResult(action=GuardAction.ALLOW, category="educational", message=None)
 
         try:
-            client = _get_guard_client()
-
             # Use grade-aware prompt when student_mode + grade is set
             if self.student_mode and self.grade:
                 prompt = CLASSIFIER_PROMPT_WITH_GRADE.format(
@@ -348,11 +454,7 @@ class ContentGuardService:
             else:
                 prompt = CLASSIFIER_PROMPT_BASE.format(query=query[:500])
 
-            response = await client.aio.models.generate_content(
-                model=settings.AI_PRIMARY_MODEL,
-                contents=prompt,
-            )
-            text = response.text.strip()
+            text = (await _run_classifier(prompt)).strip()
 
             # Strip markdown fences if present
             if text.startswith("```"):
@@ -425,8 +527,8 @@ class ContentGuardService:
             )
 
         except Exception as e:
-            # FAIL OPEN — never block a legitimate query due to classifier error
-            logger.warning("ContentGuard classifier error (failing open): %s", e)
+            # FAIL OPEN — never block a legitimate query due to classifier error.
+            log_fail_open(f"classifier error: {type(e).__name__}: {str(e)[:200]}")
             return GuardResult(action=GuardAction.ALLOW, category="educational", message=None, confidence=0.0)
 
     # -- Stage 3: output safety check --------------------------------------

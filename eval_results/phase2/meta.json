@@ -1,0 +1,26 @@
+{
+ "run_at": "2026-10-01T12:45:14.028915+00:00",
+ "primary_model": "gemini-3.5-flash",
+ "document_model": "claude-sonnet-4-20250514",
+ "fallback_model": "gpt-4o-mini",
+ "judge_model": "claude-sonnet-5-5",
+ "guard_llm_classifier": false,
+ "forced_provider": "openai",
+ "compare_to": "eval_results/baseline",
+ "combos": [
+  "1",
+  "4",
+  "7",
+  "12",
+  "13",
+  "18"
+ ],
+ "probes": [
+  "a1_greeting_en",
+  "a2_greeting_ta",
+  "b_off_subject",
+  "c_g2_derivative",
+  "d1_rag_g5",
+  "d2_rag_g11"
+ ]
+}

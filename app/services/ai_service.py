@@ -10,15 +10,53 @@ API keys:
   GOOGLE_GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY
 """
 import json
+import logging
 import re
 import asyncio
 import random
-from typing import AsyncIterator, List, Optional, Any, Dict
+from contextvars import ContextVar
+from typing import AsyncIterator, Callable, List, Optional, Any, Dict
 from pathlib import Path
 
 from app.config import settings
+from app.services import provider_health
+from app.prompts.builder import (
+    build_system_prompt,
+    effective_student_mode,
+    history_uses_three_ways,
+    to_provider_messages,
+)
+from app.prompts.params import GenParams, generation_params, supports_temperature
+from app.prompts.language import LANGUAGE_NAMES, SCRIPT_MAP
+from app.schemas.ai_payloads import (
+    AIContextPayload,
+    ChatSettingsPayload,
+    normalize_context,
+    normalize_settings,
+)
 
 _SENTINEL = object()
+logger = logging.getLogger(__name__)
+
+# Time budget for the content-guard input pipeline in the streaming path
+# (primary classifier + fallback classifier together). Fails open on expiry.
+# While the Gemini breaker is open the OpenAI fallback classifier answers
+# instead, and it needs ~1.1–1.6 s (measured 2026-10-01, median 1.32 s).
+GUARD_BUDGET_S = 0.5
+GUARD_BUDGET_FALLBACK_S = 1.5
+
+
+def _guard_budget() -> float:
+    return GUARD_BUDGET_FALLBACK_S if provider_health.is_open("gemini", settings.AI_PRIMARY_MODEL) else GUARD_BUDGET_S
+
+
+def _gemini_contents(turns: List[dict]) -> list:
+    """Provider-neutral turns → google-genai Contents (role "assistant" → "model"), audit P5."""
+    from google.genai import types as _gt
+    return [
+        _gt.Content(role="model" if t["role"] == "assistant" else "user", parts=[_gt.Part(text=t["content"])])
+        for t in turns
+    ]
 
 
 def _build_genai_config(gemini_gen_config: dict | None):
@@ -28,6 +66,8 @@ def _build_genai_config(gemini_gen_config: dict | None):
     try:
         from google.genai import types as _gt
         kwargs = {}
+        if gemini_gen_config.get("temperature") is not None:
+            kwargs["temperature"] = gemini_gen_config["temperature"]
         if gemini_gen_config.get("max_output_tokens"):
             kwargs["max_output_tokens"] = gemini_gen_config["max_output_tokens"]
         if gemini_gen_config.get("response_mime_type"):
@@ -41,13 +81,35 @@ def _build_genai_config(gemini_gen_config: dict | None):
         return None
 
 
+# Optional per-generation metadata observer (plan amendment 5). When set (by
+# scripts/eval_tailoring.py), each provider stream reports one dict:
+#   {provider, model, input_tokens, output_tokens, thoughts_tokens, finish_reason}
+# Unset (the default) → no extra work and no change to any provider request.
+generation_observer: ContextVar[Optional[Callable[[dict], None]]] = ContextVar(
+    "generation_observer", default=None
+)
+
+
+def _report_generation(meta: dict) -> None:
+    observer = generation_observer.get()
+    if observer is not None:
+        try:
+            observer(meta)
+        except Exception:  # an observer must never break generation
+            pass
+
+
 def _is_retryable(exc: Exception) -> bool:
-    """Return True for transient Gemini errors that warrant a retry."""
-    msg = str(exc)
-    return any(k in msg for k in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "quota"))
+    """Only 429 / 5xx / timeouts / connection errors retry (provider_health.classify).
+
+    400/401/402/403/404 are non-retryable — e.g. a 402 "credits depleted"
+    RESOURCE_EXHAUSTED used to be retried 4× across two models before falling back.
+    """
+    return provider_health.is_retryable(exc)
 
 
-async def _gemini_generate_with_retry(client, model: str, contents, config=None, max_retries: int = 2):
+async def _gemini_generate_with_retry(client, model: str, contents, config=None, max_retries: int = 2,
+                                     temperature: float | None = None):
     """Call client.aio.models.generate_content with exponential-backoff retry on 503/429.
 
     Retry order: primary model × 2, then backup model × 1, then raise for caller's fallback.
@@ -59,22 +121,29 @@ async def _gemini_generate_with_retry(client, model: str, contents, config=None,
 
     last_exc: Exception | None = None
     for m in models_to_try:
+        if provider_health.is_open("gemini", m):
+            last_exc = last_exc or RuntimeError(f"gemini:{m} skipped (circuit breaker open)")
+            continue
+        model_config = config
+        if temperature is not None and supports_temperature("gemini", m):
+            model_config = (config.model_copy(update={"temperature": temperature}) if config is not None
+                            else _build_genai_config({"temperature": temperature}))
         for attempt in range(max_retries if m == model else 1):
             try:
                 return await client.aio.models.generate_content(
-                    model=m, contents=contents, config=config,
+                    model=m, contents=contents, config=model_config,
                 )
             except Exception as exc:
                 last_exc = exc
-                if _is_retryable(exc) and attempt < max_retries - 1:
+                kind = provider_health.record_failure("gemini", m, exc)
+                if kind == "retryable" and attempt < max_retries - 1:
                     wait = 0.5 * (2 ** attempt)
-                    print(f"[Gemini] 503/429 ({m}) attempt {attempt + 1}, retry in {wait}s…", flush=True)
+                    logger.warning("[Gemini] %s retryable error (%s), attempt %d, retry in %.1fs", m, exc, attempt + 1, wait)
                     await asyncio.sleep(wait)
                     continue
-                if _is_retryable(exc):
-                    print(f"[Gemini] 503/429 ({m}) exhausted, trying backup model…", flush=True)
-                    break
-                raise
+                if kind in ("retryable", "not_found"):
+                    break  # next model
+                raise  # auth/billing, bad request, other → caller's next provider
     raise last_exc  # type: ignore[misc]
 
 
@@ -155,635 +224,77 @@ class AIService:
 
         return ""
 
-    def _get_grade_band(self, grade: int | None) -> str:
-        """Return a descriptive grade band for calibrating responses."""
-        if not grade:
-            return ""
-        if grade <= 3:
-            return "early-primary"
-        elif grade <= 6:
-            return "upper-primary"
-        elif grade <= 9:
-            return "middle-school"
-        else:
-            return "high-school"
+    # Prompt assembly (grade × board profiles, settings, language clause) lives
+    # in app/prompts/ — see app/prompts/builder.py (plan §2, audit §7.4).
 
-    # ------------------------------------------------------------------
-    # Grade × Board fused profile builders
-    # ------------------------------------------------------------------
-
-    def _build_grade_board_profile(self, grade: int, band: str, board_key: str) -> str:
-        """Build a single fused instruction that merges grade AND board so they
-        create measurably different outputs.  The board modifies vocabulary
-        ceiling, depth, structure, example style, and response length relative
-        to the grade baseline."""
-
-        # --- Age-range label ---
-        age_map = {
-            "early-primary": "ages 6-8",
-            "upper-primary": "ages 9-11",
-            "middle-school": "ages 12-14",
-            "high-school": "ages 15-17",
-        }
-        age = age_map.get(band, "")
-
-        # --- Per-board OUTPUT RULES that create visible differences ---
-        # Each tuple: (vocab_rule, structure_rule, depth_rule, example_rule,
-        #              length_rule, engagement_rule, curriculum_note)
-        board_rules = {
-            "STATE": {
-                "label": "State Board",
-                "vocab": (
-                    "Use ONLY the simplest everyday words. Prefer one-syllable or two-syllable words. "
-                    "If a technical term is unavoidable, immediately follow it with '(that means …)' in the simplest possible words. "
-                    "Write as if the student thinks in their regional language and reads English as a second language."
-                ),
-                "structure": (
-                    "Use VERY short bullet points — max 8-10 words per bullet. "
-                    "One idea per bullet. NO paragraphs. NO long sentences. "
-                    "Use numbered lists for steps. Keep total response SHORT (aim for 40-60% the length of a CBSE answer)."
-                ),
-                "depth": (
-                    "Cover ONLY the basic fact or definition. Do NOT go deeper unless asked. "
-                    "One example is enough. Skip edge cases, history, or 'why' explanations unless the student asks."
-                ),
-                "examples": (
-                    "Use local, everyday Indian examples: village life, markets, farming, cooking, festivals, family. "
-                    "Avoid Western or unfamiliar references. Make examples feel like home."
-                ),
-                "engagement": (
-                    "Keep it warm and encouraging but brief. A simple 'Good question!' is enough. "
-                    "Ask ONE simple check question at the end, nothing more."
-                ),
-                "curriculum": (
-                    "Follow State Board textbook patterns. Answers should look like what their textbook says — "
-                    "plain, direct, definition-style. State Board rewards brevity and correctness."
-                ),
-            },
-            "CBSE": {
-                "label": "CBSE",
-                "vocab": (
-                    "Use standard textbook English matching NCERT language level. "
-                    "Introduce key terms with **bold** and explain them clearly. "
-                    "Language should feel like reading an NCERT chapter — neither too simple nor too complex."
-                ),
-                "structure": (
-                    "Structure answers POINT-WISE with key terms **bolded** — this is the CBSE exam-answer format. "
-                    "Use numbered points for processes/steps. Use bullet points for lists of features/types. "
-                    "Include clear headings or sub-sections for longer answers. Medium-length response."
-                ),
-                "depth": (
-                    "Cover the concept thoroughly as NCERT does: definition + explanation + example. "
-                    "Include ONE worked example for Maths/Science. Mention diagram descriptions where relevant. "
-                    "Cover the standard scope — not too shallow, not too deep."
-                ),
-                "examples": (
-                    "Use examples from NCERT textbooks when possible. Otherwise use Indian context: "
-                    "Indian geography, Indian history, Indian daily life. Mix of rural and urban references."
-                ),
-                "engagement": (
-                    "Be structured and clear. Include a 'Think about it' prompt or a check question. "
-                    "For higher grades, include exam tips: 'In board exams, this is often asked as…'"
-                ),
-                "curriculum": (
-                    "Follow NCERT terminology and definitions EXACTLY — students are tested on specific wording. "
-                    "Use the same concept ordering as NCERT chapters. For definitions, prefer the textbook phrasing."
-                ),
-            },
-            "ICSE": {
-                "label": "ICSE",
-                "vocab": (
-                    "Use richer vocabulary than CBSE — ICSE students are exposed to more advanced English. "
-                    "Introduce technical terms confidently and use them throughout. "
-                    "Sentences can be longer and more nuanced. Use academic but accessible language."
-                ),
-                "structure": (
-                    "Use PARAGRAPH-form answers — ICSE expects flowing, well-written responses, not just bullet points. "
-                    "Structure with clear topic sentences. Use bullets only for lists of items. "
-                    "Answers should be MORE DETAILED than CBSE-style — about 30-50% longer."
-                ),
-                "depth": (
-                    "Go deeper than the basic definition — explain WHY, not just WHAT. "
-                    "Include the reasoning behind concepts. Show cause-and-effect chains. "
-                    "For Science, include experiment details, observations, and inferences. "
-                    "For Maths, show alternative methods when they exist."
-                ),
-                "examples": (
-                    "Use a mix of Indian and international examples. ICSE values broader exposure. "
-                    "Include real-world applications: 'This is used in…' or 'Scientists discovered this when…' "
-                    "Multiple examples are welcome to show different facets of a concept."
-                ),
-                "engagement": (
-                    "Encourage analytical thinking: 'Why do you think this happens?' "
-                    "Pose application questions: 'How would you use this in…?' "
-                    "For older students, include comparison questions: 'How is this different from…?'"
-                ),
-                "curriculum": (
-                    "Follow ICSE/ISC syllabus depth. Use textbook approaches from Selina, Concise, Frank publishers. "
-                    "ICSE tests understanding over memorisation — answers should demonstrate comprehension."
-                ),
-            },
-            "IB": {
-                "label": "IB (International Baccalaureate)",
-                "vocab": (
-                    "Use sophisticated, globally-aware vocabulary. Even for young students, introduce precise terms "
-                    "and build vocabulary actively. Use words like 'investigate', 'explore', 'consider'. "
-                    "Language should feel international — no regional bias."
-                ),
-                "structure": (
-                    "Use an INQUIRY-BASED structure: pose a question → explore → discover → reflect. "
-                    "Weave questions INTO the explanation, not just at the end. "
-                    "Use IB command terms naturally (describe, explain, analyse, evaluate). "
-                    "Responses should be the MOST DETAILED of all boards — thoroughness is valued."
-                ),
-                "depth": (
-                    "Go DEEP — explore multiple angles, perspectives, and connections. "
-                    "Connect to other subjects (interdisciplinary links). "
-                    "Include 'big picture' thinking: how does this connect to global issues, ethics, or other cultures? "
-                    "Encourage the student to form their own conclusions."
-                ),
-                "examples": (
-                    "Use GLOBAL, DIVERSE examples from different countries and cultures. "
-                    "Include current events, real-world problems, and sustainability connections. "
-                    "Avoid culturally narrow examples — IB values international-mindedness."
-                ),
-                "engagement": (
-                    "Make it highly interactive and inquiry-driven. Ask open-ended questions throughout. "
-                    "Include 'What do you think?' and 'How might this be different in another country?' "
-                    "Connect to TOK (Theory of Knowledge) concepts where natural. "
-                    "End with a reflection or exploration prompt."
-                ),
-                "curriculum": (
-                    "Follow IB curriculum philosophy. Reference IB assessment criteria and command terms. "
-                    "IB values process over product — show thinking, not just answers."
-                ),
-            },
-            "CAMBRIDGE": {
-                "label": "Cambridge (IGCSE/A-Level)",
-                "vocab": (
-                    "Use precise, formal academic English. Cambridge values exactness in language. "
-                    "Technical terms should be used correctly from the start with clear definitions. "
-                    "Avoid colloquial language — maintain an academic register throughout."
-                ),
-                "structure": (
-                    "Use a LOGICAL ARGUMENT structure: claim → evidence → reasoning → conclusion. "
-                    "Answers should be well-structured with clear progression. "
-                    "Use subheadings for longer responses. Include units, significant figures for Science/Maths. "
-                    "Response length should be DETAILED — Cambridge rewards thorough, precise answers."
-                ),
-                "depth": (
-                    "Be THOROUGH and PRECISE. Cover definitions, explanations, worked examples, and edge cases. "
-                    "For Science: include proper working with units at every step. "
-                    "For Maths: show full algebraic working. "
-                    "Include exam technique tips: mark allocation awareness, command word interpretation."
-                ),
-                "examples": (
-                    "Use international, scientifically rigorous examples. "
-                    "Include real-world applications with proper data/figures where relevant. "
-                    "Cambridge values evidence-based reasoning — examples should support arguments."
-                ),
-                "engagement": (
-                    "Be intellectually rigorous but supportive. Pose analytical questions. "
-                    "Include 'Examiner tip' callouts for exam-relevant advice. "
-                    "For higher grades, include past-paper style practice questions."
-                ),
-                "curriculum": (
-                    "Follow Cambridge International syllabus learning objectives. "
-                    "Use Cambridge-prescribed conventions and terminology. "
-                    "Cambridge emphasises structured, evidence-based reasoning throughout."
-                ),
-            },
-        }
-
-        rules = board_rules[board_key]
-
-        # --- Grade-specific engagement style ---
-        engagement_styles = {
-            "early-primary": (
-                "TONE: Warm, playful, like telling a short bedtime story to a curious child.\n"
-                "- Make it fun and vivid, as if painting a magical picture in their mind.\n"
-                "- Start with a fun hook: a tiny story, 'imagine this…', or a surprising fact.\n"
-                "- Use everyday objects, animals, food as analogies.\n"
-                "- Use 'First… Then… Finally…' patterns for steps.\n"
-                "- Celebrate curiosity: 'Great question!' or 'You're thinking like a little scientist!'\n"
-                "- Suggest a fun try-at-home activity when the topic allows.\n"
-                "RESPONSE LENGTH (strictly enforced):\n"
-                "- Short answers → single short paragraph, 8-9 lines max.\n"
-                "- Detailed answers → storytelling with humor and emojis, 10-12 lines max. Do NOT exceed 12 lines."
-            ),
-            "upper-primary": (
-                "TONE: Friendly and encouraging, like a cool older sibling who knows stuff.\n"
-                "- Open with 'Did you know?' fun facts or relatable scenarios.\n"
-                "- Use daily life, sports, nature examples they'd connect with.\n"
-                "- Include 'Think about it' moments and quick challenges.\n"
-                "- Break complex topics into numbered steps.\n"
-                "- End with 'What would happen if…?' scenarios.\n"
-                "RESPONSE LENGTH (strictly enforced):\n"
-                "- Short answers → concise summary in 4-5 lines. Do NOT exceed 5 lines.\n"
-                "- Detailed answers → step-by-step with real-world applications, 10-15 lines max."
-            ),
-            "middle-school": (
-                "TONE: Clear and structured, balancing depth with accessibility.\n"
-                "- Start with thought-provoking real-world connections.\n"
-                "- Encourage critical thinking: 'What would happen if we changed X?'\n"
-                "- Walk through reasoning step-by-step.\n"
-                "- Connect concepts across subjects.\n"
-                "- Present common misconceptions and ask them to spot the error.\n"
-                "RESPONSE LENGTH (strictly enforced):\n"
-                "- Short answers → concise summary in 4-5 lines. Do NOT exceed 5 lines.\n"
-                "- Detailed answers → structured breakdown with applications, 15-20 lines max."
-            ),
-            "high-school": (
-                "TONE: Precise and academic but still supportive.\n"
-                "- Open with a conceptual question or real-world problem.\n"
-                "- Use Socratic prompts: 'Think about this before reading the answer…'\n"
-                "- Include 'Exam corner' tips and common pitfalls.\n"
-                "- Connect to competitive exams (JEE, NEET, CUET) where relevant.\n"
-                "- End with a practice problem or discussion question.\n"
-                "RESPONSE LENGTH (strictly enforced):\n"
-                "- Short answers → concise summary in 4-5 lines with exam relevance. Do NOT exceed 5 lines.\n"
-                "- Detailed answers → structured, competitive answer with principles and reasoning, 20-25 lines max."
-            ),
-        }
-
-        return (
-            f"STUDENT PROFILE: Grade {grade} ({age}) — {rules['label']}\n\n"
-            f"VOCABULARY RULES (follow strictly):\n{rules['vocab']}\n\n"
-            f"RESPONSE STRUCTURE (follow strictly):\n{rules['structure']}\n\n"
-            f"DEPTH & DETAIL:\n{rules['depth']}\n\n"
-            f"EXAMPLES & ANALOGIES:\n{rules['examples']}\n\n"
-            f"INTERACTIVE ENGAGEMENT:\n{rules['engagement']}\n"
-            f"{engagement_styles.get(band, '')}\n\n"
-            f"CURRICULUM ALIGNMENT:\n{rules['curriculum']}"
-        )
-
-    def _build_grade_only_profile(self, grade: int, band: str) -> str:
-        """Grade profile when no board is selected — the original behaviour."""
-        age_map = {
-            "early-primary": "ages 6-8",
-            "upper-primary": "ages 9-11",
-            "middle-school": "ages 12-14",
-            "high-school": "ages 15-17",
-        }
-        age = age_map.get(band, "")
-        profiles = {
-            "early-primary": (
-                f"The student is in Grade {grade} ({age}).\n"
-                "LANGUAGE & TONE:\n"
-                "- Use very simple words and short sentences a young child can understand.\n"
-                "- Use a warm, playful, encouraging tone — like telling a short bedtime story to a curious child.\n"
-                "- Make it fun and vivid, as if painting a magical picture in their mind.\n"
-                "- Avoid abstract concepts, technical terms, dialogue format, or any formal teaching tone.\n"
-                "RESPONSE LENGTH (strictly enforced):\n"
-                "- Short/simple questions → single short paragraph, 8-9 lines max. Keep words simple and imaginative.\n"
-                "- Detailed explanations → storytelling-based, back-and-forth between characters, "
-                "humor, excitement, emojis. 10-12 lines max. Do NOT exceed 12 lines.\n"
-                "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
-                "- Start explanations with a fun hook: a tiny story, a 'imagine this…' scenario, or a surprising fact.\n"
-                "- Use everyday objects, animals, colours, and food as analogies.\n"
-                "- Sprinkle in mini-challenges: 'Can you guess what happens next?' or 'Let's count together!'\n"
-                "- After explaining, ask a simple check question.\n"
-                "- Celebrate their curiosity: 'What a great question!'\n"
-                "- Use patterns like 'First… Then… Finally…' to make steps easy to follow.\n"
-                "- If the topic allows, suggest a fun activity: 'Try this at home: …'"
-            ),
-            "upper-primary": (
-                f"The student is in Grade {grade} ({age}).\n"
-                "LANGUAGE & TONE:\n"
-                "- Use clear, simple language with age-appropriate vocabulary.\n"
-                "- Introduce technical terms but always explain them in plain words right after.\n"
-                "- Keep explanations structured but friendly — not too formal.\n"
-                "RESPONSE LENGTH (strictly enforced):\n"
-                "- Short/simple questions → concise summary in 4-5 lines with structured explanations "
-                "and real-world applications. Do NOT exceed 5 lines for short answers.\n"
-                "- Detailed explanations → step-by-step breakdown with real-world applications, "
-                "keep within 10-15 lines.\n"
-                "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
-                "- Open with a 'Did you know?' fun fact or a relatable scenario.\n"
-                "- Use examples from daily life, school, sports, nature.\n"
-                "- Include 'Think about it' moments and quick challenges.\n"
-                "- Break complex topics into numbered steps with clear transitions.\n"
-                "- End with a thought-provoking 'What would happen if…?' scenario."
-            ),
-            "middle-school": (
-                f"The student is in Grade {grade} ({age}).\n"
-                "LANGUAGE & TONE:\n"
-                "- Use moderately detailed explanations with proper terminology.\n"
-                "- Define key terms when first introduced, then use them naturally.\n"
-                "- Be clear and structured, balancing depth with accessibility.\n"
-                "RESPONSE LENGTH (strictly enforced):\n"
-                "- Short/simple questions → concise summary in 4-5 lines with structured explanations "
-                "and real-world applications. Do NOT exceed 5 lines for short answers.\n"
-                "- Detailed explanations → detailed step-by-step breakdown with real-world applications, "
-                "keep within 15-20 lines.\n"
-                "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
-                "- Start with a thought-provoking question or real-world connection.\n"
-                "- Encourage critical thinking: 'What do you think would happen if we changed X?'\n"
-                "- Walk through logic step-by-step.\n"
-                "- Connect concepts across subjects.\n"
-                "- Include quick self-check questions."
-            ),
-            "high-school": (
-                f"The student is in Grade {grade} ({age}).\n"
-                "LANGUAGE & TONE:\n"
-                "- Use precise academic language appropriate for senior students.\n"
-                "- Students are preparing for board exams and competitive entrances.\n"
-                "- Be thorough, cover edge cases, include exam-relevant tips.\n"
-                "RESPONSE LENGTH (strictly enforced):\n"
-                "- Short/simple questions → concise summary in 4-5 lines with technical concepts "
-                "and exam relevance. Do NOT exceed 5 lines for short answers.\n"
-                "- Detailed explanations → structured, competitive answer with principles and reasoning, "
-                "keep within 20-25 lines.\n"
-                "INTERACTIVE ENGAGEMENT (use these naturally, not all at once):\n"
-                "- Open with a conceptual question or real-world problem.\n"
-                "- Use Socratic-style prompts.\n"
-                "- Include 'Exam corner' tips and 'Common pitfall' callouts.\n"
-                "- Connect to competitive exam relevance (JEE, NEET, CUET).\n"
-                "- End with a practice problem or discussion question."
-            ),
-        }
-        return profiles.get(band, f"The student is in Grade {grade}.")
-
-    def _build_board_only_profile(self, board_key: str) -> str:
-        """Board profile when no grade is selected."""
-        board_profiles = {
-            "STATE": (
-                "BOARD: State Board\n"
-                "Use the simplest possible language. Short sentences, basic vocabulary. "
-                "Bullet points over paragraphs. Local everyday examples. "
-                "Keep answers brief and direct — State Board rewards correctness and brevity."
-            ),
-            "CBSE": (
-                "BOARD: CBSE\n"
-                "Follow NCERT terminology and conventions. Structure answers point-wise with **bold** key terms. "
-                "Use textbook-standard English. Include worked examples for Maths/Science."
-            ),
-            "ICSE": (
-                "BOARD: ICSE\n"
-                "Use richer vocabulary and paragraph-form answers. Explain 'why' not just 'what'. "
-                "Go deeper than surface definitions. Include real-world applications."
-            ),
-            "IB": (
-                "BOARD: IB\n"
-                "Use inquiry-based approach. Sophisticated vocabulary, global examples, multiple perspectives. "
-                "Encourage the student to form their own conclusions. Reference IB command terms."
-            ),
-            "CAMBRIDGE": (
-                "BOARD: Cambridge\n"
-                "Use precise formal academic English. Structure: claim -> evidence -> reasoning -> conclusion. "
-                "Include full working with units. Exam technique tips where relevant."
-            ),
-        }
-        return board_profiles.get(board_key, f"Follow {board_key} curriculum standards.")
-
-    def _build_context_prompt(self, context: dict | None) -> str:
-        if not context:
-            return ""
-
-        grade = context.get("grade")
-        board = context.get("board")
-        subject = context.get("subject")
-        language = context.get("language")
-        student_mode = context.get("student_mode")
-
-        parts = []
-
-        # --- Combined grade × board profile ---
-        # Grade and board are merged into ONE instruction block so they interact
-        # properly. The board modifies vocabulary ceiling, response depth, structure,
-        # and example style *relative to* the grade baseline — creating visible
-        # differences even at the same grade level.
-
-        band = self._get_grade_band(grade) if grade else None
-        board_key = None
-        if board:
-            board_upper = board.upper()
-            for k in ("CBSE", "ICSE", "STATE", "IB", "CAMBRIDGE"):
-                if k in board_upper:
-                    board_key = k
-                    break
-
-        if grade and board_key:
-            # Build a single fused instruction
-            parts.append(self._build_grade_board_profile(grade, band, board_key))
-        elif grade:
-            # Grade only (no board selected) — use default grade profile
-            parts.append(self._build_grade_only_profile(grade, band))
-        elif board_key:
-            # Board only (no grade) — just board instructions
-            parts.append(self._build_board_only_profile(board_key))
-        elif board:
-            parts.append(f"Follow {board} curriculum standards and conventions.")
-
-        if subject:
-            parts.append(f"Subject focus: {subject}. Keep your response relevant to this subject area.")
-        if language:
-            # Resolve language code (e.g. "hi", "ta") to full name ("Hindi", "Tamil")
-            lang_name = self._LANGUAGE_NAMES.get(language.lower(), language)
-            _base_name = lang_name.split("(")[0].strip().lower()
-            if _base_name != "english":
-                script = self._SCRIPT_MAP.get(_base_name, lang_name)
-                parts.append(
-                    f"RESPONSE LANGUAGE: {lang_name}. Write your ENTIRE response using ONLY {script} script. "
-                    f"Do NOT mix characters from other Indian/foreign scripts. "
-                    f"For example, if writing in Tamil, never use Devanagari (Hindi) characters — use only Tamil script. "
-                    f"Do NOT put English translations in parentheses like '(Gravity)' or '(Mass)' — "
-                    f"write the term directly in {lang_name} or use the English term as-is without parenthetical translation. "
-                    f"Do NOT use emojis or special Unicode symbols (🌟, ⚡, 🍔, etc.) in the response. "
-                    f"SCRIPT EXCEPTIONS (keep these in their standard form — do NOT transliterate or translate): "
-                    f"LaTeX math ($...$, $$...$$), chemical equations ($\\ce{{...}}$), code blocks, "
-                    f"programming keywords, variable names, and standard scientific symbols. "
-                    f"SPELLING & GRAMMAR ACCURACY: Use correct {lang_name} orthography throughout. "
-                    f"Every word must use proper character combinations, vowel signs, and conjuncts for {lang_name}. "
-                    f"Do NOT produce transliterated English written in {lang_name} script — use genuine {lang_name} vocabulary."
-                )
-            else:
-                # Explicit English instruction — prevents the model from continuing
-                # in a non-English language carried over from prior conversation turns
-                # or from topic-based associations (e.g. Indian history topics).
-                parts.append(
-                    "RESPONSE LANGUAGE: English. You MUST respond entirely in English. "
-                    "Do NOT use Hindi, Tamil, or any other language in your response — "
-                    "even if the topic relates to Indian history, culture, or a non-English subject, "
-                    "and even if earlier messages in this conversation were in another language."
-                )
-
-        return "\n".join(parts) if parts else ""
-
-    def _build_settings_prompt(self, chat_settings: dict | None) -> str:
-        """Build a system prompt section from per-chat AI settings."""
-        if not chat_settings:
-            return ""
-        parts = []
-
-        # Personality — how the AI should behave
-        personality_map = {
-            "mentor": (
-                "Act as a supportive mentor. Guide with encouragement and wisdom. "
-                "Ask thought-provoking questions to help the student discover answers themselves. "
-                "Celebrate effort and progress, not just correct answers. "
-                "When correcting mistakes, be gentle — frame it as learning."
-            ),
-            "coach": (
-                "Act as a focused, results-driven coach. Be direct and action-oriented. "
-                "Push the student to think critically — don't give answers immediately, "
-                "guide them with leading questions. Set clear expectations and challenge them to improve. "
-                "Praise effort but always raise the bar."
-            ),
-            "tutor": (
-                "Act as a patient, methodical tutor. Break down every concept into clear steps. "
-                "After each explanation, verify understanding with a quick check question. "
-                "If the student seems confused, try a different approach or analogy. "
-                "Never rush — understanding matters more than coverage."
-            ),
-            "friend": (
-                "Act as a knowledgeable, relatable friend. Explain things casually, "
-                "using everyday language, pop culture references, and humour where appropriate. "
-                "Avoid sounding like a textbook — be conversational and approachable."
-            ),
-            "professor": (
-                "Act as an authoritative professor. Deliver comprehensive, academically rigorous responses. "
-                "Use precise terminology and formal structure. Cite concepts, theories, and frameworks. "
-                "Maintain an intellectual but respectful tone."
-            ),
-            "technical-expert": (
-                "Act as a senior technical expert. Use precise, industry-standard terminology. "
-                "Dive into implementation details, cover edge cases, and reference best practices. "
-                "Assume the student wants depth, not surface-level explanations."
-            ),
-            "helpful": "Be helpful, clear, and informative in your responses.",
-        }
-        personality = chat_settings.get("personality", "helpful")
-        parts.append(personality_map.get(personality, personality_map["helpful"]))
-
-        # Difficulty — how deep and complex the response should be
-        difficulty_map = {
-            "easy": (
-                "Difficulty: EASY. Use the simplest possible language. "
-                "No jargon, no technical terms unless you explain them immediately. "
-                "Prefer everyday analogies and short sentences. "
-                "If explaining a formula, show it step-by-step with numbers, not just symbols."
-            ),
-            "medium": (
-                "Difficulty: MEDIUM. Use clear explanations with moderate technical depth. "
-                "Define key terms when first introduced. Balance simplicity with accuracy. "
-                "Include one or two examples to reinforce understanding."
-            ),
-            "hard": (
-                "Difficulty: HARD. Use advanced concepts and proper technical terminology. "
-                "Do not over-explain basics — the student knows the foundations. "
-                "Focus on deeper understanding, exceptions, and interconnections between topics."
-            ),
-            "expert": (
-                "Difficulty: EXPERT. Assume expert-level knowledge. "
-                "Skip introductory definitions entirely. Focus on nuance, edge cases, "
-                "trade-offs, proofs, derivations, and cutting-edge aspects. "
-                "Use precise notation and formal reasoning."
-            ),
-        }
-        difficulty = chat_settings.get("difficulty", "medium")
-        parts.append(difficulty_map.get(difficulty, difficulty_map["medium"]))
-
-        # Content length — with explicit line limits to prevent over-generation
-        length_map = {
-            "small": "LENGTH: Be extremely brief — 1-3 sentences maximum (4-5 lines). Just the core answer, nothing extra.",
-            "brief": "LENGTH: Keep it concise — 1-2 short paragraphs (6-8 lines max). Get to the point fast.",
-            "summary": "LENGTH: Give a focused summary — 2-3 paragraphs (10-12 lines max) covering key points without excessive detail.",
-            "medium": "LENGTH: Provide a moderately detailed response (12-15 lines) covering key points with some examples.",
-            "detailed": "LENGTH: Provide a comprehensive, in-depth response (18-25 lines) with thorough explanations, examples, and structure.",
-            "deep-dive": (
-                "LENGTH: Provide an exhaustive deep-dive (30+ lines allowed). Cover every important aspect, "
-                "edge case, and example. Use headings and sub-sections to organise."
-            ),
-        }
-        content_length = chat_settings.get("content_length", "medium")
-        parts.append(length_map.get(content_length, length_map["medium"]))
-
-        if chat_settings.get("explain_3ways"):
-            parts.append(
-                "IMPORTANT — Explain in 3 Ways (this is SEPARATE from the content length rule above):\n"
-                "First, answer the user's question normally following the LENGTH rule above.\n"
-                "Then, AFTER your main answer, add a divider line (---) and provide these three clearly labelled sections:\n"
-                "**Analogy:** A simple, relatable analogy or metaphor that makes the concept easy to grasp.\n"
-                "**Technical:** A precise, formal definition or technical explanation.\n"
-                "**Real-World Example:** A concrete, real-world application or example of the concept in action.\n"
-                "Each of these three sections should always be 3-5 lines regardless of the content length setting. "
-                "The content length setting applies ONLY to the main answer above the divider, NOT to the 3-way explanation."
+    async def _complete(
+        self, provider: str, system_prompt: str, turns: List[dict], *,
+        max_tokens: int | None, temperature: float | None, json_mode: bool = False,
+    ) -> str | None:
+        """One non-streaming completion. None = provider unavailable (not configured
+        or circuit breaker open); exceptions propagate after being recorded."""
+        if provider == "gemini":
+            client = self._get_gemini_async()
+            if not client:
+                return None
+            config = _build_genai_config({
+                "system_instruction": system_prompt,
+                "max_output_tokens": max_tokens,
+                "response_mime_type": "application/json" if json_mode else None,
+            })
+            # _gemini_generate_with_retry applies the breaker and the per-model
+            # temperature family check (no temperature for Gemini 3.x+).
+            response = await _gemini_generate_with_retry(
+                client, settings.AI_PRIMARY_MODEL, _gemini_contents(turns), config, temperature=temperature,
             )
+            return response.text
+
+        if provider == "openai":
+            client, model = self._get_openai(), settings.AI_FALLBACK_MODEL
         else:
-            parts.append(
-                "IMPORTANT: Do NOT use the 'Explain in 3 Ways' format. Do NOT include Analogy/Technical/Real-World Example sections. "
-                "Even if previous messages in this conversation used that format, it is now TURNED OFF. "
-                "Give a direct, normal response without splitting into those three sections."
+            client, model = self._get_anthropic(), settings.AI_DOCUMENT_MODEL
+        if not client or provider_health.is_open(provider, model):
+            return None
+        try:
+            if provider == "openai":
+                kwargs: dict = {"model": model,
+                                "messages": [{"role": "system", "content": system_prompt}] + turns}
+                if max_tokens:
+                    kwargs["max_tokens"] = max_tokens
+                if temperature is not None and supports_temperature("openai", model):
+                    kwargs["temperature"] = temperature
+                if json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+                response = await client.chat.completions.create(**kwargs)
+                return response.choices[0].message.content
+            response = await client.messages.create(
+                model=model, max_tokens=max_tokens or 4096, system=system_prompt, messages=turns,
             )
-
-        if chat_settings.get("examples"):
-            parts.append("Always include concrete, real-world examples to illustrate every concept you explain.")
-        else:
-            parts.append(
-                "Do NOT add extra examples unless the user specifically asks for them. "
-                "Even if previous messages included examples, the examples setting is currently OFF."
-            )
-
-        output_mode = chat_settings.get("output_mode", "text")
-        if output_mode == "structured":
-            parts.append("Structure your response with clear headings (##) and logical sections.")
-        elif output_mode == "bullets":
-            parts.append("Present information primarily using bullet points and numbered lists.")
-        else:
-            parts.append("Use normal flowing text format. Do NOT force headings or bullet-point-only structure unless it naturally fits.")
-
-        if chat_settings.get("student_mode"):
-            parts.append(
-                "STUDENT MODE is ON. You are talking directly to a student, not a professional or teacher.\n"
-                "CONTENT GUARDRAILS (strictly enforced in student mode):\n"
-                "- You are an EDUCATIONAL assistant ONLY. Always answer questions that are relevant to learning, "
-                "academics, school subjects, homework, general knowledge, or personal development.\n"
-                "- If a student asks about something clearly non-educational (entertainment gossip, dating, social media drama), "
-                "gently redirect them: 'That's interesting! But as your study buddy, I'm best at helping with learning. "
-                "What subject are you working on?'\n"
-                "- NEVER provide content involving: explicit violence, self-harm, sexual content, drug use instructions, "
-                "weapons creation, or anything harmful to a minor.\n"
-                "- If a student asks about a sensitive topic that IS part of curriculum (e.g., reproduction in biology, "
-                "wars in history, chemical hazards in chemistry), answer it factually and age-appropriately for their grade. "
-                "These are legitimate academic topics — do not refuse them.\n"
-                "- Do NOT provide personal opinions on politics, religion, or controversial social issues. "
-                "Present multiple perspectives factually and let the student form their own views.\n"
-                "- If unsure whether a topic is appropriate, err on the side of answering educationally — "
-                "curious students should never feel shamed for asking questions.\n"
-                "CORE RULES:\n"
-                "- Use encouraging, supportive language throughout — be the teacher every student wishes they had.\n"
-                "- When correcting mistakes, be gentle: 'Almost! Let's look at it this way…' or 'Good thinking! Just one small thing…'\n"
-                "- When they get something right, celebrate it: 'Exactly right!' or 'You nailed it!'\n"
-                "- Never be condescending or patronising.\n"
-                "MAKE IT INTERACTIVE:\n"
-                "- Don't just lecture — engage. Weave in questions, prompts, and challenges naturally throughout.\n"
-                "- Use 'Let's think about this together…' to walk through reasoning collaboratively.\n"
-                "- After explaining a concept, include a quick check: 'Does that make sense? Here's a quick one to test it: …'\n"
-                "- Use scaffolded hints when they're stuck: give a nudge first, then more detail if needed.\n"
-                "- Relate the topic to things students care about — school life, future careers, or everyday situations.\n"
-                "- When appropriate, present the concept as a mini-story or scenario before the formal explanation.\n"
-                "- End responses with something forward-looking: a question to ponder, a challenge to try, or a 'next time you see X, notice how…' moment.\n"
-                "- Keep the energy positive and curious — learning should feel like discovery, not a chore."
-            )
-
-        # Note: followup, next_steps, and practice are handled as separate UI cards
-        # after the response — do NOT include them inside the response body.
-
-        return "\n".join(parts) if parts else ""
+            return response.content[0].text
+        except Exception as exc:
+            provider_health.record_failure(provider, model, exc)
+            raise
 
     async def chat(
-        self, messages: List[dict], context: dict | None = None,
-        chat_settings: dict | None = None, has_files: bool = False,
+        self, messages: List[dict], context: "dict | AIContextPayload | None" = None,
+        chat_settings: "dict | ChatSettingsPayload | None" = None, has_files: bool = False,
         max_output_tokens: int | None = None,
         json_mode: bool = False,
+        question: str | None = None,
     ) -> str:
         """Non-streaming chat with AI.
+
+        `context` / `chat_settings` may be raw dicts (legacy callers) or typed
+        payloads; both are normalised here (plan §1). `question` is the student's
+        raw message (exam-intent detection); defaults to the last user turn.
 
         Routing:
           - has_files=True  → OpenAI (better at document Q&A), Gemini fallback
           - has_files=False → Gemini Pro (direct questions), OpenAI fallback
         """
+        ctx = normalize_context(context)
+        cs = normalize_settings(chat_settings)
+
         # --- Content Guard: pre-generation check ---
         # Only run for user-facing chat calls (context/chat_settings present).
         # Internal service calls (mindmap, infographic, lesson plan, etc.) pass
@@ -791,23 +302,21 @@ class AIService:
         grade_context_instruction = None
         guard = None
         is_user_chat = context is not None or chat_settings is not None
-        language = (context or {}).get("language")
+        language = ctx.language if ctx else None
+        user_query = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                user_query = m.get("content", "")
+                break
 
         if is_user_chat:
             from app.services.content_guard import ContentGuardService, GuardAction
 
-            student_mode = bool(
-                (chat_settings or {}).get("student_mode")
-                or (context or {}).get("student_mode")
+            guard = ContentGuardService(
+                student_mode=effective_student_mode(ctx, cs),
+                grade=ctx.grade if ctx else None,
+                language=language,
             )
-            grade = (context or {}).get("grade")
-            guard = ContentGuardService(student_mode=student_mode, grade=grade, language=language)
-
-            user_query = ""
-            for m in reversed(messages):
-                if m.get("role") == "user":
-                    user_query = m.get("content", "")
-                    break
 
             if user_query:
                 guard_result = await guard.run_input_pipeline(user_query)
@@ -817,162 +326,34 @@ class AIService:
                 grade_context_instruction = guard_result.grade_context
         # --- End pre-generation check ---
 
-        context_str = self._build_context_prompt(context)
-        settings_str = self._build_settings_prompt(chat_settings)
-        system_prompt = (
-            "You are Genverse.ai, an AI-powered educational assistant built for students. "
-            "You are part of a learning platform used by school students from Grade 1 to Grade 12. "
-            "Every response you give should be helpful, age-appropriate, and focused on learning.\n\n"
-            "IMPORTANT RULES — follow these strictly:\n"
-            "1. NEVER mention your training data cutoff, knowledge cutoff date, or any date-based limitation "
-            "(e.g. never say 'As of late 2023', 'As of my last update', 'my training data goes up to', "
-            "'I don't have information after', etc.). Present information confidently without disclaimers "
-            "about when you were trained. If you are unsure about something, say so without referencing dates.\n"
-            "2. Math: use $...$ for inline math and $$...$$ for display/block math. "
-            "Never use \\(...\\) or \\[...\\] notation. "
-            "CRITICAL — NEVER wrap a sentence or example that contains math in backtick code spans. "
-            "BAD: `If $f(x) = x^3$, then $f'(x) = 3x^2$.` "
-            "GOOD: If $f(x) = x^3$, then $f'(x) = 3x^2$. "
-            "Backticks are ONLY for computer code, terminal commands, or variable names — never for math examples.\n"
-            "3. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
-            "4. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
-            "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax.\n"
-            "6. STUDENT SAFETY — this platform is used by minors (ages 6-17). You MUST:\n"
-            "   - NEVER provide instructions for violence, self-harm, weapons, illegal activities, or explicit sexual content.\n"
-            "   - NEVER use profanity, slang that is inappropriate for minors, or sexually suggestive language.\n"
-            "   - If asked about harmful topics, politely decline and redirect to educational alternatives.\n"
-            "   - For sensitive curriculum topics (biology reproduction, history of wars, chemical hazards), "
-            "answer factually and age-appropriately — these are valid educational topics.\n"
-            "   - Do NOT provide personal opinions on politics, religion, or controversial social issues. "
-            "Present multiple perspectives factually.\n"
-            "7. STAY EDUCATIONAL — You are a study buddy. Your purpose is to help students learn. "
-            "If a query is clearly non-educational (gossip, dating, social media drama), "
-            "briefly acknowledge it and gently steer back: 'I'm best at helping with learning! What subject are you working on?'\n"
-            "8. PROPORTIONAL RESPONSES — Always match your response length and depth to the input:\n"
-            "   - Greetings, small talk, thank you, ok, sure, etc. → 1-2 sentences max. "
-            "Example: 'Hey! I'm Genverse, your study buddy. What would you like to learn today?'\n"
-            "   - Simple/short questions → Brief, focused answer (1 short paragraph).\n"
-            "   - Substantive academic questions → Detailed, structured response with examples.\n"
-            "   NEVER pad short inputs with unsolicited examples, subject lists, exam tips, or motivational filler. "
-            "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default.\n"
-            "9. NEVER mention the student's grade level or curriculum board in your response. "
-            "Do NOT say things like 'As a Grade 5 student…', 'For your grade level…', "
-            "'Since you are in Grade 8…', 'According to CBSE…', 'In the ICSE curriculum…', "
-            "'Based on your board…'. Just answer naturally — the grade and board context shapes "
-            "your tone, depth, and curriculum focus internally, but must never appear in the output.\n"
-            "10. MATH FORMATTING CONVENTIONS (in addition to rule 2 above): units and numbers-with-units "
-            "inside math use \\mathrm{} with \\, spacing, e.g. $25\\,\\mathrm{mL}$, $9.8\\,\\mathrm{m/s^2}$. "
-            "Keep natural-language words OUTSIDE math delimiters; if a short word must appear inside math, "
-            "wrap it in \\text{...} and keep it brief. NEVER use $ to denote currency — write \"USD 5\" or "
-            "\"₹5\" instead; $ is reserved exclusively for opening/closing math. Never place $ or $$ "
-            "delimiters inside a fenced code block unless you are intentionally showing LaTeX source as an "
-            "example. This math notation convention (Latin letters, Western digits, standard LaTeX) applies "
-            "even when your response is in Tamil, Hindi, Arabic, or any other language — only the "
-            "surrounding prose changes language, never the math notation itself."
+        system_prompt = build_system_prompt(
+            ctx, cs, extra_instruction=grade_context_instruction,
+            history_has_three_ways=history_uses_three_ways(messages),
+            question=question or user_query,
         )
-        if context_str:
-            system_prompt += f"\n{context_str}"
-        if settings_str:
-            system_prompt += f"\n\n{settings_str}"
-        if grade_context_instruction:
-            system_prompt += f"\n\n{grade_context_instruction}"
+        # User-facing calls always carry a language reminder (English when unset);
+        # internal generators get none, so their own language notes stand.
+        prompt_language = (language or "en") if is_user_chat else None
+        turns = to_provider_messages(messages, prompt_language)
+        params = generation_params(ctx, cs, question or user_query, has_files, effective_student_mode(ctx, cs))
+        max_tokens = max_output_tokens or params.max_tokens
 
-        _conv = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
-        _lang_tag = ""
-        _rlang = language
-        if _rlang:
-            _rlang_name = self._LANGUAGE_NAMES.get(_rlang.lower(), _rlang)
-            if _rlang_name.lower() != "english":
-                _lang_tag = (
-                    f"\n\n[SYSTEM: Respond entirely in {_rlang_name}. "
-                    f"Use ONLY {_rlang_name} script — do NOT mix other scripts like Devanagari in Tamil or Tamil in Hindi. "
-                    f"CRITICAL EXCEPTIONS — keep these exactly as-is in standard notation: "
-                    f"LaTeX math ($...$, $$...$$), chemical equations ($\\ce{{...}}$), code blocks, and scientific symbols. "
-                    f"Use correct {_rlang_name} orthography — no spelling mistakes, no transliterated English.]"
-                )
-            else:
-                _lang_tag = (
-                    "\n\n[SYSTEM: Respond entirely in English. "
-                    "Do NOT use Hindi, Tamil, or any other language — "
-                    "regardless of the topic or previous conversation language.]"
-                )
-        full_prompt = system_prompt + "\n\n" + _conv + _lang_tag
-
+        # File-based queries → Claude, OpenAI, Gemini; direct questions → Gemini, OpenAI.
+        order = ("claude", "openai", "gemini") if has_files else ("gemini", "openai")
         response_text: str | None = None
-
-        # Build Gemini generation_config when custom options are requested
-        gemini_gen_config = {}
-        if max_output_tokens:
-            gemini_gen_config["max_output_tokens"] = max_output_tokens
-        if json_mode:
-            gemini_gen_config["response_mime_type"] = "application/json"
-        gemini_gen_config = gemini_gen_config or None
-
-        if has_files:
-            # File-based queries → Anthropic Claude primary, OpenAI fallback, Gemini fallback
+        for provider in order:
+            provider_max = max_tokens
+            if provider_max is None and provider == "openai" and has_files:
+                provider_max = 4096  # previous cap on the document path, kept
             try:
-                anthropic = self._get_anthropic()
-                if anthropic and response_text is None:
-                    claude_messages = [
-                        {"role": m["role"], "content": m["content"]}
-                        for m in messages if m["role"] != "system"
-                    ]
-                    if not claude_messages or claude_messages[0]["role"] != "user":
-                        claude_messages.insert(0, {"role": "user", "content": "Hello"})
-                    response = await anthropic.messages.create(
-                        model=settings.AI_DOCUMENT_MODEL,
-                        max_tokens=max_output_tokens or 4096,
-                        system=system_prompt,
-                        messages=claude_messages,
-                    )
-                    response_text = response.content[0].text
+                response_text = await self._complete(
+                    provider, system_prompt, turns, max_tokens=provider_max,
+                    temperature=params.temperature, json_mode=json_mode,
+                )
             except Exception as e:
-                print(f"[AIService] Anthropic chat failed: {e}", flush=True)
-            try:
-                openai = self._get_openai()
-                if openai and response_text is None:
-                    openai_kwargs: dict = {
-                        "model": settings.AI_FALLBACK_MODEL,
-                        "messages": [{"role": "system", "content": system_prompt}] + messages,
-                        "max_tokens": max_output_tokens or 4096,
-                    }
-                    if json_mode:
-                        openai_kwargs["response_format"] = {"type": "json_object"}
-                    response = await openai.chat.completions.create(**openai_kwargs)
-                    response_text = response.choices[0].message.content
-            except Exception as e:
-                print(f"[AIService] OpenAI chat fallback failed: {e}", flush=True)
-            try:
-                _gc = self._get_gemini_async()
-                if _gc and response_text is None:
-                    _cfg = _build_genai_config(gemini_gen_config)
-                    _r = await _gemini_generate_with_retry(_gc, settings.AI_PRIMARY_MODEL, full_prompt, _cfg)
-                    response_text = _r.text
-            except Exception as e:
-                print(f"[AIService] Gemini chat fallback failed: {e}", flush=True)
-        else:
-            # Direct questions → Gemini async primary, OpenAI fallback
-            try:
-                _gc = self._get_gemini_async()
-                if _gc and response_text is None:
-                    _cfg = _build_genai_config(gemini_gen_config)
-                    _r = await _gemini_generate_with_retry(_gc, settings.AI_PRIMARY_MODEL, full_prompt, _cfg)
-                    response_text = _r.text
-            except Exception as e:
-                print(f"[AIService] Gemini chat failed: {e}", flush=True)
-            try:
-                openai = self._get_openai()
-                if openai and response_text is None:
-                    openai_kwargs2: dict = {
-                        "model": settings.AI_FALLBACK_MODEL,
-                        "messages": [{"role": "system", "content": system_prompt}] + messages,
-                    }
-                    if json_mode:
-                        openai_kwargs2["response_format"] = {"type": "json_object"}
-                    response = await openai.chat.completions.create(**openai_kwargs2)
-                    response_text = response.choices[0].message.content
-            except Exception as e:
-                print(f"[AIService] OpenAI chat fallback failed: {e}", flush=True)
+                logger.warning("[AIService] %s chat failed: %s", provider, str(e)[:300])
+            if response_text is not None:
+                break
 
         if response_text is None:
             return self.error_message("not_configured", language)
@@ -988,21 +369,15 @@ class AIService:
 
         return response_text
 
-    async def _stream_gemini(self, full_prompt: str) -> AsyncIterator[str]:
-        """Stream from Gemini using the native async client (zero thread overhead).
+    async def _stream_gemini(self, system_prompt: str, turns: List[dict], params: GenParams) -> AsyncIterator[str]:
+        """Stream from Gemini: system_instruction + role-separated contents (audit P5).
 
-        Two optimisations vs. vanilla Gemini streaming:
-        1. thinking_budget=0 — disables gemini-2.5-flash's extended reasoning mode.
-           Without this the model silently "thinks" for 3-7 s before the first token
-           appears, giving GPT-4o-mini a huge perceived-speed advantage.
-        2. Chunk sub-division — Gemini natively returns 50-200 char blobs while
-           OpenAI streams ~10-30 chars. We split each blob into ≤15-char word-boundary
-           pieces and yield control (asyncio.sleep(0)) between them so uvicorn flushes
-           each SSE event before the next arrives, giving the user a smooth
-           per-word typewriter effect instead of whole-paragraph jumps.
-
-        Retries the initial connection up to 2 times on 503/429 before raising
-        so the caller can fall through to the next provider.
+        - thinking_budget=0 disables extended reasoning (TTFT ~7s → ~1s).
+        - Chunks are sub-divided into ≤15-char word-boundary pieces for a smooth
+          typewriter effect (asyncio.sleep(0) lets uvicorn flush each piece).
+        - Retries (429/5xx/timeouts only) and the backup model are used only
+          while NOTHING has been yielded yet — never after (audit G6).
+        - Models behind an open circuit breaker are skipped (provider_health).
         """
         client = self._get_gemini_async()
         if not client:
@@ -1012,104 +387,143 @@ class AIService:
         backup = settings.AI_GEMINI_BACKUP_MODEL
         models_to_try = [primary] + ([backup] if backup and backup != primary else [])
 
-        # Build a config that disables extended thinking (reduces TTFT from ~7s → ~1s).
-        # Gracefully skip if the SDK version doesn't expose ThinkingConfig yet.
-        _stream_config = None
-        try:
-            from google.genai import types as _gt
-            _stream_config = _gt.GenerateContentConfig(
-                thinking_config=_gt.ThinkingConfig(thinking_budget=0)
-            )
-        except Exception:
-            pass  # older SDK or model doesn't support it — fall through with no config
+        from google.genai import types as _gt
+        base_kwargs: dict = {"system_instruction": system_prompt}
+        if params.max_tokens:
+            base_kwargs["max_output_tokens"] = params.max_tokens
+
+        def _config_for(model_name: str):
+            kwargs = dict(base_kwargs)
+            temperature = params.temperature_for("gemini", model_name)   # None for Gemini 3.x+
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            try:
+                return _gt.GenerateContentConfig(thinking_config=_gt.ThinkingConfig(thinking_budget=0), **kwargs)
+            except Exception:  # older SDK without ThinkingConfig
+                return _gt.GenerateContentConfig(**kwargs)
+
+        contents = _gemini_contents(turns)
 
         last_exc: Exception | None = None
         for model_name in models_to_try:
+            if provider_health.is_open("gemini", model_name):
+                last_exc = last_exc or RuntimeError(f"gemini:{model_name} skipped (circuit breaker open)")
+                continue
             for attempt in range(2):
+                yielded = False
                 try:
-                    # generate_content_stream is an async def (coroutine) that returns
-                    # an AsyncIterator — it MUST be awaited before iterating.
+                    # generate_content_stream is a coroutine returning an AsyncIterator.
                     stream = await client.aio.models.generate_content_stream(
-                        model=model_name,
-                        contents=full_prompt,
-                        config=_stream_config,
+                        model=model_name, contents=contents, config=_config_for(model_name),
                     )
+                    last_chunk = None
                     async for chunk in stream:
+                        last_chunk = chunk
                         try:
                             text = chunk.text
                             if not text:
                                 continue
-                            # Sub-divide large chunks into ≤15-char word-boundary pieces
-                            # so SSE events look like per-token output (smooth typewriter).
-                            # asyncio.sleep(0) hands control back to the event loop so
-                            # uvicorn can flush each piece as a separate HTTP chunk.
                             words = text.split(' ')
                             buf = ''
-                            for j, word in enumerate(words):
-                                buf += ('' if j == 0 else ' ') + word
-                                if len(buf) >= 15 or j == len(words) - 1:
+                            for k, word in enumerate(words):
+                                buf += ('' if k == 0 else ' ') + word
+                                if len(buf) >= 15 or k == len(words) - 1:
+                                    yielded = True
                                     yield buf
                                     buf = ''
                                     await asyncio.sleep(0)
                         except (ValueError, AttributeError):
                             continue
+                    if generation_observer.get() is not None and last_chunk is not None:
+                        usage = getattr(last_chunk, "usage_metadata", None)
+                        cands = getattr(last_chunk, "candidates", None) or []
+                        _report_generation({
+                            "provider": "gemini", "model": model_name,
+                            "input_tokens": getattr(usage, "prompt_token_count", None),
+                            "output_tokens": getattr(usage, "candidates_token_count", None),
+                            "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+                            "finish_reason": str(getattr(cands[0], "finish_reason", None)) if cands else None,
+                        })
                     return  # stream completed successfully
                 except Exception as exc:
                     last_exc = exc
-                    if _is_retryable(exc) and attempt == 0:
-                        wait = 0.5
-                        print(f"[Gemini Stream] 503/429 ({model_name}), retrying in {wait}s…", flush=True)
-                        await asyncio.sleep(wait)
+                    kind = provider_health.record_failure("gemini", model_name, exc)
+                    if yielded:
+                        raise  # G6: never restart after text was shown
+                    if kind == "retryable" and attempt == 0:
+                        logger.warning("[Gemini Stream] %s retryable error, retrying in 0.5s: %s", model_name, str(exc)[:200])
+                        await asyncio.sleep(0.5)
                         continue
-                    if _is_retryable(exc):
-                        print(f"[Gemini Stream] 503/429 ({model_name}) exhausted → trying backup", flush=True)
+                    if kind in ("retryable", "not_found"):
                         break  # next model
-                    raise  # non-retryable error → let _prefetch fall to OpenAI
+                    raise  # auth/billing, bad request, other → next provider
         if last_exc:
             raise last_exc
 
-    async def _stream_openai(self, system_prompt: str, messages: List[dict]) -> AsyncIterator[str]:
+    async def _stream_openai(self, system_prompt: str, turns: List[dict], params: GenParams) -> AsyncIterator[str]:
         """Stream from OpenAI (natively async)."""
         openai = self._get_openai()
         if not openai:
             return
 
+        observing = generation_observer.get() is not None
+        extra: dict = {"stream_options": {"include_usage": True}} if observing else {}
+        if params.max_tokens:
+            extra["max_tokens"] = params.max_tokens
+        temperature = params.temperature_for("openai", settings.AI_FALLBACK_MODEL)
+        if temperature is not None:
+            extra["temperature"] = temperature
         stream = await openai.chat.completions.create(
             model=settings.AI_FALLBACK_MODEL,
-            messages=[{"role": "system", "content": system_prompt}] + messages,
+            messages=[{"role": "system", "content": system_prompt}] + turns,
             stream=True,
+            **extra,
         )
+        finish_reason = None
+        usage = None
         async for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage
+            if not chunk.choices:  # the include_usage chunk has no choices
+                continue
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
             delta = chunk.choices[0].delta.content
             if delta:
                 yield delta
+        if observing:
+            _report_generation({
+                "provider": "openai", "model": settings.AI_FALLBACK_MODEL,
+                "input_tokens": getattr(usage, "prompt_tokens", None),
+                "output_tokens": getattr(usage, "completion_tokens", None),
+                "thoughts_tokens": None, "finish_reason": finish_reason,
+            })
 
-    async def _stream_anthropic(self, system_prompt: str, messages: List[dict]) -> AsyncIterator[str]:
-        """Stream from Anthropic Claude (natively async)."""
+    async def _stream_anthropic(self, system_prompt: str, turns: List[dict], params: GenParams) -> AsyncIterator[str]:
+        """Stream from Anthropic Claude. `turns` are already normalised (G14).
+
+        No `temperature`: current Claude models reject it (see app/prompts/params.py).
+        """
         client = self._get_anthropic()
         if not client:
             return
 
-        # Convert messages: Anthropic expects role=user/assistant only, system is separate
-        claude_messages = []
-        for m in messages:
-            role = m["role"]
-            if role == "system":
-                continue  # system goes in the system parameter
-            claude_messages.append({"role": role, "content": m["content"]})
-
-        # Ensure messages alternate user/assistant — merge consecutive same-role
-        if not claude_messages or claude_messages[0]["role"] != "user":
-            claude_messages.insert(0, {"role": "user", "content": "Hello"})
-
         async with client.messages.stream(
             model=settings.AI_DOCUMENT_MODEL,
-            max_tokens=4096,
+            max_tokens=params.max_tokens or 4096,
             system=system_prompt,
-            messages=claude_messages,
+            messages=turns,
         ) as stream:
             async for text in stream.text_stream:
                 yield text
+            if generation_observer.get() is not None:
+                final = await stream.get_final_message()
+                _report_generation({
+                    "provider": "claude", "model": settings.AI_DOCUMENT_MODEL,
+                    "input_tokens": final.usage.input_tokens,
+                    "output_tokens": final.usage.output_tokens,
+                    "thoughts_tokens": None, "finish_reason": final.stop_reason,
+                })
 
     # ------------------------------------------------------------------
     # Document summarization (context-aware, map-reduce when needed)
@@ -1147,17 +561,19 @@ class AIService:
         Gemini is tried first because it has the largest context window
         and is fastest for large-document workloads.
         """
+        # Providers behind an open circuit breaker are skipped (provider_health).
         # 1. Gemini (1M context, fastest)
         gemini = self._get_gemini()
-        if gemini:
+        if gemini and not provider_health.is_open("gemini", settings.AI_PRIMARY_MODEL):
             try:
                 resp = await asyncio.to_thread(gemini.generate_content, prompt)
                 return resp.text or ""
             except Exception as e:
-                print(f"[Summary] Gemini {tag} failed: {e}", flush=True)
+                provider_health.record_failure("gemini", settings.AI_PRIMARY_MODEL, e)
+                logger.warning("[Summary] Gemini %s failed: %s", tag, str(e)[:300])
         # 2. Claude
         client = self._get_anthropic()
-        if client:
+        if client and not provider_health.is_open("claude", settings.AI_DOCUMENT_MODEL):
             try:
                 resp = await client.messages.create(
                     model=settings.AI_DOCUMENT_MODEL,
@@ -1166,10 +582,11 @@ class AIService:
                 )
                 return resp.content[0].text
             except Exception as e:
-                print(f"[Summary] Claude {tag} failed: {e}", flush=True)
+                provider_health.record_failure("claude", settings.AI_DOCUMENT_MODEL, e)
+                logger.warning("[Summary] Claude %s failed: %s", tag, str(e)[:300])
         # 3. OpenAI
         openai = self._get_openai()
-        if openai:
+        if openai and not provider_health.is_open("openai", settings.AI_FALLBACK_MODEL):
             try:
                 resp = await openai.chat.completions.create(
                     model=settings.AI_FALLBACK_MODEL,
@@ -1178,7 +595,8 @@ class AIService:
                 )
                 return resp.choices[0].message.content or ""
             except Exception as e:
-                print(f"[Summary] OpenAI {tag} failed: {e}", flush=True)
+                provider_health.record_failure("openai", settings.AI_FALLBACK_MODEL, e)
+                logger.warning("[Summary] OpenAI %s failed: %s", tag, str(e)[:300])
         return ""
 
     async def summarize_document_chunks(
@@ -1276,10 +694,15 @@ class AIService:
         return combined
 
     async def stream_chat(
-        self, messages: List[dict], context: dict | None = None,
-        chat_settings: dict | None = None, has_files: bool = False,
+        self, messages: List[dict], context: "dict | AIContextPayload | None" = None,
+        chat_settings: "dict | ChatSettingsPayload | None" = None, has_files: bool = False,
+        question: str | None = None,
     ) -> AsyncIterator[str]:
         """SSE streaming chat with AI.
+
+        `context` / `chat_settings` may be raw dicts or typed payloads (plan §1).
+        `question` is the student's raw message (exam-intent detection); it
+        defaults to the last user turn.
 
         Guard check and provider stream start concurrently so that by the
         time the guard LLM call finishes (~300ms), the first tokens from
@@ -1288,14 +711,18 @@ class AIService:
         """
         from app.services.content_guard import ContentGuardService, GuardAction
 
-        student_mode = bool(
-            (chat_settings or {}).get("student_mode")
-            or (context or {}).get("student_mode")
+        ctx = normalize_context(context)
+        cs = normalize_settings(chat_settings)
+        _stream_language = ctx.language if ctx else None
+        student = effective_student_mode(ctx, cs)
+        guard = ContentGuardService(
+            student_mode=student,
+            grade=ctx.grade if ctx else None,
+            language=_stream_language,
         )
-        grade = (context or {}).get("grade")
-        _stream_language = (context or {}).get("language")
-        guard = ContentGuardService(student_mode=student_mode, grade=grade, language=_stream_language)
 
+        # The guard sees the user's turn WITHOUT the language reminder: the
+        # reminder is added only to the provider copy below (amendment 9).
         user_query = ""
         for m in reversed(messages):
             if m.get("role") == "user":
@@ -1304,84 +731,12 @@ class AIService:
 
         # Build system prompt immediately (sync) — grade_context is intentionally
         # omitted here so the provider stream can start before the guard finishes.
-        context_str = self._build_context_prompt(context)
-        settings_str = self._build_settings_prompt(chat_settings)
-        system_prompt = (
-            "You are Genverse.ai, an AI-powered educational assistant built for students. "
-            "You are part of a learning platform used by school students from Grade 1 to Grade 12. "
-            "Every response you give should be helpful, age-appropriate, and focused on learning.\n\n"
-            "IMPORTANT RULES — follow these strictly:\n"
-            "1. NEVER mention your training data cutoff, knowledge cutoff date, or any date-based limitation "
-            "(e.g. never say 'As of late 2023', 'As of my last update', 'my training data goes up to', "
-            "'I don't have information after', etc.). Present information confidently without disclaimers "
-            "about when you were trained. If you are unsure about something, say so without referencing dates.\n"
-            "2. Math: use $...$ for inline math and $$...$$ for display/block math. "
-            "Never use \\(...\\) or \\[...\\] notation. "
-            "CRITICAL — NEVER wrap a sentence or example that contains math in backtick code spans. "
-            "BAD: `If $f(x) = x^3$, then $f'(x) = 3x^2$.` "
-            "GOOD: If $f(x) = x^3$, then $f'(x) = 3x^2$. "
-            "Backticks are ONLY for computer code, terminal commands, or variable names — never for math examples.\n"
-            "3. Chemical equations: use $\\ce{...}$ notation (e.g. $\\ce{H2O}$, $\\ce{2H2 + O2 -> 2H2O}$).\n"
-            "4. Tables: use standard Markdown pipe table syntax (| col | col | with a header separator row).\n"
-            "5. Lists, headings, bold, italic, code blocks: use standard Markdown syntax.\n"
-            "6. STUDENT SAFETY — this platform is used by minors (ages 6-17). You MUST:\n"
-            "   - NEVER provide instructions for violence, self-harm, weapons, illegal activities, or explicit sexual content.\n"
-            "   - NEVER use profanity, slang that is inappropriate for minors, or sexually suggestive language.\n"
-            "   - If asked about harmful topics, politely decline and redirect to educational alternatives.\n"
-            "   - For sensitive curriculum topics (biology reproduction, history of wars, chemical hazards), "
-            "answer factually and age-appropriately — these are valid educational topics.\n"
-            "   - Do NOT provide personal opinions on politics, religion, or controversial social issues. "
-            "Present multiple perspectives factually.\n"
-            "7. STAY EDUCATIONAL — You are a study buddy. Your purpose is to help students learn. "
-            "If a query is clearly non-educational (gossip, dating, social media drama), "
-            "briefly acknowledge it and gently steer back: 'I'm best at helping with learning! What subject are you working on?'\n"
-            "8. PROPORTIONAL RESPONSES — Always match your response length and depth to the input:\n"
-            "   - Greetings, small talk, thank you, ok, sure, etc. → 1-2 sentences max. "
-            "Example: 'Hey! I'm Genverse, your study buddy. What would you like to learn today?'\n"
-            "   - Simple/short questions → Brief, focused answer (1 short paragraph).\n"
-            "   - Substantive academic questions → Detailed, structured response with examples.\n"
-            "   NEVER pad short inputs with unsolicited examples, subject lists, exam tips, or motivational filler. "
-            "If the student hasn't asked a specific question, just warmly invite them to ask one. Be concise by default.\n"
-            "9. NEVER mention the student's grade level or curriculum board in your response. "
-            "Do NOT say things like 'As a Grade 5 student…', 'For your grade level…', "
-            "'Since you are in Grade 8…', 'According to CBSE…', 'In the ICSE curriculum…', "
-            "'Based on your board…'. Just answer naturally — the grade and board context shapes "
-            "your tone, depth, and curriculum focus internally, but must never appear in the output.\n"
-            "10. MATH FORMATTING CONVENTIONS (in addition to rule 2 above): units and numbers-with-units "
-            "inside math use \\mathrm{} with \\, spacing, e.g. $25\\,\\mathrm{mL}$, $9.8\\,\\mathrm{m/s^2}$. "
-            "Keep natural-language words OUTSIDE math delimiters; if a short word must appear inside math, "
-            "wrap it in \\text{...} and keep it brief. NEVER use $ to denote currency — write \"USD 5\" or "
-            "\"₹5\" instead; $ is reserved exclusively for opening/closing math. Never place $ or $$ "
-            "delimiters inside a fenced code block unless you are intentionally showing LaTeX source as an "
-            "example. This math notation convention (Latin letters, Western digits, standard LaTeX) applies "
-            "even when your response is in Tamil, Hindi, Arabic, or any other language — only the "
-            "surrounding prose changes language, never the math notation itself."
+        system_prompt = build_system_prompt(
+            ctx, cs, history_has_three_ways=history_uses_three_ways(messages),
+            question=question or user_query,
         )
-        if context_str:
-            system_prompt += f"\n{context_str}"
-        if settings_str:
-            system_prompt += f"\n\n{settings_str}"
-
-        _conv = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
-        _lang_tag = ""
-        _rlang = _stream_language
-        if _rlang:
-            _rlang_name = self._LANGUAGE_NAMES.get(_rlang.lower(), _rlang)
-            if _rlang_name.lower() != "english":
-                _lang_tag = (
-                    f"\n\n[SYSTEM: Respond entirely in {_rlang_name}. "
-                    f"Use ONLY {_rlang_name} script — do NOT mix other scripts like Devanagari in Tamil or Tamil in Hindi. "
-                    f"CRITICAL EXCEPTIONS — keep these exactly as-is in standard notation: "
-                    f"LaTeX math ($...$, $$...$$), chemical equations ($\\ce{{...}}$), code blocks, and scientific symbols. "
-                    f"Use correct {_rlang_name} orthography — no spelling mistakes, no transliterated English.]"
-                )
-            else:
-                _lang_tag = (
-                    "\n\n[SYSTEM: Respond entirely in English. "
-                    "Do NOT use Hindi, Tamil, or any other language — "
-                    "regardless of the topic or previous conversation language.]"
-                )
-        full_prompt = system_prompt + "\n\n" + _conv + _lang_tag
+        turns = to_provider_messages(messages, _stream_language or "en")
+        params = generation_params(ctx, cs, question or user_query, has_files, student)
 
         # --- Concurrent guard + provider startup ---
         # Guard runs as a background task while the provider stream is already fetching.
@@ -1393,53 +748,44 @@ class AIService:
         _queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         _stream_error: list = []
 
+        providers = {
+            "claude": (self._get_anthropic, settings.AI_DOCUMENT_MODEL, self._stream_anthropic),
+            "openai": (self._get_openai, settings.AI_FALLBACK_MODEL, self._stream_openai),
+            # Gemini applies the breaker per model inside _stream_gemini; here it is
+            # skipped quietly only when every Gemini model is behind an open breaker.
+            "gemini": (self._get_gemini_async, None, self._stream_gemini),
+        }
+        gemini_models = [m for m in (settings.AI_PRIMARY_MODEL, settings.AI_GEMINI_BACKUP_MODEL) if m]
+        order = ("claude", "openai", "gemini") if has_files else ("gemini", "openai")
+
         async def _prefetch():
             try:
-                if has_files:
+                for name in order:
+                    get_client, model, stream_fn = providers[name]
+                    if not get_client() or (model and provider_health.is_open(name, model)):
+                        continue
+                    if name == "gemini" and all(provider_health.is_open("gemini", m) for m in gemini_models):
+                        continue
+                    emitted = False
                     try:
-                        client = self._get_anthropic()
-                        if client:
-                            print(f"[MODEL] Anthropic (document Q&A): {settings.AI_DOCUMENT_MODEL}", flush=True)
-                            async for tok in self._stream_anthropic(system_prompt, messages):
-                                await _queue.put(tok)
-                            return
+                        logger.info("[MODEL] %s (%s): %s", name, "document Q&A" if has_files else "direct Q&A",
+                                    model or settings.AI_PRIMARY_MODEL)
+                        async for tok in stream_fn(system_prompt, turns, params):
+                            emitted = True
+                            await _queue.put(tok)
+                        return
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as e:
-                        print(f"[AIService] Anthropic stream failed: {e}", flush=True)
-                    try:
-                        client = self._get_openai()
-                        if client:
-                            print(f"[MODEL] OpenAI (document Q&A fallback): {settings.AI_FALLBACK_MODEL}", flush=True)
-                            async for tok in self._stream_openai(system_prompt, messages):
-                                await _queue.put(tok)
+                        if model:
+                            provider_health.record_failure(name, model, e)
+                        logger.warning("[AIService] %s stream failed%s: %s", name,
+                                       " after partial output" if emitted else "", str(e)[:300])
+                        if emitted:
+                            # G6: text was already shown — falling back would append a
+                            # second, complete answer. End with a localized notice.
+                            await _queue.put("\n\n" + self.error_message("generation_interrupted", _stream_language))
                             return
-                    except Exception as e:
-                        print(f"[AIService] OpenAI stream fallback failed: {e}", flush=True)
-                    try:
-                        if self._get_gemini_async():
-                            print(f"[MODEL] Gemini (document Q&A fallback): {settings.AI_PRIMARY_MODEL}", flush=True)
-                            async for tok in self._stream_gemini(full_prompt):
-                                await _queue.put(tok)
-                            return
-                    except Exception as e:
-                        print(f"[AIService] Gemini stream fallback failed: {e}", flush=True)
-                else:
-                    try:
-                        if self._get_gemini_async():
-                            print(f"[MODEL] Gemini (direct Q&A): {settings.AI_PRIMARY_MODEL}", flush=True)
-                            async for tok in self._stream_gemini(full_prompt):
-                                await _queue.put(tok)
-                            return
-                    except Exception as e:
-                        print(f"[AIService] Gemini stream failed: {e}", flush=True)
-                    try:
-                        client = self._get_openai()
-                        if client:
-                            print(f"[MODEL] OpenAI (direct Q&A fallback): {settings.AI_FALLBACK_MODEL}", flush=True)
-                            async for tok in self._stream_openai(system_prompt, messages):
-                                await _queue.put(tok)
-                            return
-                    except Exception as e:
-                        print(f"[AIService] OpenAI fallback failed: {e}", flush=True)
                 await _queue.put(self.error_message("temporarily_unavailable", _stream_language))
             except asyncio.CancelledError:
                 pass
@@ -1454,10 +800,16 @@ class AIService:
         # Hard timeout of 500ms: if the guard LLM call hasn't responded by then,
         # fail open so a slow/unavailable classifier never stalls the stream.
         if guard_task:
+            from app.services.content_guard import log_fail_open
+            budget = _guard_budget()
             try:
-                guard_result = await asyncio.wait_for(guard_task, timeout=0.5)
-            except (asyncio.TimeoutError, Exception):
+                guard_result = await asyncio.wait_for(guard_task, timeout=budget)
+            except asyncio.TimeoutError:
                 guard_result = None  # fail open — never block legitimate queries
+                log_fail_open(f"timeout: classifier(s) did not answer within {budget}s")
+            except Exception as exc:
+                guard_result = None
+                log_fail_open(f"guard error: {type(exc).__name__}: {str(exc)[:200]}")
             if guard_result and guard_result.action != GuardAction.ALLOW:
                 guard.log_guard_event(user_query, guard_result)
                 stream_task.cancel()
@@ -3202,33 +2554,37 @@ Return ONLY valid JSON in this exact structure:
         },
     }
 
-    _LANGUAGE_NAMES = {
-        "en": "English",
-        "hi": "Hindi (हिन्दी)",
-        "ta": "Tamil (தமிழ்)",
-        "te": "Telugu (తెలుగు)",
-        "fr": "French",
-        "de": "German",
-        "es": "Spanish",
-        "zh": "Chinese (中文)",
-        "ar": "Arabic (عربي)",
-        "pt": "Portuguese",
-    }
+    # Single source of truth lives in app/prompts/language.py (plan §2.1).
+    _LANGUAGE_NAMES = LANGUAGE_NAMES
 
     # Fallback/error text shown when generation fails outright (bypasses the LLM,
     # so it must be pre-translated rather than relying on the language-instruction prompt).
+    # hi/ta added in Phase 3 — DRAFT translations, need native-speaker review (plan D12).
     _ERROR_MESSAGES: dict[str, dict[str, str]] = {
         "generation_failed": {
             "en": "Sorry, I encountered an issue generating a response. Please try again.",
             "ar": "عذرًا، واجهت مشكلة أثناء إنشاء الرد. يرجى المحاولة مرة أخرى.",
+            "hi": "क्षमा करें, उत्तर तैयार करते समय कोई समस्या आ गई। कृपया फिर से प्रयास करें।",
+            "ta": "மன்னிக்கவும், பதிலை உருவாக்கும்போது ஒரு சிக்கல் ஏற்பட்டது. மீண்டும் முயற்சிக்கவும்.",
         },
         "not_configured": {
             "en": "AI service is not configured or all providers failed. Please check your API keys.",
             "ar": "خدمة الذكاء الاصطناعي غير مهيأة حاليًا أو فشلت جميع مزودي الخدمة. يرجى المحاولة لاحقًا.",
+            "hi": "AI सेवा अभी उपलब्ध नहीं है। कृपया थोड़ी देर बाद फिर से प्रयास करें।",
+            "ta": "AI சேவை இப்போது கிடைக்கவில்லை. சிறிது நேரம் கழித்து மீண்டும் முயற்சிக்கவும்.",
         },
         "temporarily_unavailable": {
             "en": "AI service is temporarily unavailable. Please try again in a moment.",
             "ar": "خدمة الذكاء الاصطناعي غير متاحة مؤقتًا. يرجى المحاولة مرة أخرى بعد قليل.",
+            "hi": "AI सेवा कुछ समय के लिए उपलब्ध नहीं है। कृपया एक पल बाद फिर से प्रयास करें।",
+            "ta": "AI சேவை தற்காலிகமாகக் கிடைக்கவில்லை. சிறிது நேரத்தில் மீண்டும் முயற்சிக்கவும்.",
+        },
+        # G6: the provider failed after part of the answer was already shown.
+        "generation_interrupted": {
+            "en": "The answer was interrupted before it finished. Please ask again to get the complete answer.",
+            "ar": "انقطعت الإجابة قبل اكتمالها. يرجى إعادة السؤال للحصول على الإجابة كاملة.",
+            "hi": "उत्तर पूरा होने से पहले ही रुक गया। पूरा उत्तर पाने के लिए कृपया फिर से पूछें।",
+            "ta": "பதில் முழுமையடைவதற்குள் நின்றுவிட்டது. முழுப் பதிலைப் பெற மீண்டும் கேளுங்கள்.",
         },
     }
 
@@ -3238,21 +2594,7 @@ Return ONLY valid JSON in this exact structure:
         entry = cls._ERROR_MESSAGES.get(key, cls._ERROR_MESSAGES["generation_failed"])
         return entry.get((language or "en").lower(), entry["en"])
 
-    # Maps language name → its writing script (used for strong script-enforcement instructions)
-    _SCRIPT_MAP = {
-        "hindi": "Devanagari (हिन्दी)",
-        "tamil": "Tamil (தமிழ்)",
-        "telugu": "Telugu (తెలుగు)",
-        "kannada": "Kannada (ಕನ್ನಡ)",
-        "malayalam": "Malayalam (മലയാളം)",
-        "bengali": "Bengali (বাংলা)",
-        "marathi": "Devanagari (मराठी)",
-        "gujarati": "Gujarati (ગુજરાતી)",
-        "punjabi": "Gurmukhi (ਪੰਜਾਬੀ)",
-        "urdu": "Urdu (اردو)",
-        "arabic": "Arabic (العربية)",
-        "chinese": "Chinese characters (中文)",
-    }
+    _SCRIPT_MAP = SCRIPT_MAP
 
     _HTML_FORMAT_RULES = (
         "FORMATTING: Use ONLY these HTML tags for formatting — no markdown syntax at all (no **, no #, no *, no _):\n"
@@ -5295,7 +4637,11 @@ Rules:
 - compatibility_scores: map each career title to its compatibility number
 - Return ONLY valid JSON. No markdown fences.
 {self._enhancement_language_note(language)}"""
-        response = await self.chat([{"role": "user", "content": prompt}], context)
+        # The <language> section must agree with the language note in the prompt
+        # (Phase 2 addition 4): career sends `language` separately, not in context.
+        response = await self.chat(
+            [{"role": "user", "content": prompt}], {**(context or {}), "language": language},
+        )
         try:
             cleaned = response.strip()
             if cleaned.startswith("```"):

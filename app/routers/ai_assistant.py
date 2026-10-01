@@ -1,5 +1,6 @@
 import uuid
 import logging
+from dataclasses import dataclass
 from typing import Optional
 from fastapi import APIRouter, status, Request, Query
 from fastapi.responses import StreamingResponse
@@ -20,6 +21,9 @@ from app.schemas.ai import (
     InfographicRequest, InfographicResponse,
     PracticeExercisesRequest, PracticeExercise, PracticeExercisesResponse,
     GeneratePracticeAssessmentRequest, GeneratedQuestionsResponse,
+)
+from app.schemas.ai_payloads import (
+    AIContextPayload, ChatSettingsPayload, normalize_context, normalize_settings,
 )
 from app.core.exceptions import NotFoundException
 from app.services.ai_service import AIService, get_ai_service
@@ -609,44 +613,77 @@ async def get_infographic_image(
     return {"image_base64": image_b64}
 
 
-@router.post("/chats/{chat_id}/messages/stream")
-async def send_message_stream(
-    chat_id: uuid.UUID,
-    payload: SendMessageRequest,
-    current_user: CurrentUser,
-    db: DBSession,
-):
-    """
-    Stream AI response via SSE (Server-Sent Events).
-    Client should use EventSource or fetch with streaming to consume.
-    """
-    chat_result = await db.execute(
-        select(AiChat).where(AiChat.id == chat_id, AiChat.user_id == current_user.id)
+@dataclass
+class ChatTurn:
+    """Everything one chat turn needs after the shared preparation steps."""
+    chat: AiChat
+    ctx: Optional[AIContextPayload]
+    settings: Optional[ChatSettingsPayload]
+    messages: list[dict]
+    has_files: bool
+    language: Optional[str]
+
+
+async def _get_owned_chat(chat_id: uuid.UUID, user_id, db) -> AiChat:
+    result = await db.execute(
+        select(AiChat).where(AiChat.id == chat_id, AiChat.user_id == user_id)
     )
-    chat = chat_result.scalar_one_or_none()
+    chat = result.scalar_one_or_none()
     if not chat:
         raise NotFoundException("Chat not found")
+    return chat
 
-    # Extract org_id from context for org-workspace point deduction
-    org_id = _parse_org_id((payload.context or {}).get("org_id"))
 
-    # Check feature access + usage limits
+def _owned_settings_query(chat_id: uuid.UUID, user_id):
+    """Settings row for a chat the user owns (audit G4: never by chat_id alone)."""
+    return (
+        select(AiChatSetting)
+        .join(AiChat, AiChatSetting.chat_id == AiChat.id)
+        .where(AiChatSetting.chat_id == chat_id, AiChat.user_id == user_id)
+    )
+
+
+async def _resolve_chat_settings(chat_id: uuid.UUID, raw_overlay, db) -> Optional[ChatSettingsPayload]:
+    """DB row overlaid with the client's chat_settings, normalised (plan §1.4).
+
+    Derived from the model, so new AiChatSetting columns flow through without
+    a hand-copied dict (audit §7.4).
+    """
+    result = await db.execute(select(AiChatSetting).where(AiChatSetting.chat_id == chat_id))
+    row = result.scalar_one_or_none()
+    base = ChatSettingsPayload.model_validate(row) if row else None
+    return normalize_settings(raw_overlay, base)
+
+
+async def _prepare_chat_turn(
+    chat_id: uuid.UUID,
+    payload: SendMessageRequest,
+    current_user,
+    db,
+    tag: str,
+) -> ChatTurn:
+    """Shared by the streaming and non-streaming send routes (audit §7.4).
+
+    Order: ownership → usage limit → save user message (+auto-title) →
+    settings → cost/deduction → history → RAG enrichment.
+    """
+    chat = await _get_owned_chat(chat_id, current_user.id, db)
+    ctx = normalize_context(payload.context)
+    org_id = _parse_org_id(ctx.org_id if ctx else None)
+
     points_service = PointsService()
     await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db, org_id=org_id)
 
-    # NOTE: Points deduction is deferred until after chat_settings are resolved (below)
-    # so we can calculate the total cost including enabled enhancements.
-
     # Save user message — store any attached filenames in sources_json so the
     # frontend can render them as file chips above the message bubble.
-    _inline_docs_meta = (payload.context or {}).get("inline_docs") or []
-    user_msg = AiChatMessage(
+    inline_docs = [d.model_dump() for d in ctx.inline_docs] if ctx else []
+    attached = [d["filename"] for d in inline_docs if d.get("filename")]
+    db.add(AiChatMessage(
         chat_id=chat_id,
         role="user",
         content=payload.message,
-        sources_json={"attached_files": [d["filename"] for d in _inline_docs_meta if d.get("filename")]} if _inline_docs_meta else None,
-    )
-    db.add(user_msg)
+        sources_json={"attached_files": attached} if inline_docs else None,
+    ))
 
     # Auto-title: if chat is still "New Chat", name it from the first 8 words of the message
     if chat.title == "New Chat":
@@ -658,36 +695,16 @@ async def send_message_stream(
 
     await db.commit()
 
-    # Fetch chat settings from DB; merge with any client-supplied settings
-    settings_result = await db.execute(
-        select(AiChatSetting).where(AiChatSetting.chat_id == chat_id)
-    )
-    db_settings = settings_result.scalar_one_or_none()
-    chat_settings: dict = {}
-    if db_settings:
-        chat_settings = {
-            "difficulty": db_settings.difficulty,
-            "personality": db_settings.personality,
-            "content_length": db_settings.content_length,
-            "explain_3ways": db_settings.explain_3ways,
-            "mind_map": db_settings.mind_map,
-            "infographic": db_settings.infographic,
-            "examples": db_settings.examples,
-            "output_mode": db_settings.output_mode,
-            "student_mode": db_settings.student_mode,
-            "video_refs": db_settings.video_refs,
-            "followup": db_settings.followup,
-            "practice": db_settings.practice,
-            "next_steps": db_settings.next_steps,
-        }
-    # Client-supplied settings overlay DB values (kept for backwards compatibility)
-    if payload.chat_settings:
-        chat_settings.update(payload.chat_settings)
+    chat_settings = await _resolve_chat_settings(chat_id, payload.chat_settings, db)
+    # Single student-mode authority (audit I7): the chat setting overrides the
+    # context copy, so the guard and the prompt can never disagree.
+    if ctx is not None and chat_settings is not None:
+        ctx = ctx.model_copy(update={"student_mode": chat_settings.student_mode})
 
     # Calculate total cost: base chat + enabled enhancement sub-features
     enabled_actions = [
         action for key, action in ENHANCEMENT_COST_MAP.items()
-        if chat_settings.get(key)
+        if chat_settings is not None and getattr(chat_settings, key)
     ]
     base_result = await db.execute(select(PointCost).where(PointCost.action == "basic_chat"))
     base_pc = base_result.scalars().first()
@@ -719,20 +736,15 @@ async def send_message_stream(
     ai = get_ai_service()
 
     # RAG: enrich messages with vault/library content when files are selected
-    selected_files: list[str] = (
-        payload.selected_files
-        or (payload.context or {}).get("selected_files")
-        or []
-    )
-    library_file_id: str | None = (payload.context or {}).get("library_file_id")
-    rag_language: str | None = (payload.context or {}).get("language")
+    selected_files: list[str] = payload.selected_files or (ctx.selected_files if ctx else []) or []
+    library_file_id: str | None = ctx.library_file_id if ctx else None
+    language: str | None = ctx.language if ctx else None
     is_summary = _is_summary_intent(payload.message)
 
     if selected_files:
         try:
             if is_summary:
                 # SUMMARY intent → fetch ALL chunks, map-reduce if large
-                # Resolve file name(s) for context
                 file_uuids = [uuid.UUID(fid) for fid in selected_files]
                 name_result = await db.execute(
                     select(UserLibraryItem.file_name)
@@ -740,7 +752,7 @@ async def send_message_stream(
                 )
                 vault_names = [n for n in name_result.scalars().all() if n]
                 vault_file_label = ", ".join(vault_names) if vault_names else None
-                print(f"[StreamChat] Summary intent detected — fetching full document: {vault_file_label}", flush=True)
+                logger.info("[%s] Summary intent detected — fetching full document: %s", tag, vault_file_label)
                 chunk_texts = await _fetch_all_chunks(
                     user_id=str(current_user.id),
                     file_ids=selected_files,
@@ -763,9 +775,9 @@ async def send_message_stream(
                     ai=ai,
                 )
                 if rag_text:
-                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language)
-        except Exception as e:
-            print(f"[StreamChat] RAG context build failed: {e}", flush=True)
+                    messages = _inject_rag(messages, payload.message, rag_text, language=language)
+        except Exception:
+            logger.exception("[%s] RAG context build failed", tag)
 
     # Library RAG: use public library book embeddings
     if library_file_id:
@@ -774,7 +786,7 @@ async def send_message_stream(
             book_title = lib_file.title if lib_file else "Unknown Book"
             if is_summary:
                 # SUMMARY intent → fetch ALL library chunks, map-reduce if large
-                print(f"[StreamChat] Summary intent for library book: {book_title}", flush=True)
+                logger.info("[%s] Summary intent for library book: %s", tag, book_title)
                 chunk_texts = await _fetch_all_library_chunks(
                     library_file_id=library_file_id,
                     db=db,
@@ -797,24 +809,52 @@ async def send_message_stream(
                 if lib_rag_text:
                     messages = _inject_library_rag(
                         messages, payload.message, lib_rag_text,
-                        book_title=book_title, language=rag_language,
+                        book_title=book_title, language=language,
                     )
-        except Exception as e:
-            print(f"[StreamChat] Library RAG context build failed: {e}", flush=True)
+        except Exception:
+            logger.exception("[%s] Library RAG context build failed", tag)
 
     # Inline docs: device-attached files sent from the frontend (not saved to vault)
-    inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
     if inline_docs:
-        messages = _inject_inline_docs(messages, payload.message, inline_docs, language=rag_language)
+        messages = _inject_inline_docs(messages, payload.message, inline_docs, language=language)
 
     # Detect if files are involved (vault selection, inline upload, or library book)
     has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id)
+
+    return ChatTurn(
+        chat=chat, ctx=ctx, settings=chat_settings, messages=messages,
+        has_files=has_files, language=language,
+    )
+
+
+def _interaction_snapshot(ctx: Optional[AIContextPayload]) -> dict:
+    return {
+        "subject":  ctx.subject if ctx else None,
+        "grade":    ctx.grade if ctx else None,
+        "board":    ctx.board if ctx else None,
+        "language": ctx.language if ctx else None,
+    }
+
+
+@router.post("/chats/{chat_id}/messages/stream")
+async def send_message_stream(
+    chat_id: uuid.UUID,
+    payload: SendMessageRequest,
+    current_user: CurrentUser,
+    db: DBSession,
+):
+    """
+    Stream AI response via SSE (Server-Sent Events).
+    Client should use EventSource or fetch with streaming to consume.
+    """
+    turn = await _prepare_chat_turn(chat_id, payload, current_user, db, tag="StreamChat")
+    ai = get_ai_service()
 
     # --- Instant greeting responses (no LLM call, zero tokens) ---
     # Canned replies are English-only text — only use the fast path when the
     # user's selected language is English (or unset); otherwise fall through
     # to the LLM so the greeting reply honors the selected language (e.g. Arabic).
-    _canned_ok_language = not rag_language or rag_language.lower() in ("en", "english")
+    _canned_ok_language = not turn.language or turn.language.lower() in ("en", "english")
     canned = _get_canned_response(payload.message) if _canned_ok_language else None
 
     async def event_stream():
@@ -838,16 +878,18 @@ async def send_message_stream(
             try:
                 # Gemini chunks are already sub-divided to ≤15 chars in _stream_gemini,
                 # so send each token straight through — no buffering needed.
-                async for chunk in ai.stream_chat(messages=messages, context=payload.context, chat_settings=chat_settings or None, has_files=has_files):
+                async for chunk in ai.stream_chat(
+                    messages=turn.messages, context=turn.ctx,
+                    chat_settings=turn.settings, has_files=turn.has_files,
+                    question=payload.message,
+                ):
                     full_response += chunk
                     yield f"data: {json.dumps({'delta': chunk})}\n\n"
-            except Exception as e:
-                import traceback
-                print(f"[StreamChat] Streaming error: {e}", flush=True)
-                traceback.print_exc()
+            except Exception:
+                logger.exception("[StreamChat] Streaming error")
                 # Send a user-visible error so the chat doesn't appear blank
                 if not full_response:
-                    error_msg = AIService.error_message("generation_failed", rag_language)
+                    error_msg = AIService.error_message("generation_failed", turn.language)
                     yield f"data: {json.dumps({'delta': error_msg})}\n\n"
                     full_response = error_msg
 
@@ -858,7 +900,7 @@ async def send_message_stream(
                     chat_id=chat_id,
                     role="assistant",
                     content=full_response,
-                    enhancements_json={"settings_snapshot": chat_settings} if chat_settings else None,
+                    enhancements_json={"settings_snapshot": turn.settings.model_dump()} if turn.settings else None,
                 )
                 session.add(assistant_msg)
                 chat_obj = await session.get(AiChat, chat_id)
@@ -866,22 +908,16 @@ async def send_message_stream(
                     from datetime import datetime, timezone
                     chat_obj.updated_at = datetime.now(timezone.utc)
                 # Track interaction for analytics (study-time, activity-heatmap)
-                ctx = payload.context or {}
                 session.add(AiInteractionHistory(
                     user_id=current_user.id,
                     service="ai-assistant",
                     query=payload.message[:500] if payload.message else None,
                     response_summary=full_response[:200] if full_response else None,
-                    context_snapshot={
-                        "subject":  ctx.get("subject"),
-                        "grade":    ctx.get("grade"),
-                        "board":    ctx.get("board"),
-                        "language": ctx.get("language"),
-                    },
+                    context_snapshot=_interaction_snapshot(turn.ctx),
                 ))
                 await session.commit()
-        except Exception as e:
-            print(f"[StreamChat] DB save error: {e}", flush=True)
+        except Exception:
+            logger.exception("[StreamChat] DB save error")
 
         yield "data: [DONE]\n\n"
 
@@ -899,160 +935,33 @@ async def send_message(
     current_user: CurrentUser,
     db: DBSession,
 ):
-    """Send a message and get a non-streaming response."""
-    chat_result = await db.execute(
-        select(AiChat).where(AiChat.id == chat_id, AiChat.user_id == current_user.id)
-    )
-    chat = chat_result.scalar_one_or_none()
-    if not chat:
-        raise NotFoundException("Chat not found")
+    """Send a message and get a non-streaming response.
 
-    # Extract org_id from context for org-workspace point deduction
-    org_id = _parse_org_id((payload.context or {}).get("org_id"))
-
-    points_service = PointsService()
-    await points_service.check_and_increment_usage(user_id=current_user.id, feature_key="ai_chat", db=db, org_id=org_id)
-
-    # Calculate dynamic cost based on enabled enhancements
-    cs = payload.chat_settings or {}
-    enabled_actions = [action for key, action in ENHANCEMENT_COST_MAP.items() if cs.get(key)]
-    base_result = await db.execute(select(PointCost).where(PointCost.action == "basic_chat"))
-    base_pc = base_result.scalars().first()
-    if not base_pc:
-        logger.warning("PointCost row for 'basic_chat' not found, defaulting to cost=1, xp=0")
-    total_cost = base_pc.cost if base_pc else 1
-    total_xp = (base_pc.xp_reward or 0) if base_pc else 0
-    if enabled_actions:
-        enh_result = await db.execute(select(PointCost).where(PointCost.action.in_(enabled_actions)))
-        for pc in enh_result.scalars().all():
-            total_cost += pc.cost
-            total_xp += pc.xp_reward or 0
-    await points_service.deduct_custom(
-        user_id=current_user.id, action="basic_chat", db=db,
-        cost_override=total_cost, xp_override=total_xp, org_id=org_id,
-    )
-
-    user_msg = AiChatMessage(chat_id=chat_id, role="user", content=payload.message)
-    db.add(user_msg)
-    await db.flush()
-
-    # Fetch most recent messages so follow-ups have context
-    history_result = await db.execute(
-        select(AiChatMessage)
-        .where(AiChatMessage.chat_id == chat_id)
-        .order_by(AiChatMessage.created_at.desc())
-        .limit(20)
-    )
-    history = list(reversed(history_result.scalars().all()))
-    messages = [{"role": m.role, "content": m.content} for m in history]
-
+    Shares all preparation with the streaming route (audit §7.4) and, unlike
+    before, passes the resolved chat settings to the model.
+    """
+    turn = await _prepare_chat_turn(chat_id, payload, current_user, db, tag="SendMessage")
     ai = get_ai_service()
 
-    # RAG: enrich messages with vault/library content when files are selected
-    selected_files: list[str] = (
-        payload.selected_files
-        or (payload.context or {}).get("selected_files")
-        or []
+    response_text = await ai.chat(
+        messages=turn.messages, context=turn.ctx,
+        chat_settings=turn.settings, has_files=turn.has_files,
+        question=payload.message,
     )
-    library_file_id_sync: str | None = (payload.context or {}).get("library_file_id")
-    rag_language_sync: str | None = (payload.context or {}).get("language")
-    is_summary_sync = _is_summary_intent(payload.message)
-
-    if selected_files:
-        try:
-            if is_summary_sync:
-                file_uuids_sync = [uuid.UUID(fid) for fid in selected_files]
-                name_result_sync = await db.execute(
-                    select(UserLibraryItem.file_name)
-                    .where(UserLibraryItem.id.in_(file_uuids_sync))
-                )
-                vault_names_sync = [n for n in name_result_sync.scalars().all() if n]
-                vault_label_sync = ", ".join(vault_names_sync) if vault_names_sync else None
-                chunk_texts = await _fetch_all_chunks(
-                    user_id=str(current_user.id),
-                    file_ids=selected_files,
-                    db=db,
-                )
-                if chunk_texts:
-                    summary_text = await ai.summarize_document_chunks(
-                        chunks=chunk_texts,
-                        user_question=payload.message,
-                    )
-                    if summary_text:
-                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=vault_label_sync)
-            else:
-                rag_text = await _build_rag_context(
-                    user_id=str(current_user.id),
-                    question=payload.message,
-                    file_ids=selected_files,
-                    db=db,
-                    ai=ai,
-                )
-                if rag_text:
-                    messages = _inject_rag(messages, payload.message, rag_text, language=rag_language_sync)
-        except Exception as e:
-            print(f"[SendMessage] RAG context build failed: {e}", flush=True)
-
-    # Library RAG: use public library book embeddings
-    if library_file_id_sync:
-        try:
-            lib_file_sync = await db.get(PublicFile, uuid.UUID(library_file_id_sync))
-            book_title_sync = lib_file_sync.title if lib_file_sync else "Unknown Book"
-            if is_summary_sync:
-                chunk_texts = await _fetch_all_library_chunks(
-                    library_file_id=library_file_id_sync,
-                    db=db,
-                )
-                if chunk_texts:
-                    summary_text = await ai.summarize_document_chunks(
-                        chunks=chunk_texts,
-                        user_question=payload.message,
-                    )
-                    if summary_text:
-                        messages = _inject_summary_rag(messages, payload.message, summary_text, file_name=book_title_sync)
-            else:
-                lib_rag_text_sync = await _build_library_rag_context(
-                    question=payload.message,
-                    library_file_id=library_file_id_sync,
-                    db=db,
-                    ai=ai,
-                )
-                if lib_rag_text_sync:
-                    messages = _inject_library_rag(
-                        messages, payload.message, lib_rag_text_sync,
-                        book_title=book_title_sync, language=rag_language_sync,
-                    )
-        except Exception as e:
-            print(f"[SendMessage] Library RAG context build failed: {e}", flush=True)
-
-    # Inline docs: device-attached files sent from the frontend (not saved to vault)
-    inline_docs: list[dict] = (payload.context or {}).get("inline_docs") or []
-    if inline_docs:
-        messages = _inject_inline_docs(messages, payload.message, inline_docs, language=rag_language_sync)
-
-    # Detect if files are involved (vault selection, inline upload, or library book)
-    has_files = bool(selected_files) or bool(inline_docs) or bool(library_file_id_sync)
-
-    response_text = await ai.chat(messages=messages, context=payload.context, has_files=has_files)
 
     assistant_msg = AiChatMessage(
         chat_id=chat_id,
         role="assistant",
         content=response_text,
+        enhancements_json={"settings_snapshot": turn.settings.model_dump()} if turn.settings else None,
     )
     db.add(assistant_msg)
-    ctx = payload.context or {}
     db.add(AiInteractionHistory(
         user_id=current_user.id,
         service="ai-assistant",
         query=payload.message[:500] if payload.message else None,
         response_summary=response_text[:200] if response_text else None,
-        context_snapshot={
-            "subject":  ctx.get("subject"),
-            "grade":    ctx.get("grade"),
-            "board":    ctx.get("board"),
-            "language": ctx.get("language"),
-        },
+        context_snapshot=_interaction_snapshot(turn.ctx),
     ))
     await db.commit()
     await db.refresh(assistant_msg)
@@ -1061,31 +970,43 @@ async def send_message(
 
 @router.get("/chats/{chat_id}/settings", response_model=ChatSettingsResponse)
 async def get_chat_settings(chat_id: uuid.UUID, current_user: CurrentUser, db: DBSession):
-    result = await db.execute(
-        select(AiChatSetting).where(AiChatSetting.chat_id == chat_id)
-    )
-    settings = result.scalar_one_or_none()
-    if not settings:
-        raise NotFoundException("Chat settings not found")
-    return settings
+    """Return the chat's settings, creating the default row if it is missing.
+
+    Ownership is enforced (audit G4). Creating the row here is what lets the
+    frontend drop its "ensure defaults" PATCH, which raced with this GET and
+    reset saved settings to defaults whenever an uncached chat was opened
+    (audit G1).
+    """
+    await _get_owned_chat(chat_id, current_user.id, db)
+    result = await db.execute(_owned_settings_query(chat_id, current_user.id))
+    settings_row = result.scalar_one_or_none()
+    if not settings_row:
+        settings_row = AiChatSetting(chat_id=chat_id)
+        db.add(settings_row)
+        await db.commit()
+        await db.refresh(settings_row)
+    return settings_row
 
 
 @router.patch("/chats/{chat_id}/settings", response_model=ChatSettingsResponse)
 async def update_chat_settings(
     chat_id: uuid.UUID, payload: ChatSettingsUpdate, current_user: CurrentUser, db: DBSession
 ):
-    result = await db.execute(
-        select(AiChatSetting).where(AiChatSetting.chat_id == chat_id)
-    )
-    settings = result.scalar_one_or_none()
-    if not settings:
-        settings = AiChatSetting(chat_id=chat_id)
-        db.add(settings)
-    for key, value in payload.model_dump(exclude_unset=True).items():
-        setattr(settings, key, value)
+    """Update chat settings. Ownership enforced (audit G4); values normalised (plan §1.2)."""
+    await _get_owned_chat(chat_id, current_user.id, db)
+    result = await db.execute(_owned_settings_query(chat_id, current_user.id))
+    settings_row = result.scalar_one_or_none()
+    if not settings_row:
+        settings_row = AiChatSetting(chat_id=chat_id)
+        db.add(settings_row)
+    updates = payload.model_dump(exclude_unset=True)
+    current = ChatSettingsPayload.model_validate(settings_row).model_dump()
+    validated = ChatSettingsPayload.model_validate({**current, **updates})
+    for key in updates:
+        setattr(settings_row, key, getattr(validated, key))
     await db.commit()
-    await db.refresh(settings)
-    return settings
+    await db.refresh(settings_row)
+    return settings_row
 
 
 async def _persist_enhancement(db, chat_id: uuid.UUID, key: str, value):

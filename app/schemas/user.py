@@ -71,7 +71,7 @@ class AiContextRequest(BaseModel):
     tone: str = "helpful"
     difficulty: str = "medium"
     output_mode: str = "text"
-    student_mode: bool = False
+    student_mode: bool = True  # aligned with the frontend default (audit I1)
 
 
 class AiContextResponse(AiContextRequest):

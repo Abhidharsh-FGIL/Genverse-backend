@@ -48,3 +48,6 @@ Thumbs.db
 htmlcov/
 
 alembic/versions
+# Eval run artifacts (keep only REPORT.md)
+eval_results/*/outputs/
+eval_results/*/raw.jsonl
