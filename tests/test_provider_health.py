@@ -295,3 +295,48 @@ async def test_gemini_temperature_per_model_family(monkeypatch):
     await ai_mod._gemini_generate_with_retry(client, "gemini-3.5-flash", "x", base, temperature=0.7)
     assert seen == {"gemini-3.5-flash": None, "gemini-2.5-flash-lite": 0.7}
     assert base.temperature is None, "shared config must not be mutated"
+
+
+# ── O1: billing errors carried by HTTP 400 (Anthropic "credit balance is too low") ──
+
+def _anthropic_400(message: str, err_type: str = "invalid_request_error"):
+    import anthropic
+    import httpx
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    body = {"type": "error", "error": {"type": err_type, "message": message}}
+    return anthropic.BadRequestError(f"Error code: 400 - {body}", response=httpx.Response(400, request=req), body=body)
+
+
+async def test_o1_anthropic_credit_balance_400_is_billing():
+    exc = _anthropic_400("Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing.")
+    assert provider_health.classify(exc) == "auth_billing"
+    provider_health.record_failure("claude", "claude-sonnet-5-5", exc)
+    assert provider_health.is_open("claude") and provider_health.is_open("claude", "any-other-model")
+
+
+async def test_o1_billing_error_type_is_billing_even_without_message():
+    assert provider_health.classify(_anthropic_400("Request blocked.", err_type="billing_error")) == "auth_billing"
+
+
+async def test_o1_ordinary_400_is_still_bad_request():
+    exc = _anthropic_400("max_tokens: Input should be a valid integer")
+    assert provider_health.classify(exc) == "bad_request"
+    provider_health.record_failure("claude", "m", exc)
+    assert not provider_health.is_open("claude")
+
+
+async def test_o1_document_path_skips_claude_after_billing_400(monkeypatch):
+    claude_calls = []
+
+    async def claude(self, *a):
+        claude_calls.append(True)
+        raise _anthropic_400("Your credit balance is too low to access the Anthropic API.")
+        yield  # pragma: no cover
+
+    async def openai(self, *a):
+        yield "openai answer"
+
+    _install_streams(monkeypatch, openai=openai, claude=claude)
+    assert await _collect(has_files=True) == "openai answer"
+    assert await _collect(has_files=True) == "openai answer"
+    assert claude_calls == [True], "billing 400 must trip the breaker: Claude not called again"

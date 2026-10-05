@@ -5,6 +5,9 @@ Retry policy (AI tailoring plan, pre-Phase-3 item 3):
   - 400 / 401 / 402 / 403 / 404 are non-retryable: go straight to the next
     provider (or the next model, for a 404 on one model).
 
+Billing errors carried by another 4xx status (Anthropic's "credit balance is
+too low" is an HTTP 400) are classified by error type/message as auth_billing.
+
 Circuit breaker: after an auth/billing failure (401/402/403) the whole provider
 is skipped for BREAKER_SECONDS. After a 404 (model not found) only that model is
 skipped. Each trip is logged once at ERROR; skips while open log at DEBUG. State
@@ -40,6 +43,30 @@ def error_status(exc: BaseException) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+# Billing failures that providers report with a non-billing status code.
+# Anthropic: HTTP 400, error.type "invalid_request_error", message "Your credit
+# balance is too low to access the Anthropic API…" (seen 2026-10-05) — open item O1.
+_BILLING_TYPES = {"billing_error", "insufficient_quota"}
+_BILLING_MESSAGE = re.compile(
+    r"credit balance is too low|prepayment credits|insufficient (?:credit|funds|balance)|\bbilling\b",
+    re.I,
+)
+
+
+def _error_type_and_message(exc: BaseException) -> tuple[Optional[str], str]:
+    """Provider error type + message from the SDK error body, falling back to str(exc)."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") if isinstance(body.get("error"), dict) else body
+        return err.get("type") or err.get("code"), str(err.get("message") or exc)
+    return None, str(exc)
+
+
+def is_billing_error(exc: BaseException) -> bool:
+    err_type, message = _error_type_and_message(exc)
+    return (err_type in _BILLING_TYPES) or bool(_BILLING_MESSAGE.search(message))
+
+
 def classify(exc: BaseException) -> ErrorKind:
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "retryable"
@@ -47,6 +74,9 @@ def classify(exc: BaseException) -> ErrorKind:
     if name in ("APITimeoutError", "APIConnectionError", "ReadTimeout", "ConnectTimeout", "ConnectError"):
         return "retryable"
     status = error_status(exc)
+    # Billing problems trip the breaker whatever status code carries them (O1).
+    if status is not None and 400 <= status < 500 and is_billing_error(exc):
+        return "auth_billing"
     if status is None:
         return "other"
     if status == 429 or status >= 500:
