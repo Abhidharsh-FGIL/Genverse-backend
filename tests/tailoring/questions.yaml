@@ -1,0 +1,80 @@
+# Question bank for the AI Assistant tailoring verification (scripts/tailoring_verify.py).
+#
+# Per subject: a cross-grade topic, a concept question, problem-solving questions
+# (each with its correct numeric answer and the grade range it suits), and an
+# exam-style request. `answer` is the number that must appear as the final
+# answer; `answers` lists every required root when there are several.
+
+subjects:
+  maths:
+    topic: "Area"
+    concept: "What is area?"
+    problems:
+      - {q: "A box has 3 rows of 4 apples. How many apples are there in the box?", answers: [12], grades: [1, 3]}
+      - {q: "A rectangle is 12 cm long and 5 cm wide. What is its area?", answers: [60], unit: "cm²", grades: [3, 8]}
+      - {q: "Solve x² − 5x + 6 = 0", answers: [2, 3], grades: [9, 12]}
+    exam: "important questions on area and perimeter"
+
+  science:
+    topic: "Photosynthesis"
+    concept: "What is photosynthesis?"
+    problems:
+      - {q: "A plant is 10 cm tall and grows 2 cm every day. How tall will it be after 7 days?", answers: [24], unit: "cm", grades: [2, 7]}
+      - {q: "A car starts from rest and reaches 20 m/s in 4 seconds. What is its acceleration?", answers: [5], unit: "m/s²", grades: [8, 12]}
+    exam: "important questions on photosynthesis"
+
+  social_science:
+    topic: "Democracy"
+    concept: "What is democracy?"
+    problems:
+      - {q: "A village had 1,000 people. Now it has 1,200 people. By what percentage did the population increase?", answers: [20], unit: "%", grades: [6, 12]}
+      - {q: "A school has 4 classes with 30 students each. How many students are there in total?", answers: [120], grades: [1, 5]}
+    exam: "important questions on the French Revolution"
+
+  english:
+    topic: "Nouns"
+    concept: "What is a noun?"
+    problems:
+      - {q: "How many nouns are there in the sentence 'The cat sat on the mat'?", answers: [2], grades: [2, 12]}
+    exam: "important questions on tenses"
+
+  general_knowledge:
+    topic: "The sky"
+    concept: "Why is the sky blue?"
+    problems:
+      - {q: "How many days are there in 3 weeks?", answers: [21], grades: [1, 12]}
+    exam: "make notes on the solar system"
+
+# Fixed questions reused across sweeps (in addition to the bank above).
+core:
+  concept: "What is photosynthesis?"
+  newton: "Explain Newton's second law"
+  quadratic: {q: "Solve x² − 5x + 6 = 0", answers: [2, 3]}
+
+# Requested-format probes (sweep S10).
+formats:
+  important_questions: "important questions on light reflection"
+  notes: "make notes on light reflection"
+  comparison_table: "make a comparison table of plane mirrors and concave mirrors"
+  mcqs: "give me 5 MCQs on light reflection"
+  step_by_step: "explain step by step how to find the angle of reflection when the angle of incidence is 35°"
+
+# Greetings (sweep S11): answer must be 1–2 sentences whatever the settings.
+greetings: ["hi", "thanks", "ok"]
+
+# Off-subject probe (sweep S9): subject set to Mathematics.
+off_subject: "Who wrote the Ramayana?"
+
+# Syllabus scope reference for the judge (plan §3.4).
+scope_table: |
+  Syllabus scope reference (best knowledge; confidence in brackets):
+  - Photosynthesis idea + word equation: CBSE/NCERT Class 7 (2024 'Curiosity' text may shift chapter); ICSE Class 6-7 [medium]
+  - Photosynthesis balanced chemical equation: CBSE Class 10 'Life Processes'; ICSE Class 10 Biology [high]
+  - Newton's second law F = ma: CBSE Class 9 'Force and Laws of Motion'; ICSE Class 9; IGCSE Physics [high]
+  - Quadratic equations by factorisation: CBSE Class 10 Ch.4; ICSE Class 10; IGCSE (Gr 9-10) Extended [high]
+  - Calculus (limits/derivatives): CBSE/ISC/State Class 11; IB DP; Cambridge AS [high]
+  - Area of a rectangle: Class 4-5 across Indian boards; Cambridge Primary Stage 4-5 [high]
+  - Percentages: Class 6-8 across Indian boards [high]
+  Board stages: CBSE=NCERT; ICSE (ISC for 11-12); Tamil Nadu State Board = Samacheer Kalvi (SSLC at 10, HSC +1/+2);
+  State board (SSLC at 10, HSC at 11-12); IB PYP 1-5, MYP 6-10, DP 11-12; Cambridge Primary 1-6, Lower Secondary 7-8,
+  IGCSE 9-10, AS/A Level 11-12.
