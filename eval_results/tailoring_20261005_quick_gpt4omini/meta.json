@@ -1,0 +1,18 @@
+{
+ "mode": "quick",
+ "label": "NOT production routing \u2014 structural checks only (generation fell back to gpt-4o-mini; judge gpt-4o-mini)",
+ "run_at": "2026-10-05 13:50",
+ "base_url": "http://127.0.0.1:8001",
+ "backend_sha": "56ffa5f",
+ "user": "tailoring-eval@genverse.dev",
+ "judge": "openai:gpt-4o-mini",
+ "generations": 104,
+ "gen_out_est": 26204,
+ "judge_usage": {
+  "calls": 116,
+  "input": 97529,
+  "output": 25881
+ },
+ "judge_cost": "$0.03",
+ "gen_cost": "see provider mix; $0.06 if all served by gpt-4o-mini"
+}

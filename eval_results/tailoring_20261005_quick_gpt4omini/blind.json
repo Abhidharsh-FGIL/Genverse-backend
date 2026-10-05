@@ -1,0 +1,218 @@
+{
+ "grade": [
+  {
+   "truth": {
+    "A": "Grade 8",
+    "B": "Grade 2",
+    "C": "Grade 11",
+    "D": "Grade 5"
+   },
+   "guess": {
+    "A": "Grade 11",
+    "B": "Grade 2",
+    "C": "Grade 8",
+    "D": "Grade 5"
+   }
+  },
+  {
+   "truth": {
+    "A": "Grade 5",
+    "B": "Grade 8",
+    "C": "Grade 2",
+    "D": "Grade 11"
+   },
+   "guess": {
+    "A": "Grade 11",
+    "B": "Grade 8",
+    "C": "Grade 2",
+    "D": "Grade 5"
+   }
+  },
+  {
+   "truth": {
+    "A": "Grade 8",
+    "B": "Grade 11",
+    "C": "Grade 5",
+    "D": "Grade 2"
+   },
+   "guess": {
+    "A": "Grade 11",
+    "B": "Grade 8",
+    "C": "Grade 5",
+    "D": "Grade 2"
+   }
+  }
+ ],
+ "board": [
+  {
+   "truth": {
+    "A": "ICSE",
+    "B": "State Board",
+    "C": "CBSE",
+    "D": "Cambridge",
+    "E": "IB"
+   },
+   "guess": {
+    "A": "IB",
+    "B": "CBSE",
+    "C": "State Board",
+    "D": "Cambridge",
+    "E": "ICSE"
+   }
+  },
+  {
+   "truth": {
+    "A": "State Board",
+    "B": "CBSE",
+    "C": "Cambridge",
+    "D": "ICSE",
+    "E": "IB"
+   },
+   "guess": {
+    "A": "CBSE",
+    "B": "ICSE",
+    "C": "Cambridge",
+    "D": "IB",
+    "E": "State Board"
+   }
+  },
+  {
+   "truth": {
+    "A": "ICSE",
+    "B": "IB",
+    "C": "Cambridge",
+    "D": "State Board",
+    "E": "CBSE"
+   },
+   "guess": {
+    "A": "IB",
+    "B": "Cambridge",
+    "C": "CBSE",
+    "D": "ICSE",
+    "E": "State Board"
+   }
+  }
+ ],
+ "personality": [
+  {
+   "truth": {
+    "A": "technical-expert",
+    "B": "friend",
+    "C": "mentor",
+    "D": "professor",
+    "E": "coach"
+   },
+   "guess": {
+    "A": "technical-expert",
+    "B": "coach",
+    "C": "professor",
+    "D": "mentor",
+    "E": "friend"
+   }
+  },
+  {
+   "truth": {
+    "A": "friend",
+    "B": "mentor",
+    "C": "technical-expert",
+    "D": "professor",
+    "E": "coach"
+   },
+   "guess": {
+    "A": "mentor",
+    "B": "professor",
+    "C": "technical-expert",
+    "D": "coach",
+    "E": "friend"
+   }
+  }
+ ],
+ "length": [
+  {
+   "truth": {
+    "A": "summary",
+    "B": "detailed",
+    "C": "deep-dive",
+    "D": "small"
+   },
+   "guess": {
+    "A": "detailed",
+    "B": "summary",
+    "C": "deep-dive",
+    "D": "small"
+   }
+  },
+  {
+   "truth": {
+    "A": "small",
+    "B": "deep-dive",
+    "C": "detailed",
+    "D": "summary"
+   },
+   "guess": {
+    "A": "small",
+    "B": "summary",
+    "C": "detailed",
+    "D": "deep-dive"
+   }
+  },
+  {
+   "truth": {
+    "A": "deep-dive",
+    "B": "detailed",
+    "C": "small",
+    "D": "summary"
+   },
+   "guess": {
+    "A": "deep-dive",
+    "B": "detailed",
+    "C": "summary",
+    "D": "small"
+   }
+  }
+ ],
+ "difficulty": [
+  {
+   "truth": {
+    "A": "expert",
+    "B": "easy",
+    "C": "medium",
+    "D": "hard"
+   },
+   "order": [
+    "expert",
+    "easy",
+    "hard",
+    "medium"
+   ]
+  },
+  {
+   "truth": {
+    "A": "expert",
+    "B": "easy",
+    "C": "medium",
+    "D": "hard"
+   },
+   "order": [
+    "expert",
+    "easy",
+    "medium",
+    "hard"
+   ]
+  },
+  {
+   "truth": {
+    "A": "easy",
+    "B": "hard",
+    "C": "medium",
+    "D": "expert"
+   },
+   "order": [
+    "easy",
+    "hard",
+    "medium",
+    "expert"
+   ]
+  }
+ ]
+}

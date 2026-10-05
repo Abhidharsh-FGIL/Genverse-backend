@@ -30,6 +30,7 @@ ENV/
 
 # Alembic - don't ignore versions, but do ignore __pycache__
 alembic/versions/__pycache__/
+alembic/versions
 
 # Uploads (user-uploaded files - should be on object storage in production)
 uploads/
