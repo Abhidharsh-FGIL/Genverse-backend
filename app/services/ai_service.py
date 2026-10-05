@@ -22,6 +22,7 @@ from app.config import settings
 from app.services import provider_health
 from app.prompts.builder import (
     build_system_prompt,
+    caller_task,
     effective_student_mode,
     history_uses_three_ways,
     to_provider_messages,
@@ -330,6 +331,7 @@ class AIService:
             ctx, cs, extra_instruction=grade_context_instruction,
             history_has_three_ways=history_uses_three_ways(messages),
             question=question or user_query,
+            task=caller_task(messages),  # R1: callers' system turns
         )
         # User-facing calls always carry a language reminder (English when unset);
         # internal generators get none, so their own language notes stand.
@@ -734,6 +736,7 @@ class AIService:
         system_prompt = build_system_prompt(
             ctx, cs, history_has_three_ways=history_uses_three_ways(messages),
             question=question or user_query,
+            task=caller_task(messages),  # R1: e.g. the Playground mode prompt
         )
         turns = to_provider_messages(messages, _stream_language or "en")
         params = generation_params(ctx, cs, question or user_query, has_files, student)

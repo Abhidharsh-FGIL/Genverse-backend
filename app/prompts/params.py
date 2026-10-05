@@ -67,8 +67,15 @@ def generation_params(
     has_files: bool,
     student_mode: bool,
 ) -> GenParams:
-    """Params for a user-facing chat turn. Internal calls (no ctx/settings) → defaults."""
-    if ctx is None and settings is None:
+    """Params for an AI Assistant turn.
+
+    Only the AI Assistant sends chat settings. Every other caller — internal
+    generators, and context-passing features such as career analysis, Audio
+    Q&A, Vault query and the Playground stream — gets GenParams() (no
+    max_tokens, no temperature), i.e. its previous provider defaults
+    (regression R2 in REGRESSION_CHECK.md).
+    """
+    if settings is None:
         return GenParams()
     language = (ctx.language if ctx else None) or "en"
     subject = ctx.subject if ctx else None

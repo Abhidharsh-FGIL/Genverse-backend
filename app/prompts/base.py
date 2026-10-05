@@ -40,7 +40,12 @@ HARD_RULES: tuple[str, ...] = (
     "Chemistry: use $\\ce{...}$ (e.g. $\\ce{2H2 + O2 -> 2H2O}$).",
     # 6 — formatting (old rules 4, 5)
     "Formatting: standard Markdown — headings, lists, **bold**, pipe tables, fenced code.",
-    # 7 — emojis (plan D1, audit P3)
+)
+
+# Rule 7 — AI Assistant only (plan D1, audit P3). Not part of HARD_RULES because
+# other features' generators ask for emoji fields (Playground actor_emoji,
+# avatar, background_emoji…) — regression R3 in REGRESSION_CHECK.md.
+ASSISTANT_ONLY_RULES: tuple[str, ...] = (
     "Do not use emojis.",
 )
 
@@ -49,5 +54,7 @@ def render_role(student_mode: bool) -> str:
     return f"{ROLE} {STUDENT_ROLE_SUFFIX}" if student_mode else ROLE
 
 
-def render_hard_rules() -> str:
-    return "\n".join(f"{i}. {rule}" for i, rule in enumerate(HARD_RULES, start=1))
+def render_hard_rules(assistant: bool = False) -> str:
+    """Hard rules; `assistant=True` (AI Assistant chat) adds the assistant-only rules."""
+    rules = HARD_RULES + (ASSISTANT_ONLY_RULES if assistant else ())
+    return "\n".join(f"{i}. {rule}" for i, rule in enumerate(rules, start=1))

@@ -56,6 +56,26 @@ def history_uses_three_ways(messages: list[dict]) -> bool:
                for m in messages)
 
 
+TASK_PREAMBLE = ("Instructions from the feature you are serving — follow them for this answer; they take "
+                 "priority over the board's default answer framing:")
+
+
+def _task_body(task: str) -> str:
+    return f"{TASK_PREAMBLE}\n{task}"
+
+
+def caller_task(messages: list[dict]) -> Optional[str]:
+    """System-role turns sent by the calling feature, joined (R1). None if there are none.
+
+    Before the refactor these reached the model inside the conversation (Gemini's
+    flattened prompt / OpenAI's message list); `to_provider_messages` drops
+    system turns, so they are moved into the system prompt instead.
+    """
+    parts = [(m.get("content") or "").strip() for m in messages if m.get("role") == "system"]
+    parts = [p for p in parts if p]
+    return "\n\n".join(parts) or None
+
+
 def _section(tag: str, body: str) -> str:
     return f"<{tag}>\n{body}\n</{tag}>"
 
@@ -68,16 +88,25 @@ def build_system_prompt(
     history_has_three_ways: bool = False,
     extra_instruction: Optional[str] = None,
     question: Optional[str] = None,
+    task: Optional[str] = None,
 ) -> str:
     """Assemble the full system prompt.
 
     `extra_instruction` = guard grade_context (non-stream path).
     `question` = the student's raw message (exam-intent detection for exam notes).
+    `task` = system-role instructions from the calling feature (e.g. the
+    Playground mode prompt), rendered as a final <task> section (regression R1).
+    The AI Assistant never sends system turns, so its prompt is unaffected.
     """
     is_user_chat = ctx is not None or settings is not None
+    # The AI Assistant is the only caller that sends chat settings (R3).
+    is_assistant = settings is not None
     student = effective_student_mode(ctx, settings)
-    sections = [_section("role", render_role(student)), _section("hard_rules", render_hard_rules())]
+    sections = [_section("role", render_role(student)),
+                _section("hard_rules", render_hard_rules(assistant=is_assistant))]
     if not is_user_chat:
+        if task:
+            sections.append(_section("task", _task_body(task)))
         return "\n\n".join(sections)
 
     grade = ctx.grade if ctx else None
@@ -116,6 +145,8 @@ def build_system_prompt(
         sections.append(_section("response_settings", "\n".join(lines)))
 
     sections.append(_section("precedence", PRECEDENCE))
+    if task:
+        sections.append(_section("task", _task_body(task)))
     prompt = "\n\n".join(sections)
     if extra_instruction:
         prompt += f"\n\n{extra_instruction}"
@@ -130,7 +161,8 @@ EARLIER_CONVERSATION = "(Continuing our earlier conversation.)"
 def to_provider_messages(messages: list[dict], language: Optional[str]) -> list[dict]:
     """Provider-ready turns, identical for Gemini, Claude and OpenAI (audit P5, G14).
 
-    - drops system-role turns (the system prompt is passed separately);
+    - drops system-role turns (callers' system turns go into the system prompt
+      as <task> via `caller_task`, regression R1);
     - merges consecutive same-role turns (G14: the Claude path claimed to, but didn't);
     - guarantees the first turn is a user turn;
     - appends the language reminder to the LAST user turn (P5).
