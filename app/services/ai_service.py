@@ -25,6 +25,7 @@ from app.prompts.builder import (
     caller_task,
     effective_student_mode,
     history_uses_three_ways,
+    strip_three_ways,
     to_provider_messages,
 )
 from app.prompts.params import GenParams, generation_params, supports_temperature
@@ -336,7 +337,8 @@ class AIService:
         # User-facing calls always carry a language reminder (English when unset);
         # internal generators get none, so their own language notes stand.
         prompt_language = (language or "en") if is_user_chat else None
-        turns = to_provider_messages(messages, prompt_language)
+        model_history = strip_three_ways(messages) if (cs is not None and not cs.explain_3ways) else messages  # O2
+        turns = to_provider_messages(model_history, prompt_language)
         params = generation_params(ctx, cs, question or user_query, has_files, effective_student_mode(ctx, cs))
         max_tokens = max_output_tokens or params.max_tokens
 
@@ -738,7 +740,10 @@ class AIService:
             question=question or user_query,
             task=caller_task(messages),  # R1: e.g. the Playground mode prompt
         )
-        turns = to_provider_messages(messages, _stream_language or "en")
+        # O2: with 3-ways off, earlier 3-ways blocks are hidden from the model so it
+        # cannot continue the format (stored history is untouched).
+        model_history = strip_three_ways(messages) if (cs is not None and not cs.explain_3ways) else messages
+        turns = to_provider_messages(model_history, _stream_language or "en")
         params = generation_params(ctx, cs, question or user_query, has_files, student)
 
         # --- Concurrent guard + provider startup ---

@@ -76,6 +76,29 @@ def caller_task(messages: list[dict]) -> Optional[str]:
     return "\n\n".join(parts) or None
 
 
+_THREE_WAYS_BLOCK = re.compile(r"(?:^[ \t]*---[ \t]*\n\s*)?\*\*Analogy:\*\*", re.M)
+
+
+def strip_three_ways(messages: list[dict]) -> list[dict]:
+    """Copy of `messages` with the Explain-in-3-Ways block removed from assistant turns (O2).
+
+    Used when 3-ways is OFF: earlier answers in the window would otherwise show
+    the model the Analogy / Technical / Real-World Example pattern to copy (a
+    prompt line alone did not stop gpt-4o-mini). Only blocks that carry the
+    "**Analogy:**" label followed by another 3-ways label are cut, from the
+    "---" divider (if any). Returns new dicts; stored history is untouched.
+    """
+    out = []
+    for m in messages:
+        content = m.get("content") or ""
+        if m.get("role") == "assistant":
+            match = _THREE_WAYS_BLOCK.search(content)
+            if match and re.search(r"\*\*(?:Technical|Real-World Example):\*\*", content[match.end():]):
+                m = {**m, "content": content[:match.start()].rstrip()}
+        out.append(m)
+    return out
+
+
 def _section(tag: str, body: str) -> str:
     return f"<{tag}>\n{body}\n</{tag}>"
 
